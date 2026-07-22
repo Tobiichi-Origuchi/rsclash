@@ -36,6 +36,8 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_SERVICE_SOCKET: &str = "/run/rsclash/service.sock";
 pub const DEFAULT_INSTALLED_CONFIG: &str = "/etc/rsclash/service.json";
 pub const DEFAULT_INSTALLED_CORE: &str = "/usr/lib/rsclash/mihomo";
+pub const DEFAULT_CONTROLLER_RUNTIME_DIRECTORY: &str = "/run/rsclash/core";
+pub const DEFAULT_CONTROLLER_SOCKET: &str = "/run/rsclash/core/controller.sock";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Request {

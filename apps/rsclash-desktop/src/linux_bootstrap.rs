@@ -1,14 +1,18 @@
 use std::{env, path::PathBuf, sync::Arc};
 
+use rsclash_app::MihomoAccess;
 use rsclash_config::initialize_default_runtime;
 use rsclash_core::{
   CoreBinaries, CoreRuntime, LinuxSidecarConfig, LinuxSidecarController, PreferredController,
 };
+use rsclash_mihomo::{ControllerConfig, ControllerEndpoint, MihomoApi, MihomoClient};
 use rsclash_platform::{
   RecoveryManager, RecoveryOutcome, RecoveryReason, SystemStateRecovery as _,
   UnavailableRecoveryBackend,
 };
-use rsclash_service::{DEFAULT_SERVICE_SOCKET, LinuxServiceController, ServiceClient};
+use rsclash_service::{
+  DEFAULT_CONTROLLER_SOCKET, DEFAULT_SERVICE_SOCKET, LinuxServiceController, ServiceClient,
+};
 use tokio::runtime::Handle;
 
 pub(crate) fn create_core_runtime(runtime: &Handle) -> Result<LinuxBootstrap, String> {
@@ -44,6 +48,7 @@ struct BootstrapLayout {
 
 pub(crate) struct LinuxBootstrap {
   pub core_runtime: CoreRuntime,
+  pub mihomo_access: MihomoAccess,
   pub system_recovery: Arc<RecoveryManager>,
 }
 
@@ -63,14 +68,20 @@ fn create_core_runtime_for_layout(
   let store = initialize_default_runtime(&layout.config_root)
     .map_err(|error| format!("initialize the Mihomo runtime configuration: {error}"))?;
 
-  let sidecar = LinuxSidecarController::new(LinuxSidecarConfig::new(
+  let sidecar_config = LinuxSidecarConfig::new(
     layout.binaries,
     &store.paths().root,
     &store.paths().runtime_config,
     layout.runtime_root,
-  ));
+  );
+  let sidecar_socket = sidecar_config.socket_path();
+  let sidecar = LinuxSidecarController::new(sidecar_config);
   let service = LinuxServiceController::new(ServiceClient::new(DEFAULT_SERVICE_SOCKET));
   let controller = PreferredController::new(sidecar).with_service(service);
+  let mihomo_access = MihomoAccess::new(
+    local_mihomo_client(sidecar_socket)?,
+    local_mihomo_client(DEFAULT_CONTROLLER_SOCKET)?,
+  );
   let system_recovery = Arc::new(RecoveryManager::new(
     store.paths().root.join("system-recovery.json"),
     Arc::new(UnavailableRecoveryBackend::new(
@@ -79,8 +90,17 @@ fn create_core_runtime_for_layout(
   ));
   Ok(LinuxBootstrap {
     core_runtime: CoreRuntime::spawn(runtime, controller),
+    mihomo_access,
     system_recovery,
   })
+}
+
+fn local_mihomo_client(socket: impl Into<PathBuf>) -> Result<Arc<dyn MihomoApi>, String> {
+  let config = ControllerConfig::local(ControllerEndpoint::unix_socket(socket))
+    .with_request_timeout(std::time::Duration::from_secs(2));
+  MihomoClient::new(config)
+    .map(|client| Arc::new(client) as Arc<dyn MihomoApi>)
+    .map_err(|error| format!("configure the Mihomo controller client: {error}"))
 }
 
 fn home_directory() -> Result<PathBuf, String> {

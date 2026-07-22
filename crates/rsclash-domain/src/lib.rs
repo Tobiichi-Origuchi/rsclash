@@ -105,6 +105,93 @@ pub enum CoreRunMode {
   Service,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum MihomoConnection {
+  #[default]
+  Offline,
+  Connecting,
+  Connected,
+  Degraded,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyMode {
+  #[default]
+  Rule,
+  Global,
+  Direct,
+  Unknown(String),
+}
+
+impl ProxyMode {
+  pub const fn as_str(&self) -> &str {
+    match self {
+      Self::Rule => "rule",
+      Self::Global => "global",
+      Self::Direct => "direct",
+      Self::Unknown(value) => value.as_str(),
+    }
+  }
+}
+
+impl From<&str> for ProxyMode {
+  fn from(value: &str) -> Self {
+    match value.to_ascii_lowercase().as_str() {
+      "rule" => Self::Rule,
+      "global" => Self::Global,
+      "direct" => Self::Direct,
+      _ => Self::Unknown(value.to_string()),
+    }
+  }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrafficSnapshot {
+  pub upload_bytes_per_second: u64,
+  pub download_bytes_per_second: u64,
+  pub upload_total: u64,
+  pub download_total: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProxyOptionSnapshot {
+  pub name: String,
+  pub alive: bool,
+  pub delay_ms: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProxyGroupSnapshot {
+  pub name: String,
+  pub kind: String,
+  pub selected: Option<String>,
+  pub options: Vec<ProxyOptionSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MihomoSnapshot {
+  pub connection: MihomoConnection,
+  pub version: Option<String>,
+  pub mode: ProxyMode,
+  pub traffic: TrafficSnapshot,
+  pub memory_bytes: u64,
+  pub connection_count: u64,
+  pub groups: Vec<ProxyGroupSnapshot>,
+  pub last_error: Option<String>,
+}
+
+impl MihomoSnapshot {
+  pub fn current_proxy(&self) -> Option<&str> {
+    self
+      .groups
+      .iter()
+      .find(|group| group.name.eq_ignore_ascii_case("GLOBAL"))
+      .or_else(|| self.groups.first())
+      .and_then(|group| group.selected.as_deref())
+  }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppSnapshot {
   pub revision: u64,
@@ -113,6 +200,7 @@ pub struct AppSnapshot {
   pub theme: ThemeMode,
   pub window_visible: bool,
   pub core: CoreState,
+  pub mihomo: MihomoSnapshot,
   pub last_error: Option<ErrorView>,
 }
 
@@ -125,6 +213,7 @@ impl Default for AppSnapshot {
       theme: ThemeMode::System,
       window_visible: true,
       core: CoreState::Stopped,
+      mihomo: MihomoSnapshot::default(),
       last_error: None,
     }
   }
@@ -144,6 +233,9 @@ pub enum UiCommand {
   StopCore,
   RestartCore(CoreChannel),
   ReloadCore,
+  RefreshMihomo,
+  SelectProxy { group: String, proxy: String },
+  SetProxyMode(ProxyMode),
   Navigate(Page),
   SetTheme(ThemeMode),
   SetWindowVisible(bool),
@@ -163,6 +255,7 @@ pub enum CommandOutput {
 pub enum AppEvent {
   BackendReady,
   CoreStateChanged(CoreState),
+  MihomoStateChanged,
   NavigationChanged(Page),
   ThemeChanged(ThemeMode),
   WindowVisibilityChanged(bool),

@@ -1,6 +1,7 @@
 //! Asynchronous application coordinator and UI-facing client.
 
 mod change;
+mod mihomo;
 mod runtime;
 
 use std::{fmt, future::pending, sync::Arc, time::Duration};
@@ -24,7 +25,10 @@ pub use change::{
   ChangeAction, ChangeReceipt, CompensationFailure, PreparedChange, SideEffectError,
   SideEffectTransaction,
 };
+pub use mihomo::MihomoAccess;
 pub use runtime::CoreRuntimeActivator;
+
+use mihomo::{MihomoBridgeCommand, MihomoBridgeEvent, run_mihomo_worker};
 
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 64;
@@ -192,17 +196,27 @@ pub struct BackendHandle {
   coordinator: Option<JoinHandle<()>>,
   core_relay: Option<JoinHandle<()>>,
   core_worker: Option<JoinHandle<()>>,
+  mihomo_worker: Option<JoinHandle<()>>,
   core_runtime: Option<CoreRuntime>,
   system_recovery: Option<Arc<dyn SystemStateRecovery>>,
 }
 
 impl BackendHandle {
   pub fn spawn(runtime: &Handle, wake: WakeHandle) -> Self {
-    Self::spawn_inner(runtime, wake, None, None)
+    Self::spawn_inner(runtime, wake, None, None, None)
   }
 
   pub fn spawn_with_core(runtime: &Handle, wake: WakeHandle, core_runtime: CoreRuntime) -> Self {
-    Self::spawn_inner(runtime, wake, Some(core_runtime), None)
+    Self::spawn_inner(runtime, wake, Some(core_runtime), None, None)
+  }
+
+  pub fn spawn_with_core_and_mihomo(
+    runtime: &Handle,
+    wake: WakeHandle,
+    core_runtime: CoreRuntime,
+    mihomo_access: MihomoAccess,
+  ) -> Self {
+    Self::spawn_inner(runtime, wake, Some(core_runtime), None, Some(mihomo_access))
   }
 
   pub fn spawn_with_core_and_recovery(
@@ -211,7 +225,29 @@ impl BackendHandle {
     core_runtime: CoreRuntime,
     system_recovery: Arc<dyn SystemStateRecovery>,
   ) -> Self {
-    Self::spawn_inner(runtime, wake, Some(core_runtime), Some(system_recovery))
+    Self::spawn_inner(
+      runtime,
+      wake,
+      Some(core_runtime),
+      Some(system_recovery),
+      None,
+    )
+  }
+
+  pub fn spawn_with_core_recovery_and_mihomo(
+    runtime: &Handle,
+    wake: WakeHandle,
+    core_runtime: CoreRuntime,
+    system_recovery: Arc<dyn SystemStateRecovery>,
+    mihomo_access: MihomoAccess,
+  ) -> Self {
+    Self::spawn_inner(
+      runtime,
+      wake,
+      Some(core_runtime),
+      Some(system_recovery),
+      Some(mihomo_access),
+    )
   }
 
   fn spawn_inner(
@@ -219,6 +255,7 @@ impl BackendHandle {
     wake: WakeHandle,
     core_runtime: Option<CoreRuntime>,
     system_recovery: Option<Arc<dyn SystemStateRecovery>>,
+    mihomo_access: Option<MihomoAccess>,
   ) -> Self {
     let core = core_runtime.as_ref().map(CoreRuntime::handle);
     let mut initial_snapshot = AppSnapshot::default();
@@ -245,6 +282,18 @@ impl BackendHandle {
       },
       None => (None, None, None, None),
     };
+    let (mihomo_command_tx, mihomo_event_rx, mihomo_worker) = match mihomo_access {
+      Some(access) => {
+        let (command_tx, command_rx) = mpsc::channel(CORE_EVENT_CAPACITY);
+        let (event_tx, event_rx) = mpsc::channel(CORE_EVENT_CAPACITY);
+        let _ = command_tx.try_send(MihomoBridgeCommand::CoreState(
+          initial_snapshot.core.clone(),
+        ));
+        let worker = runtime.spawn(run_mihomo_worker(access, command_rx, event_tx));
+        (Some(command_tx), Some(event_rx), Some(worker))
+      },
+      None => (None, None, None),
+    };
 
     let coordinator = Coordinator {
       snapshot: (*initial_snapshot).clone(),
@@ -254,6 +303,8 @@ impl BackendHandle {
       wake,
       core_command_tx,
       core_event_rx,
+      mihomo_command_tx,
+      mihomo_event_rx,
     };
     let coordinator = runtime.spawn(coordinator.run());
 
@@ -267,6 +318,7 @@ impl BackendHandle {
       coordinator: Some(coordinator),
       core_relay,
       core_worker,
+      mihomo_worker,
       core_runtime,
       system_recovery,
     }
@@ -302,6 +354,10 @@ impl BackendHandle {
     if let Some(core_worker) = self.core_worker.take() {
       core_worker.abort();
       let _ = core_worker.await;
+    }
+    if let Some(mihomo_worker) = self.mihomo_worker.take() {
+      mihomo_worker.abort();
+      let _ = mihomo_worker.await;
     }
 
     let recovery_result = if let Some(system_recovery) = self.system_recovery.take() {
@@ -340,6 +396,9 @@ impl Drop for BackendHandle {
     if let Some(core_worker) = self.core_worker.take() {
       core_worker.abort();
     }
+    if let Some(mihomo_worker) = self.mihomo_worker.take() {
+      mihomo_worker.abort();
+    }
     let _ = self.system_recovery.take();
     let _ = self.core_runtime.take();
   }
@@ -366,6 +425,8 @@ struct Coordinator {
   wake: WakeHandle,
   core_command_tx: Option<mpsc::Sender<CoreBridgeCommand>>,
   core_event_rx: Option<mpsc::Receiver<CoreBridgeEvent>>,
+  mihomo_command_tx: Option<mpsc::Sender<MihomoBridgeCommand>>,
+  mihomo_event_rx: Option<mpsc::Receiver<MihomoBridgeEvent>>,
 }
 
 impl Coordinator {
@@ -396,6 +457,12 @@ impl Coordinator {
             None => self.core_event_rx = None,
           }
         },
+        mihomo_event = receive_mihomo_event(&mut self.mihomo_event_rx), if self.mihomo_event_rx.is_some() => {
+          match mihomo_event {
+            Some(event) => self.handle_mihomo_event(event),
+            None => self.mihomo_event_rx = None,
+          }
+        },
       }
     }
 
@@ -413,6 +480,11 @@ impl Coordinator {
       UiCommand::StopCore => self.dispatch_core(CoreBridgeCommand::Stop),
       UiCommand::RestartCore(channel) => self.dispatch_core(CoreBridgeCommand::Restart(channel)),
       UiCommand::ReloadCore => self.dispatch_core(CoreBridgeCommand::Reload),
+      UiCommand::RefreshMihomo => self.dispatch_mihomo(MihomoBridgeCommand::Refresh),
+      UiCommand::SelectProxy { group, proxy } => {
+        self.dispatch_mihomo(MihomoBridgeCommand::SelectProxy { group, proxy })
+      },
+      UiCommand::SetProxyMode(mode) => self.dispatch_mihomo(MihomoBridgeCommand::SetMode(mode)),
       UiCommand::Navigate(page) => {
         self.snapshot.page = page;
         self.publish_snapshot();
@@ -475,6 +547,32 @@ impl Coordinator {
     }
   }
 
+  fn dispatch_mihomo(&self, command: MihomoBridgeCommand) -> (CommandResult, bool) {
+    let Some(command_tx) = &self.mihomo_command_tx else {
+      return (
+        Err(CommandError::InvalidState(
+          "the Mihomo controller bridge is not configured".to_string(),
+        )),
+        false,
+      );
+    };
+    match command_tx.try_send(command) {
+      Ok(()) => (Ok(CommandOutput::Accepted), false),
+      Err(mpsc::error::TrySendError::Full(_)) => (
+        Err(CommandError::InvalidState(
+          "the Mihomo controller command queue is full".to_string(),
+        )),
+        false,
+      ),
+      Err(mpsc::error::TrySendError::Closed(_)) => (
+        Err(CommandError::InvalidState(
+          "the Mihomo controller bridge is closed".to_string(),
+        )),
+        false,
+      ),
+    }
+  }
+
   fn handle_core_event(&mut self, event: CoreBridgeEvent) {
     match event {
       CoreBridgeEvent::State(state) => {
@@ -485,6 +583,15 @@ impl Coordinator {
             retryable: true,
           });
         }
+        if let Some(command_tx) = &self.mihomo_command_tx
+          && let Err(error) = command_tx.try_send(MihomoBridgeCommand::CoreState(state.clone()))
+        {
+          self.snapshot.last_error = Some(ErrorView {
+            title: "Mihomo controller state update failed".to_string(),
+            detail: error.to_string(),
+            retryable: true,
+          });
+        }
         self.snapshot.core = state.clone();
         self.publish_snapshot();
         self.emit(AppEvent::CoreStateChanged(state));
@@ -492,6 +599,24 @@ impl Coordinator {
       CoreBridgeEvent::CommandFailed(message) => {
         self.snapshot.last_error = Some(ErrorView {
           title: "Mihomo core command failed".to_string(),
+          detail: message,
+          retryable: true,
+        });
+        self.publish_snapshot();
+      },
+    }
+  }
+
+  fn handle_mihomo_event(&mut self, event: MihomoBridgeEvent) {
+    match event {
+      MihomoBridgeEvent::Snapshot(snapshot) => {
+        self.snapshot.mihomo = snapshot;
+        self.publish_snapshot();
+        self.emit(AppEvent::MihomoStateChanged);
+      },
+      MihomoBridgeEvent::CommandFailed(message) => {
+        self.snapshot.last_error = Some(ErrorView {
+          title: "Mihomo controller command failed".to_string(),
           detail: message,
           retryable: true,
         });
@@ -567,10 +692,21 @@ async fn receive_core_event(
   }
 }
 
+async fn receive_mihomo_event(
+  receiver: &mut Option<mpsc::Receiver<MihomoBridgeEvent>>,
+) -> Option<MihomoBridgeEvent> {
+  if let Some(receiver) = receiver {
+    receiver.recv().await
+  } else {
+    pending::<Option<MihomoBridgeEvent>>().await
+  }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
   };
@@ -578,15 +714,19 @@ mod tests {
   use async_trait::async_trait;
   use rsclash_core::{ControllerError, CoreRuntime, LifecycleController, RunningCore};
   use rsclash_domain::{
-    AppEvent, AppStatus, CommandOutput, CoreChannel, CoreRunMode, CoreState, Page, ThemeMode,
-    UiCommand,
+    AppEvent, AppStatus, CommandOutput, CoreChannel, CoreRunMode, CoreState, MihomoConnection,
+    Page, ProxyMode, ThemeMode, UiCommand,
+  };
+  use rsclash_mihomo::{
+    FakeMihomoApi, FakeMihomoState, MihomoCall,
+    models::{BaseConfig, Connections, DelayHistory, Groups, Proxies, Proxy, VersionInfo},
   };
   use rsclash_platform::{
     RecoveryOutcome, RecoveryReason, Result as RecoveryResult, SystemStateRecovery,
   };
   use tokio::{sync::broadcast, time::timeout};
 
-  use super::{AppEventReceiver, BackendHandle, WakeHandle};
+  use super::{AppEventReceiver, BackendHandle, MihomoAccess, WakeHandle};
 
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
   enum CoreCall {
@@ -738,6 +878,110 @@ mod tests {
     assert!(client.try_command(UiCommand::ToggleWindow).is_ok());
     wait_for_snapshot(&mut client, |snapshot| !snapshot.window_visible).await;
 
+    assert!(backend.shutdown().await.is_ok());
+  }
+
+  #[tokio::test]
+  async fn mihomo_bridge_publishes_dashboard_data_and_routes_mutations() {
+    let node = Proxy {
+      name: "Node A".to_string(),
+      alive: true,
+      history: vec![DelayHistory {
+        delay: 42,
+        ..DelayHistory::default()
+      }],
+      ..Proxy::default()
+    };
+    let group = Proxy {
+      name: "GLOBAL".to_string(),
+      kind: "Selector".to_string(),
+      all: Some(vec![node.name.clone()]),
+      now: Some(node.name.clone()),
+      ..Proxy::default()
+    };
+    let fake = FakeMihomoApi::new(FakeMihomoState {
+      version: VersionInfo {
+        version: "1.20.0".to_string(),
+        ..VersionInfo::default()
+      },
+      base_config: BaseConfig {
+        mode: "rule".to_string(),
+        ..BaseConfig::default()
+      },
+      groups: Groups {
+        proxies: vec![group],
+        ..Groups::default()
+      },
+      proxies: Proxies {
+        proxies: HashMap::from([(node.name.clone(), node)]),
+        ..Proxies::default()
+      },
+      connections: Connections {
+        upload_total: 1_024,
+        download_total: 2_048,
+        memory: 4_096,
+        connections: Some(vec![Default::default()]),
+        ..Connections::default()
+      },
+      ..FakeMihomoState::default()
+    });
+    let core = CoreRuntime::spawn(
+      &tokio::runtime::Handle::current(),
+      BridgeController {
+        calls: Arc::new(Mutex::new(Vec::new())),
+      },
+    );
+    let backend = BackendHandle::spawn_with_core_and_mihomo(
+      &tokio::runtime::Handle::current(),
+      WakeHandle::default(),
+      core,
+      MihomoAccess::same(Arc::new(fake.clone())),
+    );
+    let mut client = backend.client();
+
+    client
+      .request(UiCommand::StartCore(CoreChannel::Stable))
+      .await
+      .expect("core start should be accepted");
+    wait_for_snapshot(&mut client, |snapshot| {
+      snapshot.mihomo.connection == MihomoConnection::Connected
+        && snapshot.mihomo.version.as_deref() == Some("1.20.0")
+        && snapshot.mihomo.connection_count == 1
+    })
+    .await;
+    assert_eq!(client.current_snapshot().mihomo.memory_bytes, 4_096);
+    assert_eq!(
+      client.current_snapshot().mihomo.current_proxy(),
+      Some("Node A")
+    );
+    assert_eq!(
+      client.current_snapshot().mihomo.groups[0].options[0].delay_ms,
+      Some(42)
+    );
+
+    client
+      .request(UiCommand::SetProxyMode(ProxyMode::Global))
+      .await
+      .expect("mode change should be accepted");
+    client
+      .request(UiCommand::SelectProxy {
+        group: "GLOBAL".to_string(),
+        proxy: "Node A".to_string(),
+      })
+      .await
+      .expect("proxy selection should be accepted");
+    wait_for_snapshot(&mut client, |snapshot| {
+      snapshot.mihomo.mode == ProxyMode::Global
+    })
+    .await;
+
+    let calls = fake.calls().expect("fake calls should be available");
+    assert!(
+      calls
+        .iter()
+        .any(|call| matches!(call, MihomoCall::PatchBaseConfig(_)))
+    );
+    assert!(calls.iter().any(|call| matches!(call, MihomoCall::SelectProxy { group, proxy } if group == "GLOBAL" && proxy == "Node A")));
     assert!(backend.shutdown().await.is_ok());
   }
 

@@ -26,6 +26,7 @@ tracing-subscriber.workspace = true
 ksni = { workspace = true, optional = true }
 rsclash-config.workspace = true
 rsclash-core.workspace = true
+rsclash-mihomo.workspace = true
 rsclash-platform.workspace = true
 rsclash-service.workspace = true
 

@@ -8,7 +8,10 @@ use std::{
   process::Command,
 };
 
-use crate::{DEFAULT_SERVICE_SOCKET, Error, InstalledServiceConfig, Result, ServiceBinaries};
+use crate::{
+  DEFAULT_CONTROLLER_RUNTIME_DIRECTORY, DEFAULT_SERVICE_SOCKET, Error, InstalledServiceConfig,
+  Result, ServiceBinaries,
+};
 
 const SERVICE_NAME: &str = "rsclash.service";
 
@@ -143,7 +146,7 @@ impl SystemServiceInstaller {
     let config = InstalledServiceConfig {
       allowed_uid: identity.uid,
       service_socket: PathBuf::from(DEFAULT_SERVICE_SOCKET),
-      controller_runtime_directory: PathBuf::from("/run/rsclash/core"),
+      controller_runtime_directory: PathBuf::from(DEFAULT_CONTROLLER_RUNTIME_DIRECTORY),
       data_directory: request.config_root.clone(),
       runtime_config: request.config_root.join("runtime.yaml"),
       binaries: ServiceBinaries {

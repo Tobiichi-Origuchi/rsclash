@@ -87,11 +87,12 @@ fn create_backend(runtime: &Runtime, wake: WakeHandle) -> BackendHandle {
   if let Err(error) = runtime.block_on(bootstrap.audit_startup()) {
     error!(%error, "failed to audit pending system state recovery");
   }
-  let backend = BackendHandle::spawn_with_core_and_recovery(
+  let backend = BackendHandle::spawn_with_core_recovery_and_mihomo(
     runtime.handle(),
     wake,
     bootstrap.core_runtime,
     bootstrap.system_recovery,
+    bootstrap.mihomo_access,
   );
   if let Err(error) = backend
     .client()

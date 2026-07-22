@@ -10,7 +10,9 @@ async-trait.workspace = true
 rsclash-config.workspace = true
 rsclash-core.workspace = true
 rsclash-domain.workspace = true
+rsclash-mihomo.workspace = true
 rsclash-platform.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tracing.workspace = true
