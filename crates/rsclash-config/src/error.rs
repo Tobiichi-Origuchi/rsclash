@@ -14,6 +14,17 @@ pub enum Error {
     InvalidConfiguration(String),
     #[error("script execution failed: {0}")]
     ScriptExecution(String),
+    #[error("Mihomo configuration validation failed: {0}")]
+    RuntimeValidation(String),
+    #[error("runtime activation failed: {0}")]
+    RuntimeActivation(String),
+    #[error(
+        "runtime activation failed: {activation_error}; compensation also failed: {compensation_error}"
+    )]
+    DeploymentCompensation {
+        activation_error: String,
+        compensation_error: String,
+    },
     #[error("invalid profile path: {0}")]
     InvalidProfilePath(String),
     #[error("invalid draft state: expected {expected}, found {actual}")]

@@ -116,6 +116,30 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn create_staging_file(destination: &Path, content: &[u8]) -> Result<PathBuf> {
+    let parent = destination.parent().ok_or_else(|| {
+        Error::InvalidConfiguration(format!("{} has no parent directory", destination.display()))
+    })?;
+    create_private_directory(parent)?;
+    reject_symlink(destination)?;
+    let path = unique_temporary_path(destination);
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .map_err(|source| Error::io("create staging file", &path, source))?;
+    set_private_file_permissions(&file, &path)?;
+    file.write_all(content)
+        .map_err(|source| Error::io("write staging file", &path, source))?;
+    file.flush()
+        .map_err(|source| Error::io("flush staging file", &path, source))?;
+    file.sync_all()
+        .map_err(|source| Error::io("sync staging file", &path, source))?;
+    drop(file);
+    sync_directory(parent)?;
+    Ok(path)
+}
+
 pub(crate) fn remove_file(path: &Path) -> Result<()> {
     reject_symlink(path)?;
     match fs::remove_file(path) {

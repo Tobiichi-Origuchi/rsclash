@@ -1,11 +1,16 @@
 //! Profile persistence and deterministic Mihomo configuration generation.
 
+mod deployment;
 pub mod enhance;
 mod error;
 mod model;
 mod store;
 mod transaction;
 
+pub use deployment::{
+    ActivationMode, CommandRuntimeValidator, DeploymentOutcome, RuntimeActivator, RuntimeDeployer,
+    RuntimeStore, RuntimeValidator,
+};
 pub use enhance::{
     ApplicationLayer, BoaScriptExecutor, EnhancementInput, EnhancementPipeline, ListenerPolicy,
     ManualLayer, ScriptExecutor, ScriptLayer, ScriptLimits, ScriptOutput, SequenceEdit,
