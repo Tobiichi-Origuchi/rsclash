@@ -3,6 +3,7 @@
 mod deployment;
 pub mod enhance;
 mod error;
+mod import;
 mod model;
 mod store;
 mod transaction;
@@ -18,6 +19,7 @@ pub use enhance::{
     lowercase_mapping, sort_top_level,
 };
 pub use error::{Error, Result};
+pub use import::{CvrImportOutcome, CvrImportReport, CvrImporter};
 pub use model::{
     ClashOverrides, ExtraFields, MihomoConfig, ProfileCatalog, ProfileItem, ProfileKind,
     ProfileOptions, ProfileSelection, RuntimeConfig, ScriptLog, SubscriptionInfo, VergeConfig,

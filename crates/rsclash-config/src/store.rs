@@ -18,10 +18,13 @@ const JOURNAL_SUFFIX: &str = ".yaml";
 pub struct ConfigPaths {
     pub root: PathBuf,
     pub profiles_dir: PathBuf,
+    pub backups_dir: PathBuf,
     pub profiles_catalog: PathBuf,
     pub verge_config: PathBuf,
     pub clash_config: PathBuf,
+    pub dns_config: PathBuf,
     pub runtime_config: PathBuf,
+    pub cvr_import_marker: PathBuf,
 }
 
 impl ConfigPaths {
@@ -29,10 +32,13 @@ impl ConfigPaths {
         let root = root.into();
         Self {
             profiles_dir: root.join("profiles"),
+            backups_dir: root.join("backups"),
             profiles_catalog: root.join("profiles.yaml"),
             verge_config: root.join("verge.yaml"),
             clash_config: root.join("clash.yaml"),
+            dns_config: root.join("dns_config.yaml"),
             runtime_config: root.join("runtime.yaml"),
+            cvr_import_marker: root.join(".cvr-imported-v1.yaml"),
             root,
         }
     }
@@ -340,7 +346,7 @@ fn unique_temporary_path(destination: &Path) -> PathBuf {
     destination.with_file_name(format!(".{name}.rsclash-{}-{id}.tmp", std::process::id()))
 }
 
-fn create_private_directory(path: &Path) -> Result<()> {
+pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path).map_err(|source| Error::io("create directory", path, source))?;
     #[cfg(unix)]
     {
