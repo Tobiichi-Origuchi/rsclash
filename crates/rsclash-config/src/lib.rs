@@ -7,8 +7,9 @@ mod store;
 mod transaction;
 
 pub use enhance::{
-    SequenceEdit, apply_deep_merge, apply_sequence_edit, cleanup_proxy_groups, lowercase_mapping,
-    sort_top_level,
+    ApplicationLayer, EnhancementInput, EnhancementPipeline, ListenerPolicy, ManualLayer,
+    ScriptExecutor, ScriptLayer, ScriptOutput, SequenceEdit, SequenceLayers, TargetPlatform,
+    apply_deep_merge, apply_sequence_edit, cleanup_proxy_groups, lowercase_mapping, sort_top_level,
 };
 pub use error::{Error, Result};
 pub use model::{
