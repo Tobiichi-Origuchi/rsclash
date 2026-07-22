@@ -1,5 +1,6 @@
 //! Asynchronous application coordinator and UI-facing client.
 
+mod change;
 mod runtime;
 
 use std::{fmt, sync::Arc, time::Duration};
@@ -16,6 +17,10 @@ use tokio::{
 };
 use tracing::{debug, info};
 
+pub use change::{
+    ChangeAction, ChangeReceipt, CompensationFailure, PreparedChange, SideEffectError,
+    SideEffectTransaction,
+};
 pub use runtime::MihomoRuntimeActivator;
 
 const COMMAND_CAPACITY: usize = 64;
