@@ -9,7 +9,7 @@ fn controller_fixtures_remain_compatible() {
     let memory: Memory = decode(include_str!("fixtures/memory.json"));
     let log: LogEntry = decode(include_str!("fixtures/log.json"));
 
-    assert_eq!(version.version, "v1.20.0");
+    assert_eq!(version.version, "v1.19.28");
     assert_eq!(proxies.proxies["GLOBAL"].now.as_deref(), Some("Node A"));
     assert_eq!(connections.connections.as_deref().map(<[_]>::len), Some(1));
     assert_eq!((traffic.up, traffic.down), (10, 20));
