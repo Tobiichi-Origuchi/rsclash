@@ -1,5 +1,13 @@
 //! Authenticated local IPC for the rsclash system service.
 
+#[cfg(target_os = "linux")]
+mod config;
+#[cfg(target_os = "linux")]
+mod daemon;
+#[cfg(target_os = "linux")]
+mod install;
+#[cfg(target_os = "linux")]
+mod lifecycle;
 #[cfg(unix)]
 mod server;
 #[cfg(unix)]
@@ -11,6 +19,14 @@ use rsclash_domain::{CoreChannel, CoreState};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(target_os = "linux")]
+pub use config::{InstalledServiceConfig, ServiceBinaries};
+#[cfg(target_os = "linux")]
+pub use daemon::CoreServiceHandler;
+#[cfg(target_os = "linux")]
+pub use install::{InstallIdentity, InstallLayout, InstallRequest, SystemServiceInstaller};
+#[cfg(target_os = "linux")]
+pub use lifecycle::LinuxServiceController;
 #[cfg(unix)]
 pub use server::{ServiceRequestHandler, ServiceServer};
 #[cfg(unix)]
@@ -18,6 +34,7 @@ pub use transport::ServiceClient;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_SERVICE_SOCKET: &str = "/run/rsclash/service.sock";
+pub const DEFAULT_INSTALLED_CONFIG: &str = "/etc/rsclash/service.json";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Request {
@@ -94,6 +111,10 @@ pub enum Error {
   ResponseMismatch { expected: u64, actual: u64 },
   #[error("service IPC path is unsafe: {0}")]
   UnsafePath(PathBuf),
+  #[error("invalid service installation: {0}")]
+  InvalidInstallation(String),
+  #[error("service installation command failed: {0}")]
+  InstallCommand(String),
   #[error("failed to encode service IPC: {0}")]
   Encode(#[source] serde_json::Error),
   #[error("failed to decode service IPC: {0}")]

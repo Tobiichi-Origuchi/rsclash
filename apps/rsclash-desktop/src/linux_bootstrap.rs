@@ -8,6 +8,7 @@ use rsclash_platform::{
   RecoveryManager, RecoveryOutcome, RecoveryReason, SystemStateRecovery as _,
   UnavailableRecoveryBackend,
 };
+use rsclash_service::{DEFAULT_SERVICE_SOCKET, LinuxServiceController, ServiceClient};
 use tokio::runtime::Handle;
 
 const DEFAULT_RUNTIME_CONFIG: &str = r"mixed-port: 7897
@@ -91,7 +92,10 @@ fn create_core_runtime_for_layout(
     &store.paths().runtime_config,
     layout.runtime_root,
   ));
-  let controller = PreferredController::new(sidecar);
+  let service = LinuxServiceController::new(
+    ServiceClient::new(DEFAULT_SERVICE_SOCKET).with_timeout(std::time::Duration::from_millis(250)),
+  );
+  let controller = PreferredController::new(sidecar).with_service(service);
   let system_recovery = Arc::new(RecoveryManager::new(
     store.paths().root.join("system-recovery.json"),
     Arc::new(UnavailableRecoveryBackend::new(

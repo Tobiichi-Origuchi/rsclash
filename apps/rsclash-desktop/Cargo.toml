@@ -27,6 +27,7 @@ ksni = { workspace = true, optional = true }
 rsclash-config.workspace = true
 rsclash-core.workspace = true
 rsclash-platform.workspace = true
+rsclash-service.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros"] }

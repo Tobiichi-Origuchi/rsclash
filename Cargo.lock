@@ -2880,6 +2880,7 @@ dependencies = [
  "rsclash-core",
  "rsclash-domain",
  "rsclash-platform",
+ "rsclash-service",
  "rsclash-ui",
  "tokio",
  "tracing",
@@ -2926,11 +2927,15 @@ name = "rsclash-service"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "rsclash-core",
  "rsclash-domain",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
