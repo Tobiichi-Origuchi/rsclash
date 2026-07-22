@@ -8,11 +8,13 @@ use tokio::time::sleep;
 use tracing::warn;
 
 use crate::{
-    ControllerConfig, ControllerEndpoint, Error, MihomoApi, Result,
+    ControllerConfig, ControllerEndpoint, Error, MihomoApi, MihomoStream, Result,
     models::{
-        BaseConfig, Connections, CoreUpdaterChannel, Groups, Proxies, Proxy, ProxyDelay,
-        ProxyProvider, ProxyProviders, RuleProviders, Rules, VersionInfo,
+        BaseConfig, Connections, CoreUpdaterChannel, Groups, LogEntry, LogLevel, Memory, Proxies,
+        Proxy, ProxyDelay, ProxyProvider, ProxyProviders, RuleProviders, Rules, Traffic,
+        VersionInfo,
     },
+    stream::StreamKind,
 };
 
 const LONG_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -83,6 +85,10 @@ impl MihomoClient {
 
     pub fn endpoint(&self) -> &ControllerEndpoint {
         &self.config.endpoint
+    }
+
+    pub(crate) fn controller_config(&self) -> &ControllerConfig {
+        &self.config
     }
 
     pub async fn health_check(&self) -> Result<VersionInfo> {
@@ -415,6 +421,22 @@ impl MihomoApi for MihomoClient {
             RequestSpec::new(Method::POST, "/upgrade/geo").with_timeout(LONG_REQUEST_TIMEOUT),
         )
         .await
+    }
+
+    async fn traffic_stream(&self) -> Result<MihomoStream<Traffic>> {
+        self.typed_stream(StreamKind::Traffic).await
+    }
+
+    async fn memory_stream(&self) -> Result<MihomoStream<Memory>> {
+        self.typed_stream(StreamKind::Memory).await
+    }
+
+    async fn connections_stream(&self) -> Result<MihomoStream<Connections>> {
+        self.typed_stream(StreamKind::Connections).await
+    }
+
+    async fn logs_stream(&self, level: LogLevel) -> Result<MihomoStream<LogEntry>> {
+        self.typed_stream(StreamKind::Logs(level)).await
     }
 }
 

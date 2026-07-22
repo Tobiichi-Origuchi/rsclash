@@ -1,15 +1,19 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, pin::Pin};
 
 use async_trait::async_trait;
+use futures_util::Stream;
 use serde_json::Value;
 
 use crate::{
     Result,
     models::{
-        BaseConfig, Connections, CoreUpdaterChannel, Groups, Proxies, Proxy, ProxyDelay,
-        ProxyProvider, ProxyProviders, RuleProviders, Rules, VersionInfo,
+        BaseConfig, Connections, CoreUpdaterChannel, Groups, LogEntry, LogLevel, Memory, Proxies,
+        Proxy, ProxyDelay, ProxyProvider, ProxyProviders, RuleProviders, Rules, Traffic,
+        VersionInfo,
     },
 };
+
+pub type MihomoStream<T> = Pin<Box<dyn Stream<Item = Result<T>> + Send + 'static>>;
 
 #[async_trait]
 pub trait MihomoApi: Send + Sync {
@@ -61,4 +65,9 @@ pub trait MihomoApi: Send + Sync {
     async fn upgrade_core(&self, channel: CoreUpdaterChannel, force: bool) -> Result<()>;
     async fn upgrade_ui(&self) -> Result<()>;
     async fn upgrade_geo(&self) -> Result<()>;
+
+    async fn traffic_stream(&self) -> Result<MihomoStream<Traffic>>;
+    async fn memory_stream(&self) -> Result<MihomoStream<Memory>>;
+    async fn connections_stream(&self) -> Result<MihomoStream<Connections>>;
+    async fn logs_stream(&self, level: LogLevel) -> Result<MihomoStream<LogEntry>>;
 }

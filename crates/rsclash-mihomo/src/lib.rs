@@ -5,8 +5,9 @@ mod client;
 mod endpoint;
 mod error;
 pub mod models;
+mod stream;
 
-pub use api::MihomoApi;
+pub use api::{MihomoApi, MihomoStream};
 pub use client::MihomoClient;
 pub use endpoint::{ControllerConfig, ControllerEndpoint, ControllerSecret};
 pub use error::{Error, Result};

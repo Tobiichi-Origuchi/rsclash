@@ -14,6 +14,8 @@ pub enum Error {
     Timeout(Duration),
     #[error("Mihomo transport failed: {0}")]
     Transport(String),
+    #[error("Mihomo WebSocket failed: {0}")]
+    WebSocket(String),
     #[error("Mihomo returned HTTP {status}: {message}")]
     HttpStatus { status: u16, message: String },
     #[error("failed to decode the Mihomo {context} response: {source}")]

@@ -229,6 +229,59 @@ pub struct Connections {
     pub extra: ExtraFields,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Traffic {
+    pub up: u64,
+    pub down: u64,
+    pub up_total: u64,
+    pub down_total: u64,
+    #[serde(flatten)]
+    pub extra: ExtraFields,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Memory {
+    pub inuse: u64,
+    pub oslimit: u64,
+    #[serde(flatten)]
+    pub extra: ExtraFields,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogEntry {
+    #[serde(rename = "type")]
+    pub level: String,
+    pub payload: String,
+    #[serde(flatten)]
+    pub extra: ExtraFields,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Debug,
+    #[default]
+    Info,
+    Warning,
+    Error,
+    Silent,
+}
+
+impl LogLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Silent => "silent",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CoreUpdaterChannel {
     #[default]
