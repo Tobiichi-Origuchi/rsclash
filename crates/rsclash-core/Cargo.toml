@@ -11,6 +11,12 @@ rsclash-domain.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rsclash-mihomo.workspace = true
+rustix.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "process"] }
+tracing.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros"] }
 

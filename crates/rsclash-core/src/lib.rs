@@ -1,5 +1,8 @@
 //! Serialized Mihomo lifecycle coordination.
 
+#[cfg(target_os = "linux")]
+mod linux;
+
 use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -10,6 +13,12 @@ use tokio::{
   sync::{mpsc, oneshot, watch},
   task::JoinHandle,
   time::timeout,
+};
+
+#[cfg(target_os = "linux")]
+pub use linux::{
+  CoreBinaries, CoreLogEntry, CoreLogStore, CoreOutputStream, LinuxSidecarConfig,
+  LinuxSidecarController,
 };
 
 const COMMAND_CAPACITY: usize = 16;

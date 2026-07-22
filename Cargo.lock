@@ -2861,8 +2861,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "rsclash-domain",
+ "rsclash-mihomo",
+ "rustix 1.1.4",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
