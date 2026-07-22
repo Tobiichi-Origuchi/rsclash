@@ -3,6 +3,7 @@ members = [
   "apps/rsclash-desktop",
   "crates/rsclash-app",
   "crates/rsclash-config",
+  "crates/rsclash-core",
   "crates/rsclash-domain",
   "crates/rsclash-mihomo",
   "crates/rsclash-ui",
@@ -43,6 +44,7 @@ urlencoding = "2.1.3"
 
 rsclash-app = { path = "crates/rsclash-app" }
 rsclash-config = { path = "crates/rsclash-config" }
+rsclash-core = { path = "crates/rsclash-core" }
 rsclash-domain = { path = "crates/rsclash-domain" }
 rsclash-mihomo = { path = "crates/rsclash-mihomo" }
 rsclash-ui = { path = "crates/rsclash-ui" }

@@ -2856,6 +2856,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsclash-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rsclash-domain",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "rsclash-desktop"
 version = "0.1.0"
 dependencies = [

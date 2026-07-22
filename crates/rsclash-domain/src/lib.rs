@@ -80,6 +80,8 @@ pub enum CoreState {
   Starting,
   Running {
     mode: CoreRunMode,
+    #[serde(default)]
+    channel: CoreChannel,
     version: Option<String>,
   },
   Reloading,
@@ -87,6 +89,14 @@ pub enum CoreState {
   Failed {
     message: String,
   },
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoreChannel {
+  #[default]
+  Stable,
+  Alpha,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
