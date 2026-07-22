@@ -2922,6 +2922,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsclash-service"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rsclash-domain",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
 name = "rsclash-ui"
 version = "0.1.0"
 dependencies = [

@@ -7,6 +7,7 @@ members = [
   "crates/rsclash-domain",
   "crates/rsclash-mihomo",
   "crates/rsclash-platform",
+  "crates/rsclash-service",
   "crates/rsclash-ui",
 ]
 resolver = "3"
@@ -50,6 +51,7 @@ rsclash-core = { path = "crates/rsclash-core" }
 rsclash-domain = { path = "crates/rsclash-domain" }
 rsclash-mihomo = { path = "crates/rsclash-mihomo" }
 rsclash-platform = { path = "crates/rsclash-platform" }
+rsclash-service = { path = "crates/rsclash-service" }
 rsclash-ui = { path = "crates/rsclash-ui" }
 
 [workspace.lints.rust]
