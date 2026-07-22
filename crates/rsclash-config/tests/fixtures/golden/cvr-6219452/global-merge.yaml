@@ -1,0 +1,11 @@
+mode: global
+mixed-port: 9000
+socks-port: 9001
+external-controller-pipe: rsclash-golden
+dns:
+  ipv6: false
+  fallback: [8.8.8.8]
+custom:
+  nested:
+    winner: global-merge
+    global-merge: true

@@ -1,0 +1,5 @@
+prepend:
+  - {name: node-pre, type: ss, server: 127.0.0.1, port: 3, cipher: aes-128-gcm, password: test}
+append:
+  - {name: node-post, type: ss, server: 127.0.0.1, port: 4, cipher: aes-128-gcm, password: test}
+delete: [node-delete]

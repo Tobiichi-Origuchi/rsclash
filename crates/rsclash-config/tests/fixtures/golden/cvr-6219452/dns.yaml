@@ -1,0 +1,8 @@
+hosts:
+  example.test: 192.0.2.1
+dns:
+  enable: true
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range6: ""
+  nameserver: [https://dns.example/dns-query]

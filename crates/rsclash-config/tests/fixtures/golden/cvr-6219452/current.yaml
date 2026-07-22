@@ -1,0 +1,31 @@
+mode: direct
+mixed-port: 7000
+socks-port: 7001
+port: 7002
+redir-port: 7003
+tproxy-port: 7004
+allow-lan: false
+bind-address: "127.0.0.1"
+log-level: warning
+ipv6: false
+external-controller: 127.0.0.1:7005
+secret: old-secret
+unified-delay: false
+dns:
+  enable: false
+  enhanced-mode: fake-ip
+  nameserver: [system]
+proxies:
+  - {name: node-a, type: ss, server: 127.0.0.1, port: 1, cipher: aes-128-gcm, password: test}
+  - {name: node-delete, type: ss, server: 127.0.0.1, port: 2, cipher: aes-128-gcm, password: test}
+proxy-providers:
+  remote: {type: http, url: "https://example.invalid/provider.yaml", path: ./remote.yaml}
+proxy-groups:
+  - {name: selector, type: select, proxies: [node-delete, node-a, missing]}
+  - {name: provider-group, type: select, use: [remote, missing-provider], proxies: [dynamic-node]}
+  - {name: deleted-group, type: select, proxies: [node-a]}
+rules: [delete-rule, keep-rule]
+custom:
+  nested:
+    winner: base
+    keep: true

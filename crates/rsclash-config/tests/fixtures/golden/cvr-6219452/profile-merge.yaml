@@ -1,0 +1,8 @@
+allow-lan: false
+tproxy-port: 9004
+dns:
+  nameserver: [profile-merge]
+custom:
+  nested:
+    winner: profile-merge
+    profile-merge: true

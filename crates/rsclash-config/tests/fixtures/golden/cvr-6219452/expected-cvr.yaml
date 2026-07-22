@@ -1,0 +1,45 @@
+mode: rule
+redir-port: 7893
+mixed-port: 7890
+port: 7892
+allow-lan: true
+log-level: info
+ipv6: true
+external-controller: 127.0.0.1:9097
+external-controller-unix: /tmp/rsclash-golden.sock
+secret: application-secret
+unified-delay: true
+bind-address: "*"
+dns:
+  enable: true
+  ipv6: true
+  enhanced-mode: fake-ip
+  fake-ip-range6: fdfe:dcba:9876::1/64
+  nameserver: [profile-script]
+  fallback: [8.8.8.8]
+hosts:
+  example.test: 192.0.2.1
+tun:
+  stack: system
+  auto-route: true
+  enable: true
+custom:
+  nested:
+    winner: profile-script
+    keep: true
+    global-merge: true
+    global-script: true
+    profile-merge: true
+    profile-script: true
+proxies:
+  - {name: node-pre, type: ss, server: 127.0.0.1, port: 3, cipher: aes-128-gcm, password: test}
+  - {name: node-a, type: ss, server: 127.0.0.1, port: 1, cipher: aes-128-gcm, password: test}
+  - {name: node-post, type: ss, server: 127.0.0.1, port: 4, cipher: aes-128-gcm, password: test}
+proxy-providers:
+  remote: {type: http, url: "https://example.invalid/provider.yaml", path: ./remote.yaml}
+proxy-groups:
+  - {name: added-group, type: select, proxies: [node-post, DIRECT]}
+  - {name: selector, type: select, proxies: [node-pre, node-post, node-a]}
+  - {name: provider-group, type: select, use: [remote], proxies: [dynamic-node]}
+  - {name: fallback, type: select, proxies: [REJECT]}
+rules: [first-rule, keep-rule, last-rule]

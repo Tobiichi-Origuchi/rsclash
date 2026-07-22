@@ -1,0 +1,5 @@
+prepend:
+  - {name: added-group, type: select, proxies: [node-post, DIRECT]}
+append:
+  - {name: fallback, type: select, proxies: [REJECT]}
+delete: [deleted-group]
