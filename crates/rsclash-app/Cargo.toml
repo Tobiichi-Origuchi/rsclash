@@ -6,7 +6,10 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+rsclash-config.workspace = true
 rsclash-domain.workspace = true
+rsclash-mihomo.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

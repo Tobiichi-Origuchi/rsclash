@@ -1,5 +1,7 @@
 //! Asynchronous application coordinator and UI-facing client.
 
+mod runtime;
+
 use std::{fmt, sync::Arc, time::Duration};
 
 use rsclash_domain::{
@@ -13,6 +15,8 @@ use tokio::{
     time::timeout,
 };
 use tracing::{debug, info};
+
+pub use runtime::MihomoRuntimeActivator;
 
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 64;
