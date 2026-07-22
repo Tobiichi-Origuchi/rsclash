@@ -1,6 +1,6 @@
 use std::{path::Path, sync::Arc};
 
-use egui::{FontData, FontDefinitions, FontFamily};
+use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 use tracing::{debug, info};
 
 pub(crate) fn install_system_cjk_font(context: &egui::Context) {

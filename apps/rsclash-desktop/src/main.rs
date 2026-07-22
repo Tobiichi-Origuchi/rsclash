@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn Error>> {
       .with_app_id("io.github.rsclash")
       .with_inner_size([1080.0, 720.0])
       .with_min_inner_size([760.0, 520.0]),
-    renderer: selected_renderer(),
+    renderer: eframe::Renderer::Glow,
     persist_window: true,
     run_and_return: true,
     ..Default::default()
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn Error>> {
       let client = backend.client();
 
       #[cfg(all(feature = "tray", target_os = "linux"))]
-      let tray = match tray::TrayHandle::new(client.clone()) {
+      let tray = match tray::TrayHandle::new(client.clone(), runtime.handle()) {
         Ok(tray) => Some(tray),
         Err(error) => {
           error!(%error, "failed to initialize the system tray; close-to-tray is disabled");
@@ -97,7 +97,7 @@ impl Drop for DesktopApp {
   fn drop(&mut self) {
     #[cfg(all(feature = "tray", target_os = "linux"))]
     if let Some(mut tray) = self.tray.take() {
-      tray.shutdown();
+      tray.shutdown(self.runtime.handle());
     }
 
     if let Some(backend) = self.backend.take()
@@ -106,26 +106,6 @@ impl Drop for DesktopApp {
       error!(%error, "application coordinator did not shut down cleanly");
     }
   }
-}
-
-fn selected_renderer() -> eframe::Renderer {
-  #[cfg(all(feature = "renderer-glow", feature = "renderer-wgpu"))]
-  if std::env::var_os("RSCLASH_RENDERER").as_deref() == Some(std::ffi::OsStr::new("wgpu")) {
-    return eframe::Renderer::Wgpu;
-  }
-
-  #[cfg(feature = "renderer-glow")]
-  {
-    eframe::Renderer::Glow
-  }
-
-  #[cfg(all(not(feature = "renderer-glow"), feature = "renderer-wgpu"))]
-  {
-    eframe::Renderer::Wgpu
-  }
-
-  #[cfg(not(any(feature = "renderer-glow", feature = "renderer-wgpu")))]
-  compile_error!("enable either the `renderer-glow` or `renderer-wgpu` feature");
 }
 
 fn init_tracing() {

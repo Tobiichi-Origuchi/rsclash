@@ -5,13 +5,12 @@ mod theme;
 use std::sync::Arc;
 
 use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, Stroke, Ui};
-use rsclash_app::{AppClient, ClientError};
+use rsclash_app::{AppClient, AppEventReceiver, ClientError};
 use rsclash_domain::{AppEvent, AppSnapshot, AppStatus, CoreState, Page, ThemeMode, UiCommand};
-use tokio::sync::broadcast;
 
 pub struct RsClashUi {
   client: AppClient,
-  events: broadcast::Receiver<AppEvent>,
+  events: AppEventReceiver,
   snapshot: Arc<AppSnapshot>,
   applied_theme: Option<ThemeMode>,
   applied_window_visibility: Option<bool>,
@@ -44,14 +43,8 @@ impl RsClashUi {
       self.snapshot = snapshot;
     }
 
-    loop {
-      match self.events.try_recv() {
-        Ok(event) => self.last_event = Some(event),
-        Err(broadcast::error::TryRecvError::Lagged(_)) => {},
-        Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
-          break;
-        },
-      }
+    while let Some(event) = self.events.try_recv() {
+      self.last_event = Some(event);
     }
 
     if self.applied_theme != Some(self.snapshot.theme) {

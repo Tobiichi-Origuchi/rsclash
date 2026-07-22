@@ -12,7 +12,10 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

@@ -12,16 +12,20 @@ for command_name in "${required_commands[@]}"; do
   fi
 done
 
-if ! cargo deny --version >/dev/null 2>&1; then
-  echo "Required Cargo subcommand not found: cargo-deny" >&2
-  exit 127
-fi
+required_cargo_subcommands=(cargo-deny cargo-machete)
+for cargo_subcommand in "${required_cargo_subcommands[@]}"; do
+  if ! "${cargo_subcommand}" --version >/dev/null 2>&1; then
+    echo "Required Cargo subcommand not found: ${cargo_subcommand}" >&2
+    exit 127
+  fi
+done
 
 cargo fmt --all -- --check
 taplo format --check
 taplo lint
 shellcheck scripts/*.sh
 actionlint
+cargo machete --with-metadata
 cargo check --locked --workspace --all-targets --all-features
 cargo clippy --locked --workspace --all-targets --all-features
 cargo test --locked --workspace --all-targets --all-features

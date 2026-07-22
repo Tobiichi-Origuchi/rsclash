@@ -1,38 +1,41 @@
 use std::sync::LazyLock;
 
 use ksni::{
-  blocking::TrayMethods as _,
+  TrayMethods as _,
   menu::{MenuItem, StandardItem},
 };
 use rsclash_app::AppClient;
 use rsclash_domain::UiCommand;
+use tokio::runtime::Handle as RuntimeHandle;
 use tracing::{debug, warn};
 
 const ICON_SIZE: i32 = 32;
 static APP_ICON: LazyLock<ksni::Icon> = LazyLock::new(app_icon);
 
 pub(crate) struct TrayHandle {
-  handle: Option<ksni::blocking::Handle<AppTray>>,
+  handle: Option<ksni::Handle<AppTray>>,
 }
 
 impl TrayHandle {
-  pub(crate) fn new(client: AppClient) -> Result<Self, ksni::Error> {
-    let handle = AppTray { client }.spawn()?;
+  pub(crate) fn new(client: AppClient, runtime: &RuntimeHandle) -> Result<Self, ksni::Error> {
+    let handle = runtime.block_on(AppTray { client }.spawn())?;
     Ok(Self {
       handle: Some(handle),
     })
   }
 
-  pub(crate) fn shutdown(&mut self) {
+  pub(crate) fn shutdown(&mut self, runtime: &RuntimeHandle) {
     if let Some(handle) = self.handle.take() {
-      handle.shutdown().wait();
+      runtime.block_on(handle.shutdown());
     }
   }
 }
 
 impl Drop for TrayHandle {
   fn drop(&mut self) {
-    self.shutdown();
+    if let Some(handle) = self.handle.take() {
+      drop(handle.shutdown());
+    }
   }
 }
 

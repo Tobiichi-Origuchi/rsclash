@@ -10,18 +10,15 @@ name = "rsclash"
 path = "src/main.rs"
 
 [features]
-default = ["renderer-glow", "tray"]
-renderer-glow = ["eframe/glow"]
-renderer-wgpu = ["eframe/wgpu"]
+default = ["tray"]
 tray = ["dep:ksni"]
 
 [dependencies]
-eframe.workspace = true
-egui.workspace = true
+eframe = { workspace = true, features = ["glow"] }
 rsclash-app.workspace = true
 rsclash-domain.workspace = true
 rsclash-ui.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

@@ -65,6 +65,24 @@ pub struct AppClient {
   event_tx: broadcast::Sender<AppEvent>,
 }
 
+pub struct AppEventReceiver {
+  receiver: broadcast::Receiver<AppEvent>,
+}
+
+impl AppEventReceiver {
+  pub fn try_recv(&mut self) -> Option<AppEvent> {
+    loop {
+      match self.receiver.try_recv() {
+        Ok(event) => return Some(event),
+        Err(broadcast::error::TryRecvError::Lagged(_)) => {},
+        Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+          return None;
+        },
+      }
+    }
+  }
+}
+
 impl AppClient {
   pub fn current_snapshot(&self) -> Arc<AppSnapshot> {
     self.snapshot_rx.borrow().clone()
@@ -95,8 +113,10 @@ impl AppClient {
     Ok(snapshot)
   }
 
-  pub fn subscribe_events(&self) -> broadcast::Receiver<AppEvent> {
-    self.event_tx.subscribe()
+  pub fn subscribe_events(&self) -> AppEventReceiver {
+    AppEventReceiver {
+      receiver: self.event_tx.subscribe(),
+    }
   }
 
   pub fn try_command(&self, command: UiCommand) -> Result<(), ClientError> {
@@ -322,10 +342,10 @@ impl Coordinator {
 mod tests {
   use std::time::Duration;
 
-  use rsclash_domain::{AppStatus, CommandOutput, Page, ThemeMode, UiCommand};
-  use tokio::time::timeout;
+  use rsclash_domain::{AppEvent, AppStatus, CommandOutput, Page, ThemeMode, UiCommand};
+  use tokio::{sync::broadcast, time::timeout};
 
-  use super::{BackendHandle, WakeHandle};
+  use super::{AppEventReceiver, BackendHandle, WakeHandle};
 
   async fn wait_for_snapshot(
     client: &mut super::AppClient,
@@ -342,6 +362,19 @@ mod tests {
     .await;
 
     assert!(matches!(result, Ok(Ok(()))));
+  }
+
+  #[test]
+  fn event_receiver_skips_lagged_events() {
+    let (sender, _) = broadcast::channel(1);
+    let mut events = AppEventReceiver {
+      receiver: sender.subscribe(),
+    };
+
+    assert!(sender.send(AppEvent::BackendReady).is_ok());
+    assert!(sender.send(AppEvent::ShuttingDown).is_ok());
+    assert_eq!(events.try_recv(), Some(AppEvent::ShuttingDown));
+    assert_eq!(events.try_recv(), None);
   }
 
   #[tokio::test]

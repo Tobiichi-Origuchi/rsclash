@@ -50,6 +50,22 @@ duplicates = "deny"
 include-path-dependencies = false
 unused = "deny"
 
+[[bans.features]]
+crate = "boa_engine"
+deny = ["float16", "xsum"]
+
+[[bans.features]]
+crate = "eframe"
+deny = ["accesskit", "wgpu", "wgpu_no_default_features"]
+
+[[bans.features]]
+crate = "ksni"
+deny = ["async-io", "blocking"]
+
+[[bans.features]]
+crate = "tracing-subscriber"
+deny = ["ansi"]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

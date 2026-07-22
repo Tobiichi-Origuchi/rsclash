@@ -29,6 +29,7 @@ Install the pinned repository tools with:
 ```shell
 cargo install --locked taplo-cli --version 0.10.0
 cargo install --locked cargo-deny --version 0.20.2
+cargo install --locked cargo-machete --version 0.9.2
 ```
 
 Install actionlint 1.7.10 from its official release and place the `actionlint` binary on `PATH`.
@@ -42,8 +43,9 @@ Run the complete local gate before committing:
 ```
 
 The script checks Rust and TOML formatting, TOML validity, shell scripts, GitHub Actions workflows,
-compilation of every target and feature, strict Clippy lints, unit and documentation tests, rustdoc
-warnings, dependency advisories, licenses, duplicate versions, and dependency sources.
+unused direct dependencies, compilation of every target and feature, strict Clippy lints, unit and
+documentation tests, rustdoc warnings, dependency advisories, licenses, duplicate versions, and
+dependency sources.
 `cargo-deny` refreshes its advisory database, so the complete check may require network access.
 
 Use the real Mihomo integration suite after changing the client or runtime deployment code:
@@ -74,10 +76,16 @@ outside the repository.
 Dependencies must be declared in the workspace when shared and must use an exact compatible lower
 bound rather than a wildcard. The lockfile is committed, and CI commands use `--locked`.
 
+Start with default features disabled when an external crate's defaults select optional behavior.
+Enable only features exercised by the current Linux implementation, and declare runtime features
+in the member crate that owns the API use. Do not keep speculative renderers, platform backends, or
+future capabilities in the feature graph. A new dependency or feature must identify its current
+code path and pass `cargo machete --with-metadata`; remove it when that code path disappears.
+
 `deny.toml` rejects unknown registries, Git dependencies, wildcard dependency requirements, known
-vulnerabilities, yanked crates, and unapproved licenses. Every advisory or license exception must be
-narrow, documented, and removed as soon as the transitive dependency permits it. Stale exceptions
-are errors.
+vulnerabilities, yanked crates, unapproved licenses, and deliberately excluded heavyweight
+features. Every advisory, license, or feature exception must be narrow, documented, and removed as
+soon as the dependency graph permits it. Stale exceptions are errors.
 
 Rust 1.92 is the verified dependency floor for egui/eframe 0.35. Raising the MSRV must be a deliberate
 standalone change: update `Cargo.toml`, `rust-toolchain.toml`, and `.clippy.toml`; pass the complete
