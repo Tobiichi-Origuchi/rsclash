@@ -1,16 +1,28 @@
 use async_trait::async_trait;
 use rsclash_core::{ControllerError, LifecycleController, RunningCore, ServiceLifecycleController};
 use rsclash_domain::{CoreChannel, CoreRunMode, CoreState};
+use std::time::Duration;
+use tokio::time::timeout;
 
 use crate::{ServiceClient, ServiceCommand};
 
 pub struct LinuxServiceController {
   client: ServiceClient,
+  probe_timeout: Duration,
 }
 
 impl LinuxServiceController {
   pub const fn new(client: ServiceClient) -> Self {
-    Self { client }
+    Self {
+      client,
+      probe_timeout: Duration::from_millis(250),
+    }
+  }
+
+  #[must_use]
+  pub const fn with_probe_timeout(mut self, probe_timeout: Duration) -> Self {
+    self.probe_timeout = probe_timeout;
+    self
   }
 
   fn running(state: CoreState) -> Result<RunningCore, ControllerError> {
@@ -27,7 +39,11 @@ impl LinuxServiceController {
 #[async_trait]
 impl ServiceLifecycleController for LinuxServiceController {
   async fn is_available(&mut self) -> Result<bool, ControllerError> {
-    match self.client.ping().await {
+    let ping = match timeout(self.probe_timeout, self.client.ping()).await {
+      Ok(result) => result,
+      Err(_) => return Ok(false),
+    };
+    match ping {
       Ok(version) if version == env!("CARGO_PKG_VERSION") => Ok(true),
       Ok(version) => Err(ControllerError::new(format!(
         "service version mismatch: GUI {}, service {version}",

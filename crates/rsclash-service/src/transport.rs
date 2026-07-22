@@ -19,7 +19,7 @@ use crate::{
 };
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
-const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
 pub struct ServiceClient {

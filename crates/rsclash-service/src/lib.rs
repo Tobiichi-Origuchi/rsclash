@@ -35,6 +35,7 @@ pub use transport::ServiceClient;
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const DEFAULT_SERVICE_SOCKET: &str = "/run/rsclash/service.sock";
 pub const DEFAULT_INSTALLED_CONFIG: &str = "/etc/rsclash/service.json";
+pub const DEFAULT_INSTALLED_CORE: &str = "/usr/lib/rsclash/mihomo";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Request {

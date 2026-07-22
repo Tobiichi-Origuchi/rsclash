@@ -17,6 +17,10 @@ path = "src/bin/install.rs"
 name = "rsclash-service-setup"
 path = "src/bin/setup.rs"
 
+[[bin]]
+name = "rsclash-service-control"
+path = "src/bin/control.rs"
+
 [dependencies]
 async-trait.workspace = true
 rsclash-core.workspace = true
@@ -25,6 +29,7 @@ rsclash-domain.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = [
   "fs",

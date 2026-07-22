@@ -10,6 +10,9 @@ use rsclash_config::initialize_default_runtime;
 fn main() -> Result<(), Box<dyn Error>> {
   let arguments = parse_arguments()?;
   initialize_default_runtime(&arguments.config_root)?;
+  if arguments.initialize_only {
+    return Ok(());
+  }
   let status = Command::new("pkexec")
     .arg(&arguments.installer)
     .arg("--service-binary")
@@ -46,6 +49,7 @@ struct SetupArguments {
   stable_core: PathBuf,
   alpha_core: Option<PathBuf>,
   config_root: PathBuf,
+  initialize_only: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -57,8 +61,16 @@ fn parse_arguments() -> Result<SetupArguments, String> {
   let mut stable_core = None;
   let mut alpha_core = None;
   let mut config_root = None;
+  let mut initialize_only = false;
   let mut arguments = env::args_os().skip(1);
   while let Some(flag) = arguments.next() {
+    if flag == "--initialize-only" {
+      if initialize_only {
+        return Err("duplicate argument: --initialize-only".to_string());
+      }
+      initialize_only = true;
+      continue;
+    }
     let value = arguments
       .next()
       .ok_or_else(|| format!("missing value for {}", flag.to_string_lossy()))?;
@@ -74,9 +86,14 @@ fn parse_arguments() -> Result<SetupArguments, String> {
   Ok(SetupArguments {
     installer: installer.unwrap_or_else(|| sibling("rsclash-service-install")),
     service_binary: service_binary.unwrap_or_else(|| sibling("rsclash-service")),
-    stable_core: stable_core.ok_or_else(usage)?,
+    stable_core: match (stable_core, initialize_only) {
+      (Some(path), _) => path,
+      (None, true) => PathBuf::new(),
+      (None, false) => return Err(usage()),
+    },
     alpha_core,
     config_root: config_root.map_or_else(default_config_root, Ok)?,
+    initialize_only,
   })
 }
 
@@ -106,5 +123,5 @@ fn set_once(target: &mut Option<PathBuf>, value: OsString, flag: &str) -> Result
 
 #[cfg(target_os = "linux")]
 fn usage() -> String {
-  "usage: rsclash-service-setup --stable-core PATH [--alpha-core PATH] [--config-root PATH] [--installer PATH] [--service-binary PATH]".to_string()
+  "usage: rsclash-service-setup (--stable-core PATH [--alpha-core PATH] | --initialize-only) [--config-root PATH] [--installer PATH] [--service-binary PATH]".to_string()
 }

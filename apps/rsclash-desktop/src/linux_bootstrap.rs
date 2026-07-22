@@ -69,9 +69,7 @@ fn create_core_runtime_for_layout(
     &store.paths().runtime_config,
     layout.runtime_root,
   ));
-  let service = LinuxServiceController::new(
-    ServiceClient::new(DEFAULT_SERVICE_SOCKET).with_timeout(std::time::Duration::from_millis(250)),
-  );
+  let service = LinuxServiceController::new(ServiceClient::new(DEFAULT_SERVICE_SOCKET));
   let controller = PreferredController::new(sidecar).with_service(service);
   let system_recovery = Arc::new(RecoveryManager::new(
     store.paths().root.join("system-recovery.json"),

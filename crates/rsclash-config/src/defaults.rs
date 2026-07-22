@@ -1,6 +1,22 @@
-use std::path::Path;
+use std::{fs, path::Path};
 
-use crate::{MihomoConfig, ProfileStore, Result, RuntimeStore};
+use crate::{MihomoConfig, ProfileStore, Result, RuntimeStore, store::atomic_write};
+
+const LEGACY_RUNTIME_CONFIG: &str = r"mixed-port: 7897
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+proxies: []
+proxy-groups:
+  - name: GLOBAL
+    type: select
+    proxies:
+      - DIRECT
+      - REJECT
+rules:
+  - MATCH,GLOBAL
+";
 
 pub const DEFAULT_RUNTIME_CONFIG: &str = r"mixed-port: 17897
 allow-lan: false
@@ -32,8 +48,22 @@ pub fn initialize_default_runtime(config_root: &Path) -> Result<ProfileStore> {
   let store = ProfileStore::open(config_root)?;
   let runtime_store = RuntimeStore::open(&store.paths().runtime_config)?;
   let config = MihomoConfig::parse(DEFAULT_RUNTIME_CONFIG)?;
-  runtime_store.initialize_if_missing(&config)?;
+  if !runtime_store.initialize_if_missing(&config)? {
+    migrate_legacy_runtime(runtime_store.path(), &config)?;
+  }
   Ok(store)
+}
+
+fn migrate_legacy_runtime(path: &Path, replacement: &MihomoConfig) -> Result<bool> {
+  let source = fs::read_to_string(path).map_err(|source| crate::Error::io("read", path, source))?;
+  let Ok(current) = MihomoConfig::parse(&source) else {
+    return Ok(false);
+  };
+  if current != MihomoConfig::parse(LEGACY_RUNTIME_CONFIG)? {
+    return Ok(false);
+  }
+  atomic_write(path, replacement.to_yaml()?.as_bytes())?;
+  Ok(true)
 }
 
 #[cfg(test)]
@@ -44,7 +74,7 @@ mod tests {
     sync::atomic::{AtomicU64, Ordering},
   };
 
-  use super::{DEFAULT_RUNTIME_CONFIG, initialize_default_runtime};
+  use super::{DEFAULT_RUNTIME_CONFIG, LEGACY_RUNTIME_CONFIG, initialize_default_runtime};
   use crate::MihomoConfig;
 
   #[test]
@@ -90,6 +120,25 @@ mod tests {
         .as_deref(),
       Some("mixed-port: 1\n")
     );
+    let _ = fs::remove_dir_all(root);
+  }
+
+  #[test]
+  fn initialization_migrates_only_the_original_generated_runtime() {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+      "rsclash-default-migration-test-{}-{}",
+      std::process::id(),
+      NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let store = initialize_default_runtime(&root).expect("default runtime should initialize");
+    fs::write(&store.paths().runtime_config, LEGACY_RUNTIME_CONFIG)
+      .expect("legacy runtime should be written");
+    initialize_default_runtime(&root).expect("legacy runtime should migrate");
+    let migrated = fs::read_to_string(&store.paths().runtime_config)
+      .expect("migrated runtime should be readable");
+    assert!(migrated.contains("mixed-port: 17897"));
+    assert!(migrated.contains("device: rsclash"));
     let _ = fs::remove_dir_all(root);
   }
 }
