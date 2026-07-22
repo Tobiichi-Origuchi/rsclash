@@ -45,27 +45,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
       let repaint_context = creation.egui_ctx.clone();
       let wake = WakeHandle::new(move || repaint_context.request_repaint());
-      #[cfg(target_os = "linux")]
-      let (backend, auto_start_core) = match linux_bootstrap::create_core_runtime(runtime.handle())
-      {
-        Ok(core_runtime) => (
-          BackendHandle::spawn_with_core(runtime.handle(), wake, core_runtime),
-          true,
-        ),
-        Err(error) => {
-          error!(%error, "failed to configure the Mihomo sidecar");
-          (BackendHandle::spawn(runtime.handle(), wake), false)
-        },
-      };
-      #[cfg(not(target_os = "linux"))]
-      let backend = BackendHandle::spawn(runtime.handle(), wake);
+      let backend = create_backend(&runtime, wake);
       let client = backend.client();
-      #[cfg(target_os = "linux")]
-      if auto_start_core
-        && let Err(error) = client.try_command(UiCommand::StartCore(CoreChannel::Stable))
-      {
-        error!(%error, "failed to queue Mihomo startup");
-      }
 
       #[cfg(all(feature = "tray", target_os = "linux"))]
       let tray = match tray::TrayHandle::new(client.clone(), runtime.handle()) {
@@ -92,6 +73,38 @@ fn main() -> Result<(), Box<dyn Error>> {
   )?;
 
   Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn create_backend(runtime: &Runtime, wake: WakeHandle) -> BackendHandle {
+  let bootstrap = match linux_bootstrap::create_core_runtime(runtime.handle()) {
+    Ok(bootstrap) => bootstrap,
+    Err(error) => {
+      error!(%error, "failed to configure the Mihomo sidecar");
+      return BackendHandle::spawn(runtime.handle(), wake);
+    },
+  };
+  if let Err(error) = runtime.block_on(bootstrap.audit_startup()) {
+    error!(%error, "failed to audit pending system state recovery");
+  }
+  let backend = BackendHandle::spawn_with_core_and_recovery(
+    runtime.handle(),
+    wake,
+    bootstrap.core_runtime,
+    bootstrap.system_recovery,
+  );
+  if let Err(error) = backend
+    .client()
+    .try_command(UiCommand::StartCore(CoreChannel::Stable))
+  {
+    error!(%error, "failed to queue Mihomo startup");
+  }
+  backend
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_backend(runtime: &Runtime, wake: WakeHandle) -> BackendHandle {
+  BackendHandle::spawn(runtime.handle(), wake)
 }
 
 struct DesktopApp {

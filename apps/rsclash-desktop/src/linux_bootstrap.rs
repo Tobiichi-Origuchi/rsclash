@@ -1,7 +1,11 @@
-use std::{env, path::PathBuf};
+use std::{env, path::PathBuf, sync::Arc};
 
 use rsclash_config::{MihomoConfig, ProfileStore, RuntimeStore};
 use rsclash_core::{CoreBinaries, CoreRuntime, LinuxSidecarConfig, LinuxSidecarController};
+use rsclash_platform::{
+  RecoveryManager, RecoveryOutcome, RecoveryReason, SystemStateRecovery as _,
+  UnavailableRecoveryBackend,
+};
 use tokio::runtime::Handle;
 
 const DEFAULT_RUNTIME_CONFIG: &str = r"mixed-port: 7897
@@ -20,7 +24,7 @@ rules:
   - MATCH,GLOBAL
 ";
 
-pub(crate) fn create_core_runtime(runtime: &Handle) -> Result<CoreRuntime, String> {
+pub(crate) fn create_core_runtime(runtime: &Handle) -> Result<LinuxBootstrap, String> {
   let home = home_directory()?;
   let config_root = xdg_directory("XDG_CONFIG_HOME")
     .unwrap_or_else(|| home.join(".config"))
@@ -51,10 +55,24 @@ struct BootstrapLayout {
   binaries: CoreBinaries,
 }
 
+pub(crate) struct LinuxBootstrap {
+  pub core_runtime: CoreRuntime,
+  pub system_recovery: Arc<RecoveryManager>,
+}
+
+impl LinuxBootstrap {
+  pub(crate) async fn audit_startup(&self) -> rsclash_platform::Result<RecoveryOutcome> {
+    self
+      .system_recovery
+      .restore_pending(RecoveryReason::StartupAudit)
+      .await
+  }
+}
+
 fn create_core_runtime_for_layout(
   runtime: &Handle,
   layout: BootstrapLayout,
-) -> Result<CoreRuntime, String> {
+) -> Result<LinuxBootstrap, String> {
   let store = ProfileStore::open(&layout.config_root)
     .map_err(|error| format!("open the rsclash configuration directory: {error}"))?;
   let runtime_store = RuntimeStore::open(&store.paths().runtime_config)
@@ -71,7 +89,16 @@ fn create_core_runtime_for_layout(
     &store.paths().runtime_config,
     layout.runtime_root,
   ));
-  Ok(CoreRuntime::spawn(runtime, controller))
+  let system_recovery = Arc::new(RecoveryManager::new(
+    store.paths().root.join("system-recovery.json"),
+    Arc::new(UnavailableRecoveryBackend::new(
+      "Linux system proxy and TUN recovery are not implemented yet",
+    )),
+  ));
+  Ok(LinuxBootstrap {
+    core_runtime: CoreRuntime::spawn(runtime, controller),
+    system_recovery,
+  })
 }
 
 fn home_directory() -> Result<PathBuf, String> {
@@ -129,6 +156,7 @@ mod tests {
   use rsclash_app::{BackendHandle, WakeHandle};
   use rsclash_core::CoreBinaries;
   use rsclash_domain::{CoreChannel, CoreState, UiCommand};
+  use rsclash_platform::RecoveryOutcome;
 
   use super::{BootstrapLayout, create_core_runtime_for_layout};
 
@@ -139,7 +167,7 @@ mod tests {
       .expect("RSCLASH_MIHOMO_BIN must point to the pinned Mihomo binary");
     let directory = TestDirectory::new();
     let config_root = directory.path().join("config");
-    let core_runtime = create_core_runtime_for_layout(
+    let bootstrap = create_core_runtime_for_layout(
       &tokio::runtime::Handle::current(),
       BootstrapLayout {
         config_root: config_root.clone(),
@@ -148,6 +176,13 @@ mod tests {
       },
     )
     .expect("empty layout should initialize");
+    assert_eq!(
+      bootstrap
+        .audit_startup()
+        .await
+        .expect("empty recovery audit should succeed"),
+      RecoveryOutcome::NothingPending
+    );
     let runtime_path = config_root.join("runtime.yaml");
     let generated = fs::read_to_string(&runtime_path).expect("runtime config should be generated");
     assert!(generated.contains("mixed-port: 7897"));
@@ -157,10 +192,11 @@ mod tests {
     )
     .expect("integration port should be replaced");
 
-    let backend = BackendHandle::spawn_with_core(
+    let backend = BackendHandle::spawn_with_core_and_recovery(
       &tokio::runtime::Handle::current(),
       WakeHandle::default(),
-      core_runtime,
+      bootstrap.core_runtime,
+      bootstrap.system_recovery,
     );
     let mut client = backend.client();
     client

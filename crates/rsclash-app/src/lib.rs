@@ -10,6 +10,7 @@ use rsclash_domain::{
   AppEvent, AppSnapshot, AppStatus, CommandError, CommandOutput, CommandResult, CoreChannel,
   CoreState, ErrorView, UiCommand,
 };
+use rsclash_platform::{RecoveryReason, SystemStateRecovery};
 use thiserror::Error;
 use tokio::{
   runtime::Handle,
@@ -182,6 +183,8 @@ pub enum BackendError {
   TaskFailed(String),
   #[error("the core runtime did not shut down cleanly: {0}")]
   CoreShutdown(String),
+  #[error("system state recovery failed during shutdown: {0}")]
+  SystemRecovery(String),
 }
 
 pub struct BackendHandle {
@@ -190,18 +193,33 @@ pub struct BackendHandle {
   core_relay: Option<JoinHandle<()>>,
   core_worker: Option<JoinHandle<()>>,
   core_runtime: Option<CoreRuntime>,
+  system_recovery: Option<Arc<dyn SystemStateRecovery>>,
 }
 
 impl BackendHandle {
   pub fn spawn(runtime: &Handle, wake: WakeHandle) -> Self {
-    Self::spawn_inner(runtime, wake, None)
+    Self::spawn_inner(runtime, wake, None, None)
   }
 
   pub fn spawn_with_core(runtime: &Handle, wake: WakeHandle, core_runtime: CoreRuntime) -> Self {
-    Self::spawn_inner(runtime, wake, Some(core_runtime))
+    Self::spawn_inner(runtime, wake, Some(core_runtime), None)
   }
 
-  fn spawn_inner(runtime: &Handle, wake: WakeHandle, core_runtime: Option<CoreRuntime>) -> Self {
+  pub fn spawn_with_core_and_recovery(
+    runtime: &Handle,
+    wake: WakeHandle,
+    core_runtime: CoreRuntime,
+    system_recovery: Arc<dyn SystemStateRecovery>,
+  ) -> Self {
+    Self::spawn_inner(runtime, wake, Some(core_runtime), Some(system_recovery))
+  }
+
+  fn spawn_inner(
+    runtime: &Handle,
+    wake: WakeHandle,
+    core_runtime: Option<CoreRuntime>,
+    system_recovery: Option<Arc<dyn SystemStateRecovery>>,
+  ) -> Self {
     let core = core_runtime.as_ref().map(CoreRuntime::handle);
     let mut initial_snapshot = AppSnapshot::default();
     if let Some(core) = &core {
@@ -250,6 +268,7 @@ impl BackendHandle {
       core_relay,
       core_worker,
       core_runtime,
+      system_recovery,
     }
   }
 
@@ -285,6 +304,16 @@ impl BackendHandle {
       let _ = core_worker.await;
     }
 
+    let recovery_result = if let Some(system_recovery) = self.system_recovery.take() {
+      system_recovery
+        .restore_pending(RecoveryReason::CleanShutdown)
+        .await
+        .map(|_| ())
+        .map_err(|error| BackendError::SystemRecovery(error.to_string()))
+    } else {
+      Ok(())
+    };
+
     let core_result = if let Some(core_runtime) = self.core_runtime.take() {
       core_runtime
         .shutdown()
@@ -294,6 +323,7 @@ impl BackendHandle {
       Ok(())
     };
     coordinator_result?;
+    recovery_result?;
     core_result
   }
 }
@@ -310,6 +340,7 @@ impl Drop for BackendHandle {
     if let Some(core_worker) = self.core_worker.take() {
       core_worker.abort();
     }
+    let _ = self.system_recovery.take();
     let _ = self.core_runtime.take();
   }
 }
@@ -550,6 +581,9 @@ mod tests {
     AppEvent, AppStatus, CommandOutput, CoreChannel, CoreRunMode, CoreState, Page, ThemeMode,
     UiCommand,
   };
+  use rsclash_platform::{
+    RecoveryOutcome, RecoveryReason, Result as RecoveryResult, SystemStateRecovery,
+  };
   use tokio::{sync::broadcast, time::timeout};
 
   use super::{AppEventReceiver, BackendHandle, WakeHandle};
@@ -563,6 +597,50 @@ mod tests {
 
   struct BridgeController {
     calls: Arc<Mutex<Vec<CoreCall>>>,
+  }
+
+  struct OrderedController {
+    order: Arc<Mutex<Vec<&'static str>>>,
+  }
+
+  #[async_trait]
+  impl LifecycleController for OrderedController {
+    async fn start(&mut self, _channel: CoreChannel) -> Result<RunningCore, ControllerError> {
+      Ok(BridgeController::running())
+    }
+
+    async fn stop(&mut self) -> Result<(), ControllerError> {
+      self
+        .order
+        .lock()
+        .expect("shutdown order lock should be available")
+        .push("core");
+      Ok(())
+    }
+
+    async fn reload(&mut self) -> Result<RunningCore, ControllerError> {
+      Ok(BridgeController::running())
+    }
+
+    async fn health_check(&mut self) -> Result<RunningCore, ControllerError> {
+      Ok(BridgeController::running())
+    }
+  }
+
+  struct OrderedRecovery {
+    order: Arc<Mutex<Vec<&'static str>>>,
+  }
+
+  #[async_trait]
+  impl SystemStateRecovery for OrderedRecovery {
+    async fn restore_pending(&self, _reason: RecoveryReason) -> RecoveryResult<RecoveryOutcome> {
+      self
+        .order
+        .lock()
+        .expect("shutdown order lock should be available")
+        .push("recovery");
+      Ok(RecoveryOutcome::NothingPending)
+    }
   }
 
   impl BridgeController {
@@ -742,5 +820,37 @@ mod tests {
       vec![CoreCall::Start(CoreChannel::Stable), CoreCall::Reload]
     );
     assert!(backend.shutdown().await.is_ok());
+  }
+
+  #[tokio::test]
+  async fn shutdown_restores_system_state_before_stopping_the_core() {
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let core_runtime = CoreRuntime::spawn(
+      &tokio::runtime::Handle::current(),
+      OrderedController {
+        order: Arc::clone(&order),
+      },
+    );
+    core_runtime
+      .handle()
+      .start(CoreChannel::Stable)
+      .await
+      .expect("core should start");
+    let backend = BackendHandle::spawn_with_core_and_recovery(
+      &tokio::runtime::Handle::current(),
+      WakeHandle::default(),
+      core_runtime,
+      Arc::new(OrderedRecovery {
+        order: Arc::clone(&order),
+      }),
+    );
+
+    assert!(backend.shutdown().await.is_ok());
+    assert_eq!(
+      *order
+        .lock()
+        .expect("shutdown order lock should be available"),
+      vec!["recovery", "core"]
+    );
   }
 }
