@@ -142,6 +142,14 @@ impl RuntimeStore {
     &self.runtime_path
   }
 
+  pub fn initialize_if_missing(&self, config: &MihomoConfig) -> Result<bool> {
+    if read_bytes_if_exists(&self.runtime_path)?.is_some() {
+      return Ok(false);
+    }
+    atomic_write(&self.runtime_path, config.to_yaml()?.as_bytes())?;
+    Ok(true)
+  }
+
   async fn prepare(
     &self,
     config: &MihomoConfig,
@@ -478,6 +486,28 @@ mod tests {
       "mode: rule\n"
     );
     assert_no_staging_files(&directory.path);
+  }
+
+  #[test]
+  fn initializes_an_empty_runtime_without_replacing_existing_content() {
+    let directory = TestDirectory::new();
+    let runtime_path = directory.path.join("runtime.yaml");
+    let store = RuntimeStore::open(&runtime_path).expect("store should open");
+
+    assert!(
+      store
+        .initialize_if_missing(&config("mode: rule"))
+        .expect("empty runtime should initialize")
+    );
+    assert!(
+      !store
+        .initialize_if_missing(&config("mode: global"))
+        .expect("existing runtime should remain unchanged")
+    );
+    assert_eq!(
+      fs::read_to_string(runtime_path).expect("runtime should be readable"),
+      "mode: rule\n"
+    );
   }
 
   #[tokio::test]

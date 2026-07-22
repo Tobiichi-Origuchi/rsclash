@@ -1,4 +1,6 @@
 mod fonts;
+#[cfg(target_os = "linux")]
+mod linux_bootstrap;
 #[cfg(all(feature = "tray", target_os = "linux"))]
 mod tray;
 
@@ -6,6 +8,8 @@ use std::{error::Error, time::Duration};
 
 use eframe::egui;
 use rsclash_app::{BackendHandle, WakeHandle};
+#[cfg(target_os = "linux")]
+use rsclash_domain::{CoreChannel, UiCommand};
 use rsclash_ui::RsClashUi;
 use tokio::runtime::{Builder, Runtime};
 use tracing::{error, info};
@@ -41,8 +45,27 @@ fn main() -> Result<(), Box<dyn Error>> {
 
       let repaint_context = creation.egui_ctx.clone();
       let wake = WakeHandle::new(move || repaint_context.request_repaint());
+      #[cfg(target_os = "linux")]
+      let (backend, auto_start_core) = match linux_bootstrap::create_core_runtime(runtime.handle())
+      {
+        Ok(core_runtime) => (
+          BackendHandle::spawn_with_core(runtime.handle(), wake, core_runtime),
+          true,
+        ),
+        Err(error) => {
+          error!(%error, "failed to configure the Mihomo sidecar");
+          (BackendHandle::spawn(runtime.handle(), wake), false)
+        },
+      };
+      #[cfg(not(target_os = "linux"))]
       let backend = BackendHandle::spawn(runtime.handle(), wake);
       let client = backend.client();
+      #[cfg(target_os = "linux")]
+      if auto_start_core
+        && let Err(error) = client.try_command(UiCommand::StartCore(CoreChannel::Stable))
+      {
+        error!(%error, "failed to queue Mihomo startup");
+      }
 
       #[cfg(all(feature = "tray", target_os = "linux"))]
       let tray = match tray::TrayHandle::new(client.clone(), runtime.handle()) {

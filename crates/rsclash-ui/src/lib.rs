@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, Stroke, Ui};
 use rsclash_app::{AppClient, AppEventReceiver, ClientError};
-use rsclash_domain::{AppEvent, AppSnapshot, AppStatus, CoreState, Page, ThemeMode, UiCommand};
+use rsclash_domain::{
+  AppEvent, AppSnapshot, AppStatus, CoreChannel, CoreRunMode, CoreState, Page, ThemeMode, UiCommand,
+};
 
 pub struct RsClashUi {
   client: AppClient,
@@ -166,6 +168,29 @@ impl RsClashUi {
   }
 
   fn page(&mut self, ui: &mut Ui) {
+    if let Some(error) = self.snapshot.last_error.clone() {
+      Frame::new()
+        .fill(ui.visuals().error_fg_color.gamma_multiply(0.08))
+        .stroke(Stroke::new(
+          1.0,
+          ui.visuals().error_fg_color.gamma_multiply(0.35),
+        ))
+        .corner_radius(10)
+        .inner_margin(14)
+        .show(ui, |ui| {
+          ui.label(
+            RichText::new(error.title)
+              .strong()
+              .color(ui.visuals().error_fg_color),
+          );
+          ui.label(RichText::new(error.detail).color(ui.visuals().error_fg_color));
+          if ui.button("关闭").clicked() {
+            self.command(UiCommand::ClearError);
+          }
+        });
+      ui.add_space(14.0);
+    }
+
     if let Some(error) = self.local_error.clone() {
       Frame::new()
         .fill(ui.visuals().error_fg_color.gamma_multiply(0.08))
@@ -193,43 +218,110 @@ impl RsClashUi {
     }
   }
 
-  fn home(&self, ui: &mut Ui) {
+  fn home(&mut self, ui: &mut Ui) {
     ui.label(
       RichText::new("一个不依赖 WebView 的 Mihomo 原生桌面壳")
         .size(22.0)
         .strong(),
     );
-    ui.label(RichText::new("当前阶段验证 egui、Tokio 状态桥接、系统主题和事件驱动重绘。").weak());
+    ui.label(RichText::new("原生 egui 界面通过本地 Unix Socket 管理 Mihomo 生命周期。").weak());
     ui.add_space(18.0);
 
+    let core = self.snapshot.core.clone();
+    let revision = self.snapshot.revision;
     ui.columns(2, |columns| {
       card(&mut columns[0], "Mihomo 核心", |ui| {
-        match &self.snapshot.core {
-          CoreState::Stopped => {
-            ui.label(RichText::new("尚未接入").size(18.0).strong());
-            ui.label(RichText::new("将在 P3–P5 接入本地 IPC 与生命周期").weak());
-          },
-          state => {
-            ui.label(RichText::new(format!("{state:?}")).size(18.0));
-          },
-        }
+        self.core_controls(ui, &core);
       });
       card(&mut columns[1], "应用协调器", |ui| {
         ui.label(RichText::new("运行正常").size(18.0).strong());
-        ui.label(RichText::new(format!("Snapshot revision {}", self.snapshot.revision)).weak());
+        ui.label(RichText::new(format!("Snapshot revision {revision}")).weak());
       });
     });
 
     ui.add_space(12.0);
-    card(ui, "P1/P2 验证范围", |ui| {
+    card(ui, "P5 核心能力", |ui| {
       ui.label("• eframe 0.35 + Glow 原生渲染");
-      ui.label("• Tokio 有界命令通道与 watch 快照");
-      ui.label("• 后台状态变化主动唤醒 egui");
-      ui.label("• GTK/Adwaita 风格语义色板和系统主题");
-      ui.label("• 窗口持久化、托盘隐藏与确定性退出");
+      ui.label("• stable / alpha 核心切换与热加载");
+      ui.label("• 私有 UDS、健康检查与崩溃退避");
+      ui.label("• 有界 stdout / stderr 和确定性退出");
       if let Some(event) = &self.last_event {
         ui.add_space(8.0);
         ui.label(RichText::new(format!("最近事件：{event:?}")).small().weak());
+      }
+    });
+  }
+
+  fn core_controls(&mut self, ui: &mut Ui, state: &CoreState) {
+    match state {
+      CoreState::Stopped => {
+        ui.label(RichText::new("已停止").size(18.0).strong());
+        ui.label(RichText::new("选择要启动的 Mihomo 核心通道。").weak());
+        self.start_buttons(ui, "启动 Stable", "启动 Alpha");
+      },
+      CoreState::Starting => {
+        ui.label(RichText::new("正在启动…").size(18.0).strong());
+        ui.spinner();
+      },
+      CoreState::Running {
+        mode,
+        channel,
+        version,
+      } => {
+        ui.label(RichText::new("运行中").size(18.0).strong());
+        let mode = match mode {
+          CoreRunMode::Sidecar => "Sidecar",
+          CoreRunMode::Service => "Service",
+        };
+        let channel_name = match channel {
+          CoreChannel::Stable => "Stable",
+          CoreChannel::Alpha => "Alpha",
+        };
+        let version = version.as_deref().unwrap_or("版本未知");
+        ui.label(RichText::new(format!("{channel_name} · {mode} · {version}")).weak());
+        ui.horizontal(|ui| {
+          if ui.button("热加载").clicked() {
+            self.command(UiCommand::ReloadCore);
+          }
+          if ui.button("重启").clicked() {
+            self.command(UiCommand::RestartCore(*channel));
+          }
+          if ui.button("停止").clicked() {
+            self.command(UiCommand::StopCore);
+          }
+        });
+      },
+      CoreState::Reloading => {
+        ui.label(RichText::new("正在热加载…").size(18.0).strong());
+        ui.spinner();
+      },
+      CoreState::Stopping => {
+        ui.label(RichText::new("正在停止…").size(18.0).strong());
+        ui.spinner();
+      },
+      CoreState::Failed { message } => {
+        ui.label(
+          RichText::new("核心异常")
+            .size(18.0)
+            .strong()
+            .color(ui.visuals().error_fg_color),
+        );
+        ui.label(RichText::new(message).small().weak());
+        self.start_buttons(ui, "重试 Stable", "重试 Alpha");
+        if ui.button("停止并清理").clicked() {
+          self.command(UiCommand::StopCore);
+        }
+      },
+    }
+  }
+
+  fn start_buttons(&mut self, ui: &mut Ui, stable_label: &str, alpha_label: &str) {
+    ui.horizontal(|ui| {
+      if ui.button(stable_label).clicked() {
+        self.command(UiCommand::StartCore(CoreChannel::Stable));
+      }
+      if ui.button(alpha_label).clicked() {
+        self.command(UiCommand::StartCore(CoreChannel::Alpha));
       }
     });
   }

@@ -2875,6 +2875,8 @@ dependencies = [
  "eframe",
  "ksni",
  "rsclash-app",
+ "rsclash-config",
+ "rsclash-core",
  "rsclash-domain",
  "rsclash-ui",
  "tokio",
