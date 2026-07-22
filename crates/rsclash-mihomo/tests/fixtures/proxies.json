@@ -1,0 +1,25 @@
+{
+  "proxies": {
+    "GLOBAL": {
+      "name": "GLOBAL",
+      "type": "Selector",
+      "alive": true,
+      "all": ["Node A", "DIRECT"],
+      "now": "Node A",
+      "history": []
+    },
+    "Node A": {
+      "name": "Node A",
+      "type": "Shadowsocks",
+      "alive": true,
+      "udp": true,
+      "history": [
+        {
+          "time": "2026-07-22T00:00:00Z",
+          "delay": 42
+        }
+      ],
+      "futureCapability": true
+    }
+  }
+}

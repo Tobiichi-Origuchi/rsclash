@@ -26,4 +26,6 @@ pub enum Error {
     },
     #[error("failed to encode a Mihomo request: {0}")]
     Encode(#[from] serde_json::Error),
+    #[error("fake Mihomo API failed: {0}")]
+    Fake(String),
 }

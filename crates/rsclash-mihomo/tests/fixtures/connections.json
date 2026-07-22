@@ -1,0 +1,29 @@
+{
+  "downloadTotal": 2048,
+  "uploadTotal": 1024,
+  "memory": 4096,
+  "connections": [
+    {
+      "id": "connection-1",
+      "metadata": {
+        "network": "tcp",
+        "type": "HTTP",
+        "sourceIP": "127.0.0.1",
+        "destinationIP": "93.184.216.34",
+        "sourcePort": "42000",
+        "destinationPort": "443",
+        "host": "example.com",
+        "dnsMode": "normal",
+        "process": "browser",
+        "processPath": "/usr/bin/browser"
+      },
+      "upload": 100,
+      "download": 200,
+      "start": "2026-07-22T00:00:00Z",
+      "chains": ["Node A"],
+      "providerChains": ["Provider A"],
+      "rule": "MATCH",
+      "rulePayload": ""
+    }
+  ]
+}
