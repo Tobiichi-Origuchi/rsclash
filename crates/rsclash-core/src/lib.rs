@@ -3,7 +3,7 @@
 #[cfg(target_os = "linux")]
 mod linux;
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{fmt, future::pending, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use rsclash_domain::{CoreChannel, CoreRunMode, CoreState};
@@ -12,7 +12,7 @@ use tokio::{
   runtime::Handle,
   sync::{mpsc, oneshot, watch},
   task::JoinHandle,
-  time::timeout,
+  time::{Instant, MissedTickBehavior, interval_at, sleep_until, timeout},
 };
 
 #[cfg(target_os = "linux")]
@@ -22,7 +22,73 @@ pub use linux::{
 };
 
 const COMMAND_CAPACITY: usize = 16;
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SupervisionConfig {
+  pub health_interval: Duration,
+  pub max_consecutive_health_failures: u8,
+  pub initial_restart_delay: Duration,
+  pub max_restart_delay: Duration,
+  pub max_restart_attempts: u8,
+  pub stable_reset_after: Duration,
+}
+
+impl Default for SupervisionConfig {
+  fn default() -> Self {
+    Self {
+      health_interval: Duration::from_secs(5),
+      max_consecutive_health_failures: 3,
+      initial_restart_delay: Duration::from_secs(1),
+      max_restart_delay: Duration::from_secs(30),
+      max_restart_attempts: 5,
+      stable_reset_after: Duration::from_secs(60),
+    }
+  }
+}
+
+impl SupervisionConfig {
+  fn validate(self) -> Result<Self, SupervisionConfigError> {
+    if self.health_interval.is_zero() {
+      return Err(SupervisionConfigError::ZeroHealthInterval);
+    }
+    if self.max_consecutive_health_failures == 0 {
+      return Err(SupervisionConfigError::ZeroHealthFailures);
+    }
+    if self.initial_restart_delay.is_zero() {
+      return Err(SupervisionConfigError::ZeroRestartDelay);
+    }
+    if self.max_restart_delay < self.initial_restart_delay {
+      return Err(SupervisionConfigError::InvalidMaximumRestartDelay);
+    }
+    if self.stable_reset_after.is_zero() {
+      return Err(SupervisionConfigError::ZeroStableReset);
+    }
+    Ok(self)
+  }
+
+  fn restart_delay(self, attempt: u8) -> Duration {
+    let exponent = u32::from(attempt.saturating_sub(1).min(31));
+    self
+      .initial_restart_delay
+      .saturating_mul(1_u32 << exponent)
+      .min(self.max_restart_delay)
+  }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum SupervisionConfigError {
+  #[error("the health interval must not be zero")]
+  ZeroHealthInterval,
+  #[error("at least one consecutive health failure must be allowed")]
+  ZeroHealthFailures,
+  #[error("the initial restart delay must not be zero")]
+  ZeroRestartDelay,
+  #[error("the maximum restart delay must be at least the initial delay")]
+  InvalidMaximumRestartDelay,
+  #[error("the stable restart-budget reset duration must not be zero")]
+  ZeroStableReset,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunningCore {
@@ -47,15 +113,42 @@ impl RunningCore {
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 #[error("{message}")]
 pub struct ControllerError {
+  kind: ControllerErrorKind,
   message: String,
 }
 
 impl ControllerError {
   pub fn new(message: impl Into<String>) -> Self {
     Self {
+      kind: ControllerErrorKind::Operation,
       message: message.into(),
     }
   }
+
+  pub fn unhealthy(message: impl Into<String>) -> Self {
+    Self {
+      kind: ControllerErrorKind::Unhealthy,
+      message: message.into(),
+    }
+  }
+
+  pub fn process_exited(message: impl Into<String>) -> Self {
+    Self {
+      kind: ControllerErrorKind::ProcessExited,
+      message: message.into(),
+    }
+  }
+
+  pub const fn kind(&self) -> ControllerErrorKind {
+    self.kind
+  }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControllerErrorKind {
+  Operation,
+  Unhealthy,
+  ProcessExited,
 }
 
 #[async_trait]
@@ -65,6 +158,8 @@ pub trait LifecycleController: Send + 'static {
   async fn stop(&mut self) -> Result<(), ControllerError>;
 
   async fn reload(&mut self) -> Result<RunningCore, ControllerError>;
+
+  async fn health_check(&mut self) -> Result<RunningCore, ControllerError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,6 +296,28 @@ impl CoreRuntime {
   where
     C: LifecycleController,
   {
+    Self::spawn_inner(runtime, controller, SupervisionConfig::default())
+  }
+
+  pub fn spawn_with_config<C>(
+    runtime: &Handle,
+    controller: C,
+    supervision: SupervisionConfig,
+  ) -> Result<Self, SupervisionConfigError>
+  where
+    C: LifecycleController,
+  {
+    Ok(Self::spawn_inner(
+      runtime,
+      controller,
+      supervision.validate()?,
+    ))
+  }
+
+  fn spawn_inner<C>(runtime: &Handle, controller: C, supervision: SupervisionConfig) -> Self
+  where
+    C: LifecycleController,
+  {
     let initial_state = Arc::new(CoreState::Stopped);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (state_tx, state_rx) = watch::channel(Arc::clone(&initial_state));
@@ -210,6 +327,11 @@ impl CoreRuntime {
       active_channel: None,
       command_rx,
       state_tx,
+      supervision,
+      consecutive_health_failures: 0,
+      restart_attempts: 0,
+      restart_at: None,
+      started_at: None,
     };
 
     Self {
@@ -260,6 +382,11 @@ struct Coordinator<C> {
   active_channel: Option<CoreChannel>,
   command_rx: mpsc::Receiver<CommandEnvelope>,
   state_tx: watch::Sender<Arc<CoreState>>,
+  supervision: SupervisionConfig,
+  consecutive_health_failures: u8,
+  restart_attempts: u8,
+  restart_at: Option<Instant>,
+  started_at: Option<Instant>,
 }
 
 impl<C> Coordinator<C>
@@ -267,15 +394,35 @@ where
   C: LifecycleController,
 {
   async fn run(mut self) {
-    while let Some(envelope) = self.command_rx.recv().await {
-      let should_stop = matches!(envelope.command, LifecycleCommand::Shutdown);
-      let result = self.handle_command(envelope.command).await;
-      let _ = envelope.reply.send(result);
-      if should_stop {
-        return;
+    let first_health_check = Instant::now() + self.supervision.health_interval;
+    let mut health_timer = interval_at(first_health_check, self.supervision.health_interval);
+    health_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+      let restart_at = self.restart_at;
+      tokio::select! {
+        biased;
+        envelope = self.command_rx.recv() => {
+          let Some(envelope) = envelope else {
+            break;
+          };
+          let should_stop = matches!(envelope.command, LifecycleCommand::Shutdown);
+          let result = self.handle_command(envelope.command).await;
+          let _ = envelope.reply.send(result);
+          if should_stop {
+            return;
+          }
+        },
+        () = wait_for_restart(restart_at), if restart_at.is_some() => {
+          self.run_scheduled_restart().await;
+        },
+        _ = health_timer.tick() => {
+          self.supervise().await;
+        },
       }
     }
 
+    self.restart_at = None;
     let _ = self.stop(LifecycleOperation::Shutdown).await;
   }
 
@@ -284,11 +431,23 @@ where
     command: LifecycleCommand,
   ) -> Result<CoreState, LifecycleError> {
     match command {
-      LifecycleCommand::Start(channel) => self.start(channel, LifecycleOperation::Start).await,
-      LifecycleCommand::Stop => self.stop(LifecycleOperation::Stop).await,
-      LifecycleCommand::Restart(channel) => self.restart(channel).await,
+      LifecycleCommand::Start(channel) => {
+        self.reset_supervision();
+        self.start(channel, LifecycleOperation::Start).await
+      },
+      LifecycleCommand::Stop => {
+        self.reset_supervision();
+        self.stop(LifecycleOperation::Stop).await
+      },
+      LifecycleCommand::Restart(channel) => {
+        self.reset_supervision();
+        self.restart(channel).await
+      },
       LifecycleCommand::Reload => self.reload().await,
-      LifecycleCommand::Shutdown => self.stop(LifecycleOperation::Shutdown).await,
+      LifecycleCommand::Shutdown => {
+        self.reset_supervision();
+        self.stop(LifecycleOperation::Shutdown).await
+      },
     }
   }
 
@@ -297,6 +456,7 @@ where
     channel: CoreChannel,
     operation: LifecycleOperation,
   ) -> Result<CoreState, LifecycleError> {
+    let needs_cleanup = matches!(self.state, CoreState::Failed { .. });
     match &self.state {
       CoreState::Stopped | CoreState::Failed { .. } => {},
       CoreState::Running {
@@ -306,10 +466,19 @@ where
       state => return Err(Self::invalid_transition(operation, state)),
     }
 
+    if needs_cleanup {
+      self
+        .controller
+        .stop()
+        .await
+        .map_err(|error| self.fail(operation, error))?;
+      self.active_channel = None;
+    }
     self.publish(CoreState::Starting);
     match self.controller.start(channel).await {
       Ok(running) => {
         self.active_channel = Some(channel);
+        self.mark_started();
         self.publish(running.into_state(channel));
         Ok(self.state.clone())
       },
@@ -328,6 +497,8 @@ where
     match self.controller.stop().await {
       Ok(()) => {
         self.active_channel = None;
+        self.started_at = None;
+        self.consecutive_health_failures = 0;
         self.publish(CoreState::Stopped);
         Ok(self.state.clone())
       },
@@ -360,6 +531,107 @@ where
     }
   }
 
+  async fn supervise(&mut self) {
+    let CoreState::Running { channel, .. } = self.state else {
+      return;
+    };
+    match self.controller.health_check().await {
+      Ok(running) => self.record_healthy(channel, running),
+      Err(error) => self.record_health_failure(channel, error).await,
+    }
+  }
+
+  fn record_healthy(&mut self, channel: CoreChannel, running: RunningCore) {
+    self.consecutive_health_failures = 0;
+    if self
+      .started_at
+      .is_some_and(|started| started.elapsed() >= self.supervision.stable_reset_after)
+    {
+      self.restart_attempts = 0;
+    }
+    let state = running.into_state(channel);
+    if self.state != state {
+      self.publish(state);
+    }
+  }
+
+  async fn record_health_failure(&mut self, channel: CoreChannel, error: ControllerError) {
+    self.consecutive_health_failures = self.consecutive_health_failures.saturating_add(1);
+    let should_restart = error.kind() == ControllerErrorKind::ProcessExited
+      || self.consecutive_health_failures >= self.supervision.max_consecutive_health_failures;
+    if !should_restart {
+      return;
+    }
+
+    let mut message = error.to_string();
+    if let Err(cleanup_error) = self.controller.stop().await {
+      message = format!("{message}; cleanup failed: {cleanup_error}");
+    }
+    self.started_at = None;
+    self.consecutive_health_failures = 0;
+    self.active_channel = Some(channel);
+    self.schedule_restart(channel, message);
+  }
+
+  async fn run_scheduled_restart(&mut self) {
+    let Some(channel) = self.active_channel else {
+      self.restart_at = None;
+      return;
+    };
+    self.restart_at = None;
+    if let Err(error) = self.controller.stop().await {
+      self.schedule_restart(
+        channel,
+        format!("automatic restart cleanup failed: {error}"),
+      );
+      return;
+    }
+    self.publish(CoreState::Starting);
+    match self.controller.start(channel).await {
+      Ok(running) => {
+        self.mark_started();
+        self.publish(running.into_state(channel));
+      },
+      Err(error) => self.schedule_restart(channel, error.to_string()),
+    }
+  }
+
+  fn schedule_restart(&mut self, channel: CoreChannel, cause: String) {
+    if self.restart_attempts >= self.supervision.max_restart_attempts {
+      self.restart_at = None;
+      self.publish(CoreState::Failed {
+        message: format!(
+          "{cause}; automatic restart exhausted after {} attempts",
+          self.restart_attempts
+        ),
+      });
+      return;
+    }
+
+    self.restart_attempts = self.restart_attempts.saturating_add(1);
+    let delay = self.supervision.restart_delay(self.restart_attempts);
+    self.active_channel = Some(channel);
+    self.restart_at = Some(Instant::now() + delay);
+    self.publish(CoreState::Failed {
+      message: format!(
+        "{cause}; automatic restart {}/{} in {delay:?}",
+        self.restart_attempts, self.supervision.max_restart_attempts
+      ),
+    });
+  }
+
+  fn mark_started(&mut self) {
+    self.started_at = Some(Instant::now());
+    self.consecutive_health_failures = 0;
+  }
+
+  const fn reset_supervision(&mut self) {
+    self.restart_at = None;
+    self.restart_attempts = 0;
+    self.consecutive_health_failures = 0;
+    self.started_at = None;
+  }
+
   fn publish(&mut self, state: CoreState) {
     self.state = state;
     self.state_tx.send_replace(Arc::new(self.state.clone()));
@@ -381,13 +653,21 @@ where
   }
 }
 
+async fn wait_for_restart(deadline: Option<Instant>) {
+  if let Some(deadline) = deadline {
+    sleep_until(deadline).await;
+  } else {
+    pending::<()>().await;
+  }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use std::{
     sync::{
       Arc, Mutex,
-      atomic::{AtomicBool, AtomicUsize, Ordering},
+      atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     time::Duration,
   };
@@ -398,7 +678,7 @@ mod tests {
 
   use super::{
     ControllerError, CoreRuntime, LifecycleController, LifecycleError, LifecycleOperation,
-    RunningCore,
+    RunningCore, SupervisionConfig,
   };
 
   #[derive(Clone, Debug, Eq, PartialEq)]
@@ -406,12 +686,15 @@ mod tests {
     Start(CoreChannel),
     Stop,
     Reload,
+    Health,
   }
 
   #[derive(Default)]
   struct FakeState {
     calls: Mutex<Vec<Call>>,
     fail_next_start: AtomicBool,
+    fail_start: AtomicBool,
+    health_failure: AtomicU8,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
   }
@@ -447,7 +730,9 @@ mod tests {
   impl LifecycleController for FakeController {
     async fn start(&mut self, channel: CoreChannel) -> Result<RunningCore, ControllerError> {
       self.record(Call::Start(channel)).await;
-      if self.state.fail_next_start.swap(false, Ordering::SeqCst) {
+      if self.state.fail_start.load(Ordering::SeqCst)
+        || self.state.fail_next_start.swap(false, Ordering::SeqCst)
+      {
         Err(ControllerError::new("planned start failure"))
       } else {
         Ok(RunningCore::new(
@@ -468,6 +753,18 @@ mod tests {
         CoreRunMode::Sidecar,
         Some("1.0.1".to_string()),
       ))
+    }
+
+    async fn health_check(&mut self) -> Result<RunningCore, ControllerError> {
+      self.record(Call::Health).await;
+      match self.state.health_failure.load(Ordering::SeqCst) {
+        1 => Err(ControllerError::unhealthy("planned health failure")),
+        2 => Err(ControllerError::process_exited("planned process exit")),
+        _ => Ok(RunningCore::new(
+          CoreRunMode::Sidecar,
+          Some("1.0.1".to_string()),
+        )),
+      }
     }
   }
 
@@ -593,6 +890,122 @@ mod tests {
         channel: CoreChannel::Alpha,
         ..
       }
+    ));
+    assert!(runtime.shutdown().await.is_ok());
+  }
+
+  fn test_supervision(max_restart_attempts: u8) -> SupervisionConfig {
+    SupervisionConfig {
+      health_interval: Duration::from_secs(1),
+      max_consecutive_health_failures: 2,
+      initial_restart_delay: Duration::from_secs(1),
+      max_restart_delay: Duration::from_secs(4),
+      max_restart_attempts,
+      stable_reset_after: Duration::from_secs(60),
+    }
+  }
+
+  async fn settle_tasks() {
+    for _ in 0..4 {
+      tokio::task::yield_now().await;
+    }
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn restarts_an_exited_core_and_stop_cancels_supervision() {
+    let state = Arc::new(FakeState::default());
+    let runtime = CoreRuntime::spawn_with_config(
+      &tokio::runtime::Handle::current(),
+      FakeController::new(Arc::clone(&state), Duration::ZERO),
+      test_supervision(3),
+    )
+    .expect("supervision config should be valid");
+    let handle = runtime.handle();
+    assert!(handle.start(CoreChannel::Stable).await.is_ok());
+
+    state.health_failure.store(2, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle_tasks().await;
+    assert!(matches!(
+      handle.current_state().as_ref(),
+      CoreState::Failed { message } if message.contains("automatic restart 1/3")
+    ));
+
+    state.health_failure.store(0, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle_tasks().await;
+    assert!(matches!(
+      handle.current_state().as_ref(),
+      CoreState::Running {
+        channel: CoreChannel::Stable,
+        ..
+      }
+    ));
+
+    assert!(handle.stop().await.is_ok());
+    let starts_before = state
+      .calls
+      .lock()
+      .expect("call log lock should be available")
+      .iter()
+      .filter(|call| matches!(call, Call::Start(_)))
+      .count();
+    state.health_failure.store(2, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    settle_tasks().await;
+    let starts_after = state
+      .calls
+      .lock()
+      .expect("call log lock should be available")
+      .iter()
+      .filter(|call| matches!(call, Call::Start(_)))
+      .count();
+    assert_eq!(starts_before, 2);
+    assert_eq!(starts_after, starts_before);
+    assert!(runtime.shutdown().await.is_ok());
+  }
+
+  #[tokio::test(start_paused = true)]
+  async fn exhausts_bounded_backoff_and_allows_manual_recovery() {
+    let state = Arc::new(FakeState::default());
+    let runtime = CoreRuntime::spawn_with_config(
+      &tokio::runtime::Handle::current(),
+      FakeController::new(Arc::clone(&state), Duration::ZERO),
+      test_supervision(2),
+    )
+    .expect("supervision config should be valid");
+    let handle = runtime.handle();
+    assert!(handle.start(CoreChannel::Alpha).await.is_ok());
+
+    state.health_failure.store(2, Ordering::SeqCst);
+    state.fail_start.store(true, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle_tasks().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    settle_tasks().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    settle_tasks().await;
+    assert!(matches!(
+      handle.current_state().as_ref(),
+      CoreState::Failed { message }
+        if message.contains("automatic restart exhausted after 2 attempts")
+    ));
+
+    let starts = state
+      .calls
+      .lock()
+      .expect("call log lock should be available")
+      .iter()
+      .filter(|call| matches!(call, Call::Start(_)))
+      .count();
+    assert_eq!(starts, 3);
+
+    state.fail_start.store(false, Ordering::SeqCst);
+    state.health_failure.store(0, Ordering::SeqCst);
+    assert!(handle.start(CoreChannel::Alpha).await.is_ok());
+    assert!(matches!(
+      handle.current_state().as_ref(),
+      CoreState::Running { .. }
     ));
     assert!(runtime.shutdown().await.is_ok());
   }

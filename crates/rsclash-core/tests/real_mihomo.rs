@@ -6,14 +6,18 @@
 
 use std::{
   fs,
-  os::unix::fs::PermissionsExt as _,
-  path::PathBuf,
+  os::unix::{ffi::OsStrExt as _, fs::PermissionsExt as _},
+  path::{Path, PathBuf},
   sync::atomic::{AtomicU64, Ordering},
   time::Duration,
 };
 
-use rsclash_core::{CoreBinaries, CoreRuntime, LinuxSidecarConfig, LinuxSidecarController};
+use rsclash_core::{
+  CoreBinaries, CoreHandle, CoreRuntime, LinuxSidecarConfig, LinuxSidecarController,
+  SupervisionConfig,
+};
 use rsclash_domain::{CoreChannel, CoreRunMode, CoreState};
+use rustix::process::{Pid, Signal, kill_process};
 
 const CONFIG: &str = include_str!("../../rsclash-mihomo/tests/fixtures/minimal-config.yaml");
 
@@ -38,8 +42,20 @@ async fn pinned_mihomo_runs_through_the_lifecycle_coordinator() {
   );
   config.startup_timeout = Duration::from_secs(10);
   let controller = LinuxSidecarController::new(config);
-  let runtime = CoreRuntime::spawn(&tokio::runtime::Handle::current(), controller);
-  let handle = runtime.handle();
+  let runtime = CoreRuntime::spawn_with_config(
+    &tokio::runtime::Handle::current(),
+    controller,
+    SupervisionConfig {
+      health_interval: Duration::from_millis(50),
+      max_consecutive_health_failures: 1,
+      initial_restart_delay: Duration::from_millis(200),
+      max_restart_delay: Duration::from_secs(1),
+      max_restart_attempts: 3,
+      stable_reset_after: Duration::from_secs(5),
+    },
+  )
+  .expect("supervision config should be valid");
+  let mut handle = runtime.handle();
 
   let running = handle
     .start(CoreChannel::Stable)
@@ -54,10 +70,64 @@ async fn pinned_mihomo_runs_through_the_lifecycle_coordinator() {
     } if !version.is_empty()
   ));
   handle.reload().await.expect("Mihomo should reload");
+  let socket_path = runtime_directory.join("controller.sock");
+  let pid = find_process_with_argument(&socket_path)
+    .expect("the Mihomo process should contain the private socket argument");
+  kill_process(pid, Signal::KILL).expect("the Mihomo process should be killable");
+  wait_for_state(&mut handle, |state| {
+    matches!(state, CoreState::Failed { .. })
+  })
+  .await;
+  wait_for_state(&mut handle, |state| {
+    matches!(
+      state,
+      CoreState::Running {
+        channel: CoreChannel::Stable,
+        ..
+      }
+    )
+  })
+  .await;
   assert!(handle.restart(CoreChannel::Alpha).await.is_ok());
   assert_eq!(handle.stop().await.ok(), Some(CoreState::Stopped));
-  assert!(!runtime_directory.join("controller.sock").exists());
+  assert!(!socket_path.exists());
   assert!(runtime.shutdown().await.is_ok());
+}
+
+async fn wait_for_state(
+  handle: &mut CoreHandle,
+  predicate: impl Fn(&CoreState) -> bool + Send + Sync,
+) {
+  tokio::time::timeout(Duration::from_secs(5), async {
+    loop {
+      let state = handle.current_state();
+      if predicate(&state) {
+        return;
+      }
+      handle
+        .changed()
+        .await
+        .expect("the lifecycle state channel should remain open");
+    }
+  })
+  .await
+  .expect("the expected lifecycle state should arrive before the timeout");
+}
+
+fn find_process_with_argument(argument: &Path) -> Option<Pid> {
+  let argument = argument.as_os_str().as_bytes();
+  fs::read_dir("/proc")
+    .ok()?
+    .filter_map(Result::ok)
+    .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok())
+    .filter_map(Pid::from_raw)
+    .find(|pid| {
+      fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|command_line| {
+        command_line
+          .split(|byte| *byte == 0)
+          .any(|item| item == argument)
+      })
+    })
 }
 
 struct TestDirectory(PathBuf);
@@ -74,7 +144,7 @@ impl TestDirectory {
     Self(path)
   }
 
-  fn path(&self) -> &std::path::Path {
+  fn path(&self) -> &Path {
     &self.0
   }
 }

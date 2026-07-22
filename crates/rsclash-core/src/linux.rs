@@ -363,6 +363,23 @@ impl LinuxSidecarController {
       Some(version.version),
     ))
   }
+
+  async fn health_check_sidecar(&mut self) -> Result<RunningCore, ControllerError> {
+    let sidecar = self
+      .sidecar
+      .as_mut()
+      .ok_or_else(|| ControllerError::process_exited("no sidecar process is running"))?;
+    if let Some(status) = sidecar.try_wait()? {
+      return Err(process_exit_error(status, &self.logs));
+    }
+    let version = sidecar.client.health_check().await.map_err(|error| {
+      ControllerError::unhealthy(format!("Mihomo health check failed: {error}"))
+    })?;
+    Ok(RunningCore::new(
+      CoreRunMode::Sidecar,
+      Some(version.version),
+    ))
+  }
 }
 
 #[async_trait]
@@ -377,6 +394,10 @@ impl LifecycleController for LinuxSidecarController {
 
   async fn reload(&mut self) -> Result<RunningCore, ControllerError> {
     self.reload_sidecar().await
+  }
+
+  async fn health_check(&mut self) -> Result<RunningCore, ControllerError> {
+    self.health_check_sidecar().await
   }
 }
 
@@ -716,9 +737,9 @@ async fn cleanup_failed_start(
 fn process_exit_error(status: ExitStatus, logs: &CoreLogStore) -> ControllerError {
   let recent = logs.recent_text();
   if recent.is_empty() {
-    ControllerError::new(format!("Mihomo exited unexpectedly: {status}"))
+    ControllerError::process_exited(format!("Mihomo exited unexpectedly: {status}"))
   } else {
-    ControllerError::new(format!(
+    ControllerError::process_exited(format!(
       "Mihomo exited unexpectedly: {status}; recent output:\n{recent}"
     ))
   }
