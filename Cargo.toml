@@ -3,6 +3,7 @@ members = [
     "apps/rsclash-desktop",
     "crates/rsclash-app",
     "crates/rsclash-domain",
+    "crates/rsclash-mihomo",
     "crates/rsclash-ui",
 ]
 resolver = "3"
@@ -14,6 +15,7 @@ rust-version = "1.92"
 publish = false
 
 [workspace.dependencies]
+async-trait = "0.1.89"
 eframe = { version = "0.35.0", default-features = false, features = [
     "accesskit",
     "default_fonts",
@@ -22,10 +24,14 @@ eframe = { version = "0.35.0", default-features = false, features = [
     "x11",
 ] }
 egui = { version = "0.35.0", features = ["serde"] }
+reqwest = { version = "0.13.3", default-features = false, features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 thiserror = "2.0.18"
 tokio = { version = "1.53.1", features = [
+    "io-util",
     "macros",
+    "net",
     "rt-multi-thread",
     "sync",
     "time",
@@ -33,9 +39,11 @@ tokio = { version = "1.53.1", features = [
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"] }
+urlencoding = "2.1.3"
 
 rsclash-app = { path = "crates/rsclash-app" }
 rsclash-domain = { path = "crates/rsclash-domain" }
+rsclash-mihomo = { path = "crates/rsclash-mihomo" }
 rsclash-ui = { path = "crates/rsclash-ui" }
 
 [workspace.lints.rust]
