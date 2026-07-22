@@ -1,10 +1,15 @@
 //! Profile persistence and deterministic Mihomo configuration generation.
 
+pub mod enhance;
 mod error;
 mod model;
 mod store;
 mod transaction;
 
+pub use enhance::{
+    SequenceEdit, apply_deep_merge, apply_sequence_edit, cleanup_proxy_groups, lowercase_mapping,
+    sort_top_level,
+};
 pub use error::{Error, Result};
 pub use model::{
     ClashOverrides, ExtraFields, MihomoConfig, ProfileCatalog, ProfileItem, ProfileKind,
