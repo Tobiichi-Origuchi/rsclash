@@ -2,6 +2,7 @@
 
 #[cfg(target_os = "linux")]
 mod linux;
+mod preferred;
 
 use std::{fmt, future::pending, sync::Arc, time::Duration};
 
@@ -20,6 +21,7 @@ pub use linux::{
   CoreBinaries, CoreLogEntry, CoreLogStore, CoreOutputStream, LinuxSidecarConfig,
   LinuxSidecarController,
 };
+pub use preferred::{PreferredController, ServiceLifecycleController};
 
 const COMMAND_CAPACITY: usize = 16;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);

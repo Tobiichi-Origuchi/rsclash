@@ -1,7 +1,9 @@
 use std::{env, path::PathBuf, sync::Arc};
 
 use rsclash_config::{MihomoConfig, ProfileStore, RuntimeStore};
-use rsclash_core::{CoreBinaries, CoreRuntime, LinuxSidecarConfig, LinuxSidecarController};
+use rsclash_core::{
+  CoreBinaries, CoreRuntime, LinuxSidecarConfig, LinuxSidecarController, PreferredController,
+};
 use rsclash_platform::{
   RecoveryManager, RecoveryOutcome, RecoveryReason, SystemStateRecovery as _,
   UnavailableRecoveryBackend,
@@ -83,12 +85,13 @@ fn create_core_runtime_for_layout(
     .initialize_if_missing(&config)
     .map_err(|error| format!("initialize the Mihomo runtime configuration: {error}"))?;
 
-  let controller = LinuxSidecarController::new(LinuxSidecarConfig::new(
+  let sidecar = LinuxSidecarController::new(LinuxSidecarConfig::new(
     layout.binaries,
     &store.paths().root,
     &store.paths().runtime_config,
     layout.runtime_root,
   ));
+  let controller = PreferredController::new(sidecar);
   let system_recovery = Arc::new(RecoveryManager::new(
     store.paths().root.join("system-recovery.json"),
     Arc::new(UnavailableRecoveryBackend::new(
