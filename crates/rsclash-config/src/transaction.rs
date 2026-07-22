@@ -4,7 +4,7 @@ use serde_yaml_ng::Mapping;
 
 use crate::{
     Error, ProfileCatalog, ProfileItem, ProfileKind, ProfileStore, Result,
-    store::{atomic_write, read_bytes_if_exists, remove_file},
+    store::{RollbackJournal, atomic_write, read_bytes_if_exists, remove_file},
     to_yaml,
 };
 
@@ -198,8 +198,25 @@ impl ProfileTransaction {
             Some(format!("# Profiles Config for rsclash\n{catalog_yaml}").into_bytes()),
         );
         let snapshots = capture_snapshots(writes.keys())?;
+        let journal = RollbackJournal::create(&self.store.paths().root, &snapshots)?;
 
         if let Err(commit_error) = apply_writes(&writes, &self.store.paths().profiles_catalog) {
+            if let Err(rollback_error) = restore_snapshots(&snapshots) {
+                return Err(Error::CommitRollback {
+                    commit_error: commit_error.to_string(),
+                    rollback_error: rollback_error.to_string(),
+                });
+            }
+            if let Err(rollback_error) = journal.complete() {
+                return Err(Error::CommitRollback {
+                    commit_error: commit_error.to_string(),
+                    rollback_error: rollback_error.to_string(),
+                });
+            }
+            return Err(commit_error);
+        }
+
+        if let Err(commit_error) = journal.complete() {
             if let Err(rollback_error) = restore_snapshots(&snapshots) {
                 return Err(Error::CommitRollback {
                     commit_error: commit_error.to_string(),
@@ -303,11 +320,15 @@ fn apply_writes(
 
 #[cfg(test)]
 fn should_inject_catalog_failure(catalog_path: &std::path::Path) -> bool {
-    INJECTED_CATALOG_FAILURE
-        .lock()
-        .ok()
-        .and_then(|mut path| path.take())
-        .is_some_and(|path| path == catalog_path)
+    let Ok(mut injected) = INJECTED_CATALOG_FAILURE.lock() else {
+        return false;
+    };
+    if injected.as_deref() == Some(catalog_path) {
+        injected.take();
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]

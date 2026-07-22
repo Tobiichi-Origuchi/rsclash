@@ -43,7 +43,7 @@ async fn pinned_mihomo_validates_staging_before_runtime_commit() {
         .expect("RSCLASH_MIHOMO_BIN must point to the pinned Mihomo binary");
     let directory = TestDirectory::new();
     let runtime_path = directory.path.join("runtime.yaml");
-    let store = RuntimeStore::new(&runtime_path);
+    let store = RuntimeStore::open(&runtime_path).expect("runtime store should open");
     let validator = CommandRuntimeValidator::new(binary, &directory.path);
     let config = MihomoConfig::parse(CONFIG).expect("fixture should parse");
 

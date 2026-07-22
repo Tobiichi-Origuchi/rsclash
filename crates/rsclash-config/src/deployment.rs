@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     process::Stdio,
@@ -10,7 +11,10 @@ use tokio::{process::Command, time::timeout};
 
 use crate::{
     Error, MihomoConfig, Result,
-    store::{atomic_write, create_staging_file, read_bytes_if_exists, remove_file},
+    store::{
+        RollbackJournal, atomic_write, create_staging_file, read_bytes_if_exists,
+        recover_pending_transactions, remove_file,
+    },
 };
 
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
@@ -122,11 +126,16 @@ pub struct RuntimeStore {
 }
 
 impl RuntimeStore {
-    #[must_use]
-    pub fn new(runtime_path: impl Into<PathBuf>) -> Self {
-        Self {
-            runtime_path: runtime_path.into(),
-        }
+    pub fn open(runtime_path: impl Into<PathBuf>) -> Result<Self> {
+        let runtime_path = runtime_path.into();
+        let root = runtime_path.parent().ok_or_else(|| {
+            Error::InvalidConfiguration(format!(
+                "{} has no parent directory",
+                runtime_path.display()
+            ))
+        })?;
+        recover_pending_transactions(root)?;
+        Ok(Self { runtime_path })
     }
 
     pub fn path(&self) -> &Path {
@@ -150,6 +159,17 @@ impl RuntimeStore {
         };
         validator.validate(prepared.staging_path()).await?;
         Ok(prepared)
+    }
+
+    fn create_journal(&self, prepared: &PreparedRuntime) -> Result<RollbackJournal> {
+        let root = self.runtime_path.parent().ok_or_else(|| {
+            Error::InvalidConfiguration(format!(
+                "{} has no parent directory",
+                self.runtime_path.display()
+            ))
+        })?;
+        let snapshots = BTreeMap::from([(self.runtime_path.clone(), prepared.previous.clone())]);
+        RollbackJournal::create(root, &snapshots)
     }
 }
 
@@ -227,21 +247,81 @@ impl<'a> RuntimeDeployer<'a> {
 
     pub async fn deploy(&self, config: &MihomoConfig) -> Result<DeploymentOutcome> {
         let mut prepared = self.store.prepare(config, self.validator).await?;
-        prepared.commit_file()?;
+        let journal = self.store.create_journal(&prepared)?;
+        if let Err(commit_error) = prepared.commit_file() {
+            return self
+                .handle_commit_failure(&prepared, &journal, commit_error)
+                .await;
+        }
 
         match self.activator.reload(self.store.path()).await {
-            Ok(()) => Ok(self.outcome(ActivationMode::Reload)),
+            Ok(()) => {
+                self.finish_success(&prepared, &journal, ActivationMode::Reload)
+                    .await
+            }
             Err(reload_error) => match self.activator.restart(self.store.path()).await {
-                Ok(()) => Ok(self.outcome(ActivationMode::Restart)),
+                Ok(()) => {
+                    self.finish_success(&prepared, &journal, ActivationMode::Restart)
+                        .await
+                }
                 Err(restart_error) => {
                     let activation_error = format!(
                         "reload failed: {reload_error}; controlled restart failed: {restart_error}"
                     );
                     self.compensate(&prepared, &activation_error).await?;
+                    if let Err(compensation_error) = journal.complete() {
+                        return Err(Error::DeploymentCompensation {
+                            activation_error,
+                            compensation_error: compensation_error.to_string(),
+                        });
+                    }
                     Err(Error::RuntimeActivation(activation_error))
                 }
             },
         }
+    }
+
+    async fn finish_success(
+        &self,
+        prepared: &PreparedRuntime,
+        journal: &RollbackJournal,
+        activation: ActivationMode,
+    ) -> Result<DeploymentOutcome> {
+        match journal.complete() {
+            Ok(()) => Ok(self.outcome(activation)),
+            Err(error) => {
+                let activation_error = format!("failed to finalize runtime transaction: {error}");
+                self.compensate(prepared, &activation_error).await?;
+                if let Err(compensation_error) = journal.complete() {
+                    return Err(Error::DeploymentCompensation {
+                        activation_error,
+                        compensation_error: compensation_error.to_string(),
+                    });
+                }
+                Err(Error::RuntimeActivation(activation_error))
+            }
+        }
+    }
+
+    async fn handle_commit_failure(
+        &self,
+        prepared: &PreparedRuntime,
+        journal: &RollbackJournal,
+        commit_error: Error,
+    ) -> Result<DeploymentOutcome> {
+        if let Err(compensation_error) = prepared.compensate_file() {
+            return Err(Error::DeploymentCompensation {
+                activation_error: commit_error.to_string(),
+                compensation_error: compensation_error.to_string(),
+            });
+        }
+        if let Err(compensation_error) = journal.complete() {
+            return Err(Error::DeploymentCompensation {
+                activation_error: commit_error.to_string(),
+                compensation_error: compensation_error.to_string(),
+            });
+        }
+        Err(commit_error)
     }
 
     fn outcome(&self, activation: ActivationMode) -> DeploymentOutcome {
@@ -383,7 +463,7 @@ mod tests {
     async fn validates_staging_before_commit_and_reloads() {
         let directory = TestDirectory::new();
         let runtime_path = directory.path.join("runtime.yaml");
-        let store = RuntimeStore::new(&runtime_path);
+        let store = RuntimeStore::open(&runtime_path).expect("store should open");
         let activator = FakeActivator::default();
         let output = RuntimeDeployer::new(&store, &AcceptValidator, &activator)
             .deploy(&config("mode: rule"))
@@ -404,7 +484,7 @@ mod tests {
         let directory = TestDirectory::new();
         let runtime_path = directory.path.join("runtime.yaml");
         fs::write(&runtime_path, "mode: old\n").expect("old runtime should write");
-        let store = RuntimeStore::new(&runtime_path);
+        let store = RuntimeStore::open(&runtime_path).expect("store should open");
         let activator = FakeActivator::default();
         let result = RuntimeDeployer::new(&store, &RejectValidator, &activator)
             .deploy(&config("mode: rule"))
@@ -423,7 +503,7 @@ mod tests {
     async fn reload_failure_uses_one_controlled_restart() {
         let directory = TestDirectory::new();
         let runtime_path = directory.path.join("runtime.yaml");
-        let store = RuntimeStore::new(&runtime_path);
+        let store = RuntimeStore::open(&runtime_path).expect("store should open");
         let activator = FakeActivator::with_failures(vec![true, false]);
         let output = RuntimeDeployer::new(&store, &AcceptValidator, &activator)
             .deploy(&config("mode: rule"))
@@ -439,7 +519,7 @@ mod tests {
         let directory = TestDirectory::new();
         let runtime_path = directory.path.join("runtime.yaml");
         fs::write(&runtime_path, "mode: old\n").expect("old runtime should write");
-        let store = RuntimeStore::new(&runtime_path);
+        let store = RuntimeStore::open(&runtime_path).expect("store should open");
         let activator = FakeActivator::with_failures(vec![true, true, false]);
         let result = RuntimeDeployer::new(&store, &AcceptValidator, &activator)
             .deploy(&config("mode: rule"))
