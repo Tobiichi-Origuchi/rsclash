@@ -1,5 +1,5 @@
 mod fonts;
-#[cfg(feature = "tray")]
+#[cfg(all(feature = "tray", target_os = "linux"))]
 mod tray;
 
 use std::{error::Error, time::Duration};
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn Error>> {
       let backend = BackendHandle::spawn(runtime.handle(), wake);
       let client = backend.client();
 
-      #[cfg(feature = "tray")]
+      #[cfg(all(feature = "tray", target_os = "linux"))]
       let tray = match tray::TrayHandle::new(client.clone()) {
         Ok(tray) => Some(tray),
         Err(error) => {
@@ -52,9 +52,9 @@ fn main() -> Result<(), Box<dyn Error>> {
           None
         },
       };
-      #[cfg(feature = "tray")]
+      #[cfg(all(feature = "tray", target_os = "linux"))]
       let close_to_tray = tray.is_some();
-      #[cfg(not(feature = "tray"))]
+      #[cfg(not(all(feature = "tray", target_os = "linux")))]
       let close_to_tray = false;
 
       let ui = RsClashUi::new(&creation.egui_ctx, client, close_to_tray);
@@ -62,8 +62,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         ui,
         runtime,
         backend: Some(backend),
-        #[cfg(feature = "tray")]
-        _tray: tray,
+        #[cfg(all(feature = "tray", target_os = "linux"))]
+        tray,
       }))
     }),
   )?;
@@ -75,8 +75,8 @@ struct DesktopApp {
   ui: RsClashUi,
   runtime: Runtime,
   backend: Option<BackendHandle>,
-  #[cfg(feature = "tray")]
-  _tray: Option<tray::TrayHandle>,
+  #[cfg(all(feature = "tray", target_os = "linux"))]
+  tray: Option<tray::TrayHandle>,
 }
 
 impl eframe::App for DesktopApp {
@@ -95,6 +95,11 @@ impl eframe::App for DesktopApp {
 
 impl Drop for DesktopApp {
   fn drop(&mut self) {
+    #[cfg(all(feature = "tray", target_os = "linux"))]
+    if let Some(mut tray) = self.tray.take() {
+      tray.shutdown();
+    }
+
     if let Some(backend) = self.backend.take()
       && let Err(error) = self.runtime.block_on(backend.shutdown())
     {

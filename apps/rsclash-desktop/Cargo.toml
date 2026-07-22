@@ -13,7 +13,7 @@ path = "src/main.rs"
 default = ["renderer-glow", "tray"]
 renderer-glow = ["eframe/glow"]
 renderer-wgpu = ["eframe/wgpu"]
-tray = ["dep:tray-icon", "dep:gtk"]
+tray = ["dep:ksni"]
 
 [dependencies]
 eframe.workspace = true
@@ -24,10 +24,9 @@ rsclash-ui.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tray-icon = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gtk = { version = "0.18.2", optional = true }
+ksni = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -7,8 +7,6 @@ unsound = "all"
 yanked = "deny"
 unused-ignored-advisory = "deny"
 ignore = [
-  { id = "RUSTSEC-2024-0415", reason = "tray-icon requires the GTK3 backend on Linux and has no maintained drop-in replacement" },
-  { id = "RUSTSEC-2024-0429", reason = "glib 0.18 is required by the GTK3 tray backend; rsclash does not use VariantStrIter" },
   { id = "RUSTSEC-2026-0194", reason = "quick-xml is build-only through wayland-scanner and parses trusted bundled protocol XML" },
   { id = "RUSTSEC-2026-0195", reason = "quick-xml is build-only through wayland-scanner and parses trusted bundled protocol XML" },
 ]
@@ -25,6 +23,7 @@ allow = [
   "ISC",
   "MIT",
   "MPL-2.0",
+  "Unlicense",
   "Unicode-3.0",
   "Zlib",
 ]

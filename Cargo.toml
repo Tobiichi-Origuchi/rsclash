@@ -27,6 +27,7 @@ eframe = { version = "0.35.0", default-features = false, features = [
 ] }
 egui = { version = "0.35.0", features = ["serde"] }
 futures-util = "0.3.32"
+ksni = { version = "0.3.6", default-features = false, features = ["async-io", "blocking"] }
 reqwest = { version = "0.13.3", default-features = false, features = ["json"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -44,7 +45,6 @@ tokio = { version = "1.53.1", features = [
 tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["handshake"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-tray-icon = { version = "0.24.1", default-features = false, features = ["gtk"] }
 urlencoding = "2.1.3"
 
 rsclash-app = { path = "crates/rsclash-app" }

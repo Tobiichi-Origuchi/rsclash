@@ -1,167 +1,106 @@
-use std::error::Error;
+use std::sync::LazyLock;
 
+use ksni::{
+  blocking::TrayMethods as _,
+  menu::{MenuItem, StandardItem},
+};
 use rsclash_app::AppClient;
 use rsclash_domain::UiCommand;
-use tray_icon::{
-  Icon, TrayIcon, TrayIconBuilder,
-  menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-};
+use tracing::{debug, warn};
 
-#[cfg(target_os = "linux")]
-use std::{
-  sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-  },
-  thread,
-  time::Duration,
-};
+const ICON_SIZE: i32 = 32;
+static APP_ICON: LazyLock<ksni::Icon> = LazyLock::new(app_icon);
 
 pub(crate) struct TrayHandle {
-  #[cfg(not(target_os = "linux"))]
-  _tray: TrayIcon,
-  #[cfg(target_os = "linux")]
-  stop: Arc<AtomicBool>,
-  #[cfg(target_os = "linux")]
-  thread: Option<thread::JoinHandle<()>>,
+  handle: Option<ksni::blocking::Handle<AppTray>>,
 }
 
 impl TrayHandle {
-  pub(crate) fn new(client: AppClient) -> Result<Self, Box<dyn Error + Send + Sync>> {
-    #[cfg(target_os = "linux")]
-    {
-      Self::new_linux(client)
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-      Ok(Self {
-        _tray: build_tray(client)?,
-      })
-    }
+  pub(crate) fn new(client: AppClient) -> Result<Self, ksni::Error> {
+    let handle = AppTray { client }.spawn()?;
+    Ok(Self {
+      handle: Some(handle),
+    })
   }
 
-  #[cfg(target_os = "linux")]
-  fn new_linux(client: AppClient) -> Result<Self, Box<dyn Error + Send + Sync>> {
-    const INIT_TIMEOUT: Duration = Duration::from_secs(3);
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_for_thread = Arc::clone(&stop);
-    let (init_tx, init_rx) = mpsc::sync_channel(1);
-
-    let thread = thread::Builder::new()
-      .name("rsclash-tray".to_owned())
-      .spawn(move || {
-        if let Err(error) = gtk::init() {
-          let _ = init_tx.send(Err(format!("failed to initialize GTK: {error}")));
-          return;
-        }
-
-        let tray = match build_tray(client) {
-          Ok(tray) => tray,
-          Err(error) => {
-            let _ = init_tx.send(Err(error.to_string()));
-            return;
-          },
-        };
-
-        let main_loop = gtk::glib::MainLoop::new(None, false);
-        let loop_for_timer = main_loop.clone();
-        gtk::glib::timeout_add_local(Duration::from_millis(100), move || {
-          if stop_for_thread.load(Ordering::Acquire) {
-            loop_for_timer.quit();
-            gtk::glib::ControlFlow::Break
-          } else {
-            gtk::glib::ControlFlow::Continue
-          }
-        });
-
-        if init_tx.send(Ok(())).is_err() {
-          return;
-        }
-
-        main_loop.run();
-        drop(tray);
-        clear_menu_handler();
-      })?;
-
-    match init_rx.recv_timeout(INIT_TIMEOUT) {
-      Ok(Ok(())) => Ok(Self {
-        stop,
-        thread: Some(thread),
-      }),
-      Ok(Err(message)) => {
-        let _ = thread.join();
-        Err(boxed_error(message))
-      },
-      Err(error) => {
-        stop.store(true, Ordering::Release);
-        let _ = thread.join();
-        Err(boxed_error(format!(
-          "timed out while initializing the Linux tray: {error}"
-        )))
-      },
+  pub(crate) fn shutdown(&mut self) {
+    if let Some(handle) = self.handle.take() {
+      handle.shutdown().wait();
     }
   }
 }
 
 impl Drop for TrayHandle {
   fn drop(&mut self) {
-    #[cfg(target_os = "linux")]
-    {
-      self.stop.store(true, Ordering::Release);
-      if let Some(thread) = self.thread.take() {
-        let _ = thread.join();
-      }
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    clear_menu_handler();
+    self.shutdown();
   }
 }
 
-fn build_tray(client: AppClient) -> Result<TrayIcon, Box<dyn Error + Send + Sync>> {
-  let menu = Menu::new();
-  let toggle = MenuItem::new("显示或隐藏 rsclash", true, None);
-  let quit = MenuItem::new("退出", true, None);
-  let toggle_id = toggle.id().clone();
-  let quit_id = quit.id().clone();
+struct AppTray {
+  client: AppClient,
+}
 
-  menu.append(&toggle)?;
-  menu.append(&PredefinedMenuItem::separator())?;
-  menu.append(&quit)?;
-
-  MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-    if event.id == toggle_id {
-      let _ = client.try_command(UiCommand::ToggleWindow);
-    } else if event.id == quit_id {
-      let _ = client.try_command(UiCommand::Shutdown);
+impl AppTray {
+  fn send(&self, command: UiCommand) {
+    debug!(?command, "dispatching system tray command");
+    if let Err(error) = self.client.try_command(command) {
+      warn!(%error, "failed to dispatch system tray command");
     }
-  }));
-
-  TrayIconBuilder::new()
-    .with_menu(Box::new(menu))
-    .with_tooltip("rsclash · Native Mihomo GUI")
-    .with_icon(app_icon()?)
-    .build()
-    .map_err(Into::into)
+  }
 }
 
-fn clear_menu_handler() {
-  MenuEvent::set_event_handler::<fn(MenuEvent)>(None);
+impl ksni::Tray for AppTray {
+  fn id(&self) -> String {
+    "rsclash".to_owned()
+  }
+
+  fn title(&self) -> String {
+    "rsclash".to_owned()
+  }
+
+  fn activate(&mut self, _x: i32, _y: i32) {
+    self.send(UiCommand::ToggleWindow);
+  }
+
+  fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+    vec![APP_ICON.clone()]
+  }
+
+  fn tool_tip(&self) -> ksni::ToolTip {
+    ksni::ToolTip {
+      icon_pixmap: self.icon_pixmap(),
+      title: self.title(),
+      description: "Native Mihomo GUI".to_owned(),
+      ..Default::default()
+    }
+  }
+
+  fn menu(&self) -> Vec<MenuItem<Self>> {
+    vec![
+      StandardItem {
+        label: "显示或隐藏 rsclash".to_owned(),
+        icon_name: "view-restore-symbolic".to_owned(),
+        activate: Box::new(|tray: &mut Self| tray.send(UiCommand::ToggleWindow)),
+        ..Default::default()
+      }
+      .into(),
+      MenuItem::Separator,
+      StandardItem {
+        label: "退出".to_owned(),
+        icon_name: "application-exit-symbolic".to_owned(),
+        activate: Box::new(|tray: &mut Self| tray.send(UiCommand::Shutdown)),
+        ..Default::default()
+      }
+      .into(),
+    ]
+  }
 }
 
-#[cfg(target_os = "linux")]
-fn boxed_error(message: String) -> Box<dyn Error + Send + Sync> {
-  Box::new(std::io::Error::other(message))
-}
+fn app_icon() -> ksni::Icon {
+  let mut data = Vec::with_capacity((ICON_SIZE * ICON_SIZE * 4) as usize);
 
-fn app_icon() -> Result<Icon, tray_icon::BadIcon> {
-  const SIZE: u32 = 32;
-  let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-
-  for y in 0..SIZE {
-    for x in 0..SIZE {
+  for y in 0..ICON_SIZE {
+    for x in 0..ICON_SIZE {
       let dx = x as f32 - 15.5;
       let dy = y as f32 - 15.5;
       let inside = dx.mul_add(dx, dy * dy) <= 14.5_f32.powi(2);
@@ -173,10 +112,30 @@ fn app_icon() -> Result<Icon, tray_icon::BadIcon> {
       } else {
         (0, 0, 0, 0)
       };
-      let pixel: [u8; 4] = (red, green, blue, alpha).into();
-      rgba.extend_from_slice(&pixel);
+      let pixel: [u8; 4] = (alpha, red, green, blue).into();
+      data.extend_from_slice(&pixel);
     }
   }
 
-  Icon::from_rgba(rgba, SIZE, SIZE)
+  ksni::Icon {
+    width: ICON_SIZE,
+    height: ICON_SIZE,
+    data,
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{APP_ICON, ICON_SIZE};
+
+  #[test]
+  fn icon_uses_argb_network_byte_order() {
+    assert_eq!(APP_ICON.width, ICON_SIZE);
+    assert_eq!(APP_ICON.height, ICON_SIZE);
+    assert_eq!(APP_ICON.data.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
+    assert_eq!(&APP_ICON.data[..4], &[0, 0, 0, 0]);
+
+    let center = ((16 * ICON_SIZE + 16) * 4) as usize;
+    assert_eq!(&APP_ICON.data[center..center + 4], &[255, 28, 113, 216]);
+  }
 }

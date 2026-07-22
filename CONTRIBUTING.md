@@ -14,13 +14,15 @@ On Debian or Ubuntu, install the current Linux build dependencies with:
 ```shell
 sudo apt-get install \
   build-essential \
-  libayatana-appindicator3-dev \
-  libgtk-3-dev \
   libwayland-dev \
   libxkbcommon-dev \
   pkg-config \
   shellcheck
 ```
+
+The Linux tray uses the StatusNotifierItem and DBusMenu protocols directly through `ksni`; it does
+not link GTK, GLib, or AppIndicator. The desktop session must provide an SNI host, such as KDE
+Plasma, a compatible Waybar or Quickshell tray, or GNOME with an AppIndicator extension.
 
 Install the pinned repository tools with:
 

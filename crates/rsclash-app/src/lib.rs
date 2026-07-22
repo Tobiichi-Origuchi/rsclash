@@ -61,6 +61,7 @@ struct CommandEnvelope {
 pub struct AppClient {
   command_tx: mpsc::Sender<CommandEnvelope>,
   snapshot_rx: watch::Receiver<Arc<AppSnapshot>>,
+  last_snapshot_revision: u64,
   event_tx: broadcast::Sender<AppEvent>,
 }
 
@@ -70,9 +71,16 @@ impl AppClient {
   }
 
   pub fn take_snapshot_if_changed(&mut self) -> Option<Arc<AppSnapshot>> {
-    match self.snapshot_rx.has_changed() {
-      Ok(true) => Some(self.snapshot_rx.borrow_and_update().clone()),
-      Ok(false) | Err(_) => None,
+    let has_changed = self
+      .snapshot_rx
+      .has_changed()
+      .unwrap_or_else(|_| self.snapshot_rx.borrow().revision != self.last_snapshot_revision);
+    if has_changed {
+      let snapshot = self.snapshot_rx.borrow_and_update().clone();
+      self.last_snapshot_revision = snapshot.revision;
+      Some(snapshot)
+    } else {
+      None
     }
   }
 
@@ -82,7 +90,9 @@ impl AppClient {
       .changed()
       .await
       .map_err(|_| ClientError::CoordinatorClosed)?;
-    Ok(self.snapshot_rx.borrow_and_update().clone())
+    let snapshot = self.snapshot_rx.borrow_and_update().clone();
+    self.last_snapshot_revision = snapshot.revision;
+    Ok(snapshot)
   }
 
   pub fn subscribe_events(&self) -> broadcast::Receiver<AppEvent> {
@@ -174,6 +184,7 @@ impl BackendHandle {
       client: AppClient {
         command_tx,
         snapshot_rx,
+        last_snapshot_revision: initial_snapshot.revision,
         event_tx,
       },
       coordinator: Some(coordinator),
@@ -367,12 +378,19 @@ mod tests {
   #[tokio::test]
   async fn shutdown_is_idempotent_at_protocol_level() {
     let backend = BackendHandle::spawn(&tokio::runtime::Handle::current(), WakeHandle::default());
-    let client = backend.client();
+    let mut client = backend.client();
 
     assert_eq!(
       client.request(UiCommand::Shutdown).await.ok(),
       Some(CommandOutput::ShutdownAccepted)
     );
     assert!(backend.shutdown().await.is_ok());
+    assert_eq!(
+      client
+        .take_snapshot_if_changed()
+        .map(|snapshot| snapshot.status),
+      Some(AppStatus::ShuttingDown)
+    );
+    assert!(client.take_snapshot_if_changed().is_none());
   }
 }
