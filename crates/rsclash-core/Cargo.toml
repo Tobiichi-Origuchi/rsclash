@@ -9,7 +9,7 @@ publish.workspace = true
 async-trait.workspace = true
 rsclash-domain.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rsclash-mihomo.workspace = true

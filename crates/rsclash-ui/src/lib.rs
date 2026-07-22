@@ -7,7 +7,8 @@ use std::sync::Arc;
 use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, Stroke, Ui};
 use rsclash_app::{AppClient, AppEventReceiver, ClientError};
 use rsclash_domain::{
-  AppEvent, AppSnapshot, AppStatus, CoreChannel, CoreRunMode, CoreState, Page, ThemeMode, UiCommand,
+  AppSnapshot, AppStatus, CoreChannel, CoreRunMode, CoreState, MihomoConnection, Page,
+  ProxyGroupSnapshot, ProxyMode, ThemeMode, UiCommand,
 };
 
 pub struct RsClashUi {
@@ -16,7 +17,6 @@ pub struct RsClashUi {
   snapshot: Arc<AppSnapshot>,
   applied_theme: Option<ThemeMode>,
   applied_window_visibility: Option<bool>,
-  last_event: Option<AppEvent>,
   local_error: Option<String>,
   close_to_tray: bool,
 }
@@ -33,7 +33,6 @@ impl RsClashUi {
       snapshot,
       applied_theme: None,
       applied_window_visibility: None,
-      last_event: None,
       local_error: None,
       close_to_tray,
     }
@@ -45,9 +44,7 @@ impl RsClashUi {
       self.snapshot = snapshot;
     }
 
-    while let Some(event) = self.events.try_recv() {
-      self.last_event = Some(event);
-    }
+    while self.events.try_recv().is_some() {}
 
     if self.applied_theme != Some(self.snapshot.theme) {
       theme::apply_preference(context, self.snapshot.theme);
@@ -139,7 +136,7 @@ impl RsClashUi {
     }
 
     ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-      ui.label(RichText::new("P1/P2 技术骨架").small().weak());
+      ui.label(RichText::new("原生 egui · Mihomo").small().weak());
       ui.label(
         RichText::new(format!("状态版本 {}", self.snapshot.revision))
           .small()
@@ -213,41 +210,169 @@ impl RsClashUi {
 
     match self.snapshot.page {
       Page::Home => self.home(ui),
+      Page::Proxies => self.proxies(ui),
       Page::Settings => self.settings(ui),
       page => self.placeholder(ui, page),
     }
   }
 
   fn home(&mut self, ui: &mut Ui) {
-    ui.label(
-      RichText::new("一个不依赖 WebView 的 Mihomo 原生桌面壳")
-        .size(22.0)
-        .strong(),
-    );
-    ui.label(RichText::new("原生 egui 界面通过本地 Unix Socket 管理 Mihomo 生命周期。").weak());
+    let core = self.snapshot.core.clone();
+    let mihomo = self.snapshot.mihomo.clone();
+    ui.horizontal(|ui| {
+      ui.vertical(|ui| {
+        ui.label(RichText::new("网络概览").size(24.0).strong());
+        ui.label(RichText::new("Mihomo 与系统代理的实时状态").weak());
+      });
+      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if ui.button("刷新").clicked() {
+          self.command(UiCommand::RefreshMihomo);
+        }
+        mihomo_connection_pill(ui, mihomo.connection);
+      });
+    });
     ui.add_space(18.0);
 
-    let core = self.snapshot.core.clone();
-    let revision = self.snapshot.revision;
     ui.columns(2, |columns| {
       card(&mut columns[0], "Mihomo 核心", |ui| {
         self.core_controls(ui, &core);
       });
-      card(&mut columns[1], "应用协调器", |ui| {
-        ui.label(RichText::new("运行正常").size(18.0).strong());
-        ui.label(RichText::new(format!("Snapshot revision {revision}")).weak());
+      card(&mut columns[1], "当前代理", |ui| {
+        ui.label(
+          RichText::new(mihomo.current_proxy().unwrap_or("尚未选择"))
+            .size(18.0)
+            .strong(),
+        );
+        ui.label(
+          RichText::new(format!(
+            "{} · {}",
+            proxy_mode_label(&mihomo.mode),
+            mihomo.version.as_deref().unwrap_or("版本未知")
+          ))
+          .weak(),
+        );
       });
     });
 
     ui.add_space(12.0);
-    card(ui, "P5 核心能力", |ui| {
-      ui.label("• eframe 0.35 + Glow 原生渲染");
-      ui.label("• stable / alpha 核心切换与热加载");
-      ui.label("• 私有 UDS、健康检查与崩溃退避");
-      ui.label("• 有界 stdout / stderr 和确定性退出");
-      if let Some(event) = &self.last_event {
+    ui.columns(2, |columns| {
+      card(&mut columns[0], "实时流量", |ui| {
+        stat_pair(
+          ui,
+          "上传",
+          &format_rate(mihomo.traffic.upload_bytes_per_second),
+          "下载",
+          &format_rate(mihomo.traffic.download_bytes_per_second),
+        );
+      });
+      card(&mut columns[1], "资源使用", |ui| {
+        stat_pair(
+          ui,
+          "内存",
+          &format_bytes(mihomo.memory_bytes),
+          "连接",
+          &mihomo.connection_count.to_string(),
+        );
+      });
+    });
+
+    ui.add_space(12.0);
+    card(ui, "出站模式", |ui| {
+      self.mode_controls(ui, &mihomo.mode);
+      if let Some(error) = mihomo.last_error.as_deref() {
         ui.add_space(8.0);
-        ui.label(RichText::new(format!("最近事件：{event:?}")).small().weak());
+        ui.label(
+          RichText::new(format!("控制器暂时不可用：{error}"))
+            .small()
+            .color(ui.visuals().warn_fg_color),
+        );
+      }
+    });
+  }
+
+  fn proxies(&mut self, ui: &mut Ui) {
+    let mihomo = self.snapshot.mihomo.clone();
+    ui.horizontal(|ui| {
+      ui.vertical(|ui| {
+        ui.label(RichText::new("代理选择").size(24.0).strong());
+        ui.label(RichText::new("选择出站模式和各代理组的当前节点").weak());
+      });
+      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if ui.button("刷新").clicked() {
+          self.command(UiCommand::RefreshMihomo);
+        }
+      });
+    });
+    ui.add_space(16.0);
+    card(ui, "出站模式", |ui| {
+      self.mode_controls(ui, &mihomo.mode)
+    });
+    ui.add_space(12.0);
+
+    if mihomo.connection == MihomoConnection::Offline {
+      empty_state(
+        ui,
+        "Mihomo 尚未运行",
+        "启动核心后即可读取代理组并选择节点。",
+      );
+      return;
+    }
+    if mihomo.groups.is_empty() {
+      empty_state(
+        ui,
+        "没有可用代理组",
+        "当前配置尚未提供 Selector、URL-Test 等代理组。",
+      );
+      return;
+    }
+
+    for group in &mihomo.groups {
+      self.proxy_group(ui, group);
+      ui.add_space(12.0);
+    }
+  }
+
+  fn proxy_group(&mut self, ui: &mut Ui, group: &ProxyGroupSnapshot) {
+    card(ui, &group.name, |ui| {
+      ui.horizontal(|ui| {
+        ui.label(RichText::new(&group.kind).small().weak());
+        if let Some(selected) = group.selected.as_deref() {
+          ui.label(RichText::new(format!("当前：{selected}")).small().weak());
+        }
+      });
+      ui.add_space(6.0);
+      ui.horizontal_wrapped(|ui| {
+        for option in &group.options {
+          let selected = group.selected.as_deref() == Some(option.name.as_str());
+          let delay = option
+            .delay_ms
+            .map_or_else(|| "—".to_string(), |delay| format!("{delay} ms"));
+          let text = format!("{}  {delay}", option.name);
+          let response = ui.add_enabled(
+            option.alive || selected,
+            egui::Button::new(text).selected(selected),
+          );
+          if response.clicked() {
+            self.command(UiCommand::SelectProxy {
+              group: group.name.clone(),
+              proxy: option.name.clone(),
+            });
+          }
+        }
+      });
+    });
+  }
+
+  fn mode_controls(&mut self, ui: &mut Ui, current: &ProxyMode) {
+    ui.horizontal(|ui| {
+      for (mode, label) in [
+        (ProxyMode::Rule, "规则"),
+        (ProxyMode::Global, "全局"),
+        (ProxyMode::Direct, "直连"),
+      ] {
+        if ui.selectable_label(current == &mode, label).clicked() {
+          self.command(UiCommand::SetProxyMode(mode));
+        }
       }
     });
   }
@@ -389,6 +514,74 @@ fn status_pill(ui: &mut Ui, status: AppStatus) {
     });
 }
 
+fn mihomo_connection_pill(ui: &mut Ui, connection: MihomoConnection) {
+  let (text, color) = match connection {
+    MihomoConnection::Offline => ("核心离线", Color32::from_rgb(119, 118, 123)),
+    MihomoConnection::Connecting => ("正在连接", Color32::from_rgb(196, 121, 0)),
+    MihomoConnection::Connected => ("代理运行中", Color32::from_rgb(38, 162, 105)),
+    MihomoConnection::Degraded => ("连接异常", Color32::from_rgb(192, 28, 40)),
+  };
+  Frame::new()
+    .fill(color.gamma_multiply(0.14))
+    .corner_radius(20)
+    .inner_margin(egui::Margin::symmetric(10, 5))
+    .show(ui, |ui| {
+      ui.label(RichText::new(text).small().strong().color(color));
+    });
+}
+
+fn proxy_mode_label(mode: &ProxyMode) -> &str {
+  match mode {
+    ProxyMode::Rule => "规则模式",
+    ProxyMode::Global => "全局模式",
+    ProxyMode::Direct => "直连模式",
+    ProxyMode::Unknown(value) => value,
+  }
+}
+
+fn stat_pair(ui: &mut Ui, first_label: &str, first: &str, second_label: &str, second: &str) {
+  ui.columns(2, |columns| {
+    columns[0].label(RichText::new(first).size(19.0).strong());
+    columns[0].label(RichText::new(first_label).small().weak());
+    columns[1].label(RichText::new(second).size(19.0).strong());
+    columns[1].label(RichText::new(second_label).small().weak());
+  });
+}
+
+fn empty_state(ui: &mut Ui, title: &str, detail: &str) {
+  Frame::new()
+    .fill(ui.visuals().faint_bg_color)
+    .stroke(Stroke::new(1.0, ui.visuals().window_stroke().color))
+    .corner_radius(12)
+    .inner_margin(24)
+    .show(ui, |ui| {
+      ui.set_min_width((ui.available_width() - 1.0).max(240.0));
+      ui.vertical_centered(|ui| {
+        ui.label(RichText::new(title).size(18.0).strong());
+        ui.label(RichText::new(detail).weak());
+      });
+    });
+}
+
+fn format_rate(bytes: u64) -> String {
+  format!("{}/s", format_bytes(bytes))
+}
+
+fn format_bytes(bytes: u64) -> String {
+  const KIB: u64 = 1_024;
+  const MIB: u64 = KIB * 1_024;
+  const GIB: u64 = MIB * 1_024;
+  if bytes >= GIB {
+    format!("{:.1} GiB", bytes as f64 / GIB as f64)
+  } else if bytes >= MIB {
+    format!("{:.1} MiB", bytes as f64 / MIB as f64)
+  } else if bytes >= KIB {
+    format!("{:.1} KiB", bytes as f64 / KIB as f64)
+  } else {
+    format!("{bytes} B")
+  }
+}
+
 fn card(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui)) {
   Frame::new()
     .fill(ui.visuals().faint_bg_color)
@@ -412,6 +605,8 @@ fn client_error_message(error: &ClientError) -> String {
 mod tests {
   use rsclash_domain::Page;
 
+  use super::format_bytes;
+
   #[test]
   fn every_page_has_a_non_empty_native_label() {
     assert!(
@@ -419,5 +614,12 @@ mod tests {
         .iter()
         .all(|page| !page.label().is_empty() && !page.symbol().is_empty())
     );
+  }
+
+  #[test]
+  fn byte_counts_use_binary_units() {
+    assert_eq!(format_bytes(0), "0 B");
+    assert_eq!(format_bytes(1_024), "1.0 KiB");
+    assert_eq!(format_bytes(5 * 1_024 * 1_024), "5.0 MiB");
   }
 }
