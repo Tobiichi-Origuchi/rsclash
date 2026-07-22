@@ -140,6 +140,10 @@ pub struct ErrorView {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum UiCommand {
   Ping,
+  StartCore(CoreChannel),
+  StopCore,
+  RestartCore(CoreChannel),
+  ReloadCore,
   Navigate(Page),
   SetTheme(ThemeMode),
   SetWindowVisible(bool),
@@ -158,6 +162,7 @@ pub enum CommandOutput {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum AppEvent {
   BackendReady,
+  CoreStateChanged(CoreState),
   NavigationChanged(Page),
   ThemeChanged(ThemeMode),
   WindowVisibilityChanged(bool),

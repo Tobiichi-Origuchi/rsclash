@@ -3,10 +3,12 @@
 mod change;
 mod runtime;
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{fmt, future::pending, sync::Arc, time::Duration};
 
+use rsclash_core::{CoreHandle, CoreRuntime};
 use rsclash_domain::{
-  AppEvent, AppSnapshot, AppStatus, CommandError, CommandOutput, CommandResult, UiCommand,
+  AppEvent, AppSnapshot, AppStatus, CommandError, CommandOutput, CommandResult, CoreChannel,
+  CoreState, ErrorView, UiCommand,
 };
 use thiserror::Error;
 use tokio::{
@@ -21,10 +23,11 @@ pub use change::{
   ChangeAction, ChangeReceipt, CompensationFailure, PreparedChange, SideEffectError,
   SideEffectTransaction,
 };
-pub use runtime::MihomoRuntimeActivator;
+pub use runtime::CoreRuntimeActivator;
 
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 64;
+const CORE_EVENT_CAPACITY: usize = 32;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
@@ -177,19 +180,53 @@ pub enum BackendError {
   ShutdownTimedOut,
   #[error("the application coordinator task failed: {0}")]
   TaskFailed(String),
+  #[error("the core runtime did not shut down cleanly: {0}")]
+  CoreShutdown(String),
 }
 
 pub struct BackendHandle {
   client: AppClient,
   coordinator: Option<JoinHandle<()>>,
+  core_relay: Option<JoinHandle<()>>,
+  core_worker: Option<JoinHandle<()>>,
+  core_runtime: Option<CoreRuntime>,
 }
 
 impl BackendHandle {
   pub fn spawn(runtime: &Handle, wake: WakeHandle) -> Self {
-    let initial_snapshot = Arc::new(AppSnapshot::default());
+    Self::spawn_inner(runtime, wake, None)
+  }
+
+  pub fn spawn_with_core(runtime: &Handle, wake: WakeHandle, core_runtime: CoreRuntime) -> Self {
+    Self::spawn_inner(runtime, wake, Some(core_runtime))
+  }
+
+  fn spawn_inner(runtime: &Handle, wake: WakeHandle, core_runtime: Option<CoreRuntime>) -> Self {
+    let core = core_runtime.as_ref().map(CoreRuntime::handle);
+    let mut initial_snapshot = AppSnapshot::default();
+    if let Some(core) = &core {
+      initial_snapshot.core = core.current_state().as_ref().clone();
+    }
+    let initial_snapshot = Arc::new(initial_snapshot);
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (snapshot_tx, snapshot_rx) = watch::channel(Arc::clone(&initial_snapshot));
     let (event_tx, _) = broadcast::channel(EVENT_CAPACITY);
+    let (core_command_tx, core_event_rx, core_relay, core_worker) = match core {
+      Some(core) => {
+        let (core_event_tx, core_event_rx) = mpsc::channel(CORE_EVENT_CAPACITY);
+        let (core_command_tx, core_command_rx) = mpsc::channel(CORE_EVENT_CAPACITY);
+        let relay_tx = core_event_tx.clone();
+        let relay = runtime.spawn(relay_core_states(core.clone(), relay_tx));
+        let worker = runtime.spawn(run_core_commands(core, core_command_rx, core_event_tx));
+        (
+          Some(core_command_tx),
+          Some(core_event_rx),
+          Some(relay),
+          Some(worker),
+        )
+      },
+      None => (None, None, None, None),
+    };
 
     let coordinator = Coordinator {
       snapshot: (*initial_snapshot).clone(),
@@ -197,6 +234,8 @@ impl BackendHandle {
       snapshot_tx,
       event_tx: event_tx.clone(),
       wake,
+      core_command_tx,
+      core_event_rx,
     };
     let coordinator = runtime.spawn(coordinator.run());
 
@@ -208,6 +247,9 @@ impl BackendHandle {
         event_tx,
       },
       coordinator: Some(coordinator),
+      core_relay,
+      core_worker,
+      core_runtime,
     }
   }
 
@@ -216,7 +258,7 @@ impl BackendHandle {
   }
 
   pub async fn shutdown(mut self) -> Result<(), BackendError> {
-    if let Some(mut coordinator) = self.coordinator.take() {
+    let coordinator_result = if let Some(mut coordinator) = self.coordinator.take() {
       if !coordinator.is_finished() {
         let _ = self.client.request(UiCommand::Shutdown).await;
       }
@@ -232,7 +274,27 @@ impl BackendHandle {
       }
     } else {
       Ok(())
+    };
+
+    if let Some(core_relay) = self.core_relay.take() {
+      core_relay.abort();
+      let _ = core_relay.await;
     }
+    if let Some(core_worker) = self.core_worker.take() {
+      core_worker.abort();
+      let _ = core_worker.await;
+    }
+
+    let core_result = if let Some(core_runtime) = self.core_runtime.take() {
+      core_runtime
+        .shutdown()
+        .await
+        .map_err(|error| BackendError::CoreShutdown(error.to_string()))
+    } else {
+      Ok(())
+    };
+    coordinator_result?;
+    core_result
   }
 }
 
@@ -242,7 +304,27 @@ impl Drop for BackendHandle {
       let _ = self.client.try_command(UiCommand::Shutdown);
       coordinator.abort();
     }
+    if let Some(core_relay) = self.core_relay.take() {
+      core_relay.abort();
+    }
+    if let Some(core_worker) = self.core_worker.take() {
+      core_worker.abort();
+    }
+    let _ = self.core_runtime.take();
   }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CoreBridgeCommand {
+  Start(CoreChannel),
+  Stop,
+  Restart(CoreChannel),
+  Reload,
+}
+
+enum CoreBridgeEvent {
+  State(CoreState),
+  CommandFailed(String),
 }
 
 struct Coordinator {
@@ -251,6 +333,8 @@ struct Coordinator {
   snapshot_tx: watch::Sender<Arc<AppSnapshot>>,
   event_tx: broadcast::Sender<AppEvent>,
   wake: WakeHandle,
+  core_command_tx: Option<mpsc::Sender<CoreBridgeCommand>>,
+  core_event_rx: Option<mpsc::Receiver<CoreBridgeEvent>>,
 }
 
 impl Coordinator {
@@ -260,13 +344,27 @@ impl Coordinator {
     self.emit(AppEvent::BackendReady);
     info!("application coordinator is ready");
 
-    while let Some(envelope) = self.command_rx.recv().await {
-      let (result, should_stop) = self.handle_command(envelope.command);
-      if let Some(reply) = envelope.reply {
-        let _ = reply.send(result);
-      }
-      if should_stop {
-        break;
+    loop {
+      tokio::select! {
+        biased;
+        envelope = self.command_rx.recv() => {
+          let Some(envelope) = envelope else {
+            break;
+          };
+          let (result, should_stop) = self.handle_command(envelope.command);
+          if let Some(reply) = envelope.reply {
+            let _ = reply.send(result);
+          }
+          if should_stop {
+            break;
+          }
+        },
+        core_event = receive_core_event(&mut self.core_event_rx), if self.core_event_rx.is_some() => {
+          match core_event {
+            Some(event) => self.handle_core_event(event),
+            None => self.core_event_rx = None,
+          }
+        },
       }
     }
 
@@ -280,6 +378,10 @@ impl Coordinator {
 
     match command {
       UiCommand::Ping => (Ok(CommandOutput::Pong), false),
+      UiCommand::StartCore(channel) => self.dispatch_core(CoreBridgeCommand::Start(channel)),
+      UiCommand::StopCore => self.dispatch_core(CoreBridgeCommand::Stop),
+      UiCommand::RestartCore(channel) => self.dispatch_core(CoreBridgeCommand::Restart(channel)),
+      UiCommand::ReloadCore => self.dispatch_core(CoreBridgeCommand::Reload),
       UiCommand::Navigate(page) => {
         self.snapshot.page = page;
         self.publish_snapshot();
@@ -316,6 +418,57 @@ impl Coordinator {
     }
   }
 
+  fn dispatch_core(&self, command: CoreBridgeCommand) -> (CommandResult, bool) {
+    let Some(command_tx) = &self.core_command_tx else {
+      return (
+        Err(CommandError::InvalidState(
+          "the Mihomo core runtime is not configured".to_string(),
+        )),
+        false,
+      );
+    };
+    match command_tx.try_send(command) {
+      Ok(()) => (Ok(CommandOutput::Accepted), false),
+      Err(mpsc::error::TrySendError::Full(_)) => (
+        Err(CommandError::InvalidState(
+          "the Mihomo core command queue is full".to_string(),
+        )),
+        false,
+      ),
+      Err(mpsc::error::TrySendError::Closed(_)) => (
+        Err(CommandError::InvalidState(
+          "the Mihomo core command bridge is closed".to_string(),
+        )),
+        false,
+      ),
+    }
+  }
+
+  fn handle_core_event(&mut self, event: CoreBridgeEvent) {
+    match event {
+      CoreBridgeEvent::State(state) => {
+        if let CoreState::Failed { message } = &state {
+          self.snapshot.last_error = Some(ErrorView {
+            title: "Mihomo core failed".to_string(),
+            detail: message.clone(),
+            retryable: true,
+          });
+        }
+        self.snapshot.core = state.clone();
+        self.publish_snapshot();
+        self.emit(AppEvent::CoreStateChanged(state));
+      },
+      CoreBridgeEvent::CommandFailed(message) => {
+        self.snapshot.last_error = Some(ErrorView {
+          title: "Mihomo core command failed".to_string(),
+          detail: message,
+          retryable: true,
+        });
+        self.publish_snapshot();
+      },
+    }
+  }
+
   fn set_window_visible(&mut self, visible: bool) {
     if self.snapshot.window_visible != visible {
       self.snapshot.window_visible = visible;
@@ -338,14 +491,116 @@ impl Coordinator {
   }
 }
 
-#[cfg(test)]
-mod tests {
-  use std::time::Duration;
+async fn relay_core_states(mut core: CoreHandle, event_tx: mpsc::Sender<CoreBridgeEvent>) {
+  while let Ok(state) = core.changed().await {
+    if event_tx
+      .send(CoreBridgeEvent::State(state.as_ref().clone()))
+      .await
+      .is_err()
+    {
+      return;
+    }
+  }
+}
 
-  use rsclash_domain::{AppEvent, AppStatus, CommandOutput, Page, ThemeMode, UiCommand};
+async fn run_core_commands(
+  core: CoreHandle,
+  mut command_rx: mpsc::Receiver<CoreBridgeCommand>,
+  event_tx: mpsc::Sender<CoreBridgeEvent>,
+) {
+  while let Some(command) = command_rx.recv().await {
+    let result = match command {
+      CoreBridgeCommand::Start(channel) => core.start(channel).await,
+      CoreBridgeCommand::Stop => core.stop().await,
+      CoreBridgeCommand::Restart(channel) => core.restart(channel).await,
+      CoreBridgeCommand::Reload => core.reload().await,
+    };
+    if let Err(error) = result
+      && event_tx
+        .send(CoreBridgeEvent::CommandFailed(error.to_string()))
+        .await
+        .is_err()
+    {
+      return;
+    }
+  }
+}
+
+async fn receive_core_event(
+  receiver: &mut Option<mpsc::Receiver<CoreBridgeEvent>>,
+) -> Option<CoreBridgeEvent> {
+  if let Some(receiver) = receiver {
+    receiver.recv().await
+  } else {
+    pending::<Option<CoreBridgeEvent>>().await
+  }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
+mod tests {
+  use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+  };
+
+  use async_trait::async_trait;
+  use rsclash_core::{ControllerError, CoreRuntime, LifecycleController, RunningCore};
+  use rsclash_domain::{
+    AppEvent, AppStatus, CommandOutput, CoreChannel, CoreRunMode, CoreState, Page, ThemeMode,
+    UiCommand,
+  };
   use tokio::{sync::broadcast, time::timeout};
 
   use super::{AppEventReceiver, BackendHandle, WakeHandle};
+
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  enum CoreCall {
+    Start(CoreChannel),
+    Stop,
+    Reload,
+  }
+
+  struct BridgeController {
+    calls: Arc<Mutex<Vec<CoreCall>>>,
+  }
+
+  impl BridgeController {
+    fn record(&self, call: CoreCall) {
+      self
+        .calls
+        .lock()
+        .expect("call log lock should be available")
+        .push(call);
+    }
+
+    fn running() -> RunningCore {
+      RunningCore::new(CoreRunMode::Sidecar, Some("1.0.0".to_string()))
+    }
+  }
+
+  #[async_trait]
+  impl LifecycleController for BridgeController {
+    async fn start(&mut self, channel: CoreChannel) -> Result<RunningCore, ControllerError> {
+      self.record(CoreCall::Start(channel));
+      tokio::time::sleep(Duration::from_millis(50)).await;
+      Ok(Self::running())
+    }
+
+    async fn stop(&mut self) -> Result<(), ControllerError> {
+      self.record(CoreCall::Stop);
+      Ok(())
+    }
+
+    async fn reload(&mut self) -> Result<RunningCore, ControllerError> {
+      self.record(CoreCall::Reload);
+      Ok(Self::running())
+    }
+
+    async fn health_check(&mut self) -> Result<RunningCore, ControllerError> {
+      Ok(Self::running())
+    }
+  }
 
   async fn wait_for_snapshot(
     client: &mut super::AppClient,
@@ -425,5 +680,67 @@ mod tests {
       Some(AppStatus::ShuttingDown)
     );
     assert!(client.take_snapshot_if_changed().is_none());
+  }
+
+  #[tokio::test]
+  async fn core_bridge_preserves_command_order_without_blocking_ui_commands() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let core_runtime = CoreRuntime::spawn(
+      &tokio::runtime::Handle::current(),
+      BridgeController {
+        calls: Arc::clone(&calls),
+      },
+    );
+    let backend = BackendHandle::spawn_with_core(
+      &tokio::runtime::Handle::current(),
+      WakeHandle::default(),
+      core_runtime,
+    );
+    let mut client = backend.client();
+    wait_for_snapshot(&mut client, |snapshot| snapshot.status == AppStatus::Ready).await;
+
+    assert_eq!(
+      client
+        .request(UiCommand::StartCore(CoreChannel::Stable))
+        .await
+        .ok(),
+      Some(CommandOutput::Accepted)
+    );
+    assert_eq!(
+      client.request(UiCommand::ReloadCore).await.ok(),
+      Some(CommandOutput::Accepted)
+    );
+    assert_eq!(
+      client
+        .request(UiCommand::Navigate(Page::Proxies))
+        .await
+        .ok(),
+      Some(CommandOutput::Accepted)
+    );
+    wait_for_snapshot(&mut client, |snapshot| snapshot.page == Page::Proxies).await;
+    wait_for_snapshot(&mut client, |snapshot| {
+      matches!(snapshot.core, CoreState::Running { .. })
+    })
+    .await;
+
+    let ordered = timeout(Duration::from_secs(1), async {
+      loop {
+        let calls = calls
+          .lock()
+          .expect("call log lock should be available")
+          .clone();
+        if calls.len() >= 2 {
+          return calls;
+        }
+        tokio::task::yield_now().await;
+      }
+    })
+    .await
+    .expect("core commands should finish before the timeout");
+    assert_eq!(
+      ordered,
+      vec![CoreCall::Start(CoreChannel::Stable), CoreCall::Reload]
+    );
+    assert!(backend.shutdown().await.is_ok());
   }
 }

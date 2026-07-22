@@ -215,6 +215,7 @@ enum LifecycleCommand {
   Start(CoreChannel),
   Stop,
   Restart(CoreChannel),
+  RestartCurrent,
   Reload,
   Shutdown,
 }
@@ -254,6 +255,10 @@ impl CoreHandle {
 
   pub async fn restart(&self, channel: CoreChannel) -> Result<CoreState, LifecycleError> {
     self.request(LifecycleCommand::Restart(channel)).await
+  }
+
+  pub async fn restart_current(&self) -> Result<CoreState, LifecycleError> {
+    self.request(LifecycleCommand::RestartCurrent).await
   }
 
   pub async fn reload(&self) -> Result<CoreState, LifecycleError> {
@@ -440,6 +445,13 @@ where
         self.stop(LifecycleOperation::Stop).await
       },
       LifecycleCommand::Restart(channel) => {
+        self.reset_supervision();
+        self.restart(channel).await
+      },
+      LifecycleCommand::RestartCurrent => {
+        let channel = self
+          .active_channel
+          .ok_or_else(|| Self::invalid_transition(LifecycleOperation::Restart, &self.state))?;
         self.reset_supervision();
         self.restart(channel).await
       },

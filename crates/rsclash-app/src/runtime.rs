@@ -1,61 +1,37 @@
-use std::{fmt, path::Path, sync::Arc};
+use std::path::Path;
 
 use async_trait::async_trait;
 use rsclash_config::{Error, Result, RuntimeActivator};
-use rsclash_mihomo::MihomoApi;
+use rsclash_core::CoreHandle;
 
-#[derive(Clone)]
-pub struct MihomoRuntimeActivator {
-  api: Arc<dyn MihomoApi>,
-  force_reload: bool,
+#[derive(Clone, Debug)]
+pub struct CoreRuntimeActivator {
+  core: CoreHandle,
 }
 
-impl MihomoRuntimeActivator {
-  #[must_use]
-  pub fn new(api: Arc<dyn MihomoApi>) -> Self {
-    Self {
-      api,
-      force_reload: true,
-    }
-  }
-
-  #[must_use]
-  pub const fn with_force_reload(mut self, force_reload: bool) -> Self {
-    self.force_reload = force_reload;
-    self
-  }
-}
-
-impl fmt::Debug for MihomoRuntimeActivator {
-  fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    formatter
-      .debug_struct("MihomoRuntimeActivator")
-      .field("force_reload", &self.force_reload)
-      .finish_non_exhaustive()
+impl CoreRuntimeActivator {
+  pub const fn new(core: CoreHandle) -> Self {
+    Self { core }
   }
 }
 
 #[async_trait]
-impl RuntimeActivator for MihomoRuntimeActivator {
-  async fn reload(&self, runtime_path: &Path) -> Result<()> {
-    let path = runtime_path.to_str().ok_or_else(|| {
-      Error::RuntimeActivation(format!(
-        "runtime path is not valid UTF-8: {}",
-        runtime_path.display()
-      ))
-    })?;
+impl RuntimeActivator for CoreRuntimeActivator {
+  async fn reload(&self, _runtime_path: &Path) -> Result<()> {
     self
-      .api
-      .reload_config(path, self.force_reload)
+      .core
+      .reload()
       .await
+      .map(|_| ())
       .map_err(|error| Error::RuntimeActivation(error.to_string()))
   }
 
   async fn restart(&self, _runtime_path: &Path) -> Result<()> {
     self
-      .api
-      .restart()
+      .core
+      .restart_current()
       .await
+      .map(|_| ())
       .map_err(|error| Error::RuntimeActivation(error.to_string()))
   }
 }
@@ -63,17 +39,80 @@ impl RuntimeActivator for MihomoRuntimeActivator {
 #[cfg(test)]
 #[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
-  use std::{path::Path, sync::Arc};
+  use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+  };
 
+  use async_trait::async_trait;
   use rsclash_config::RuntimeActivator as _;
-  use rsclash_mihomo::{Error, FakeMihomoApi, MihomoCall};
+  use rsclash_core::{ControllerError, CoreRuntime, LifecycleController, RunningCore};
+  use rsclash_domain::{CoreChannel, CoreRunMode};
 
-  use super::MihomoRuntimeActivator;
+  use super::CoreRuntimeActivator;
+
+  #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+  enum Call {
+    Start(CoreChannel),
+    Stop,
+    Reload,
+  }
+
+  struct FakeController {
+    calls: Arc<Mutex<Vec<Call>>>,
+  }
+
+  impl FakeController {
+    fn record(&self, call: Call) {
+      self
+        .calls
+        .lock()
+        .expect("call log lock should be available")
+        .push(call);
+    }
+
+    fn running() -> RunningCore {
+      RunningCore::new(CoreRunMode::Sidecar, Some("1.0.0".to_string()))
+    }
+  }
+
+  #[async_trait]
+  impl LifecycleController for FakeController {
+    async fn start(&mut self, channel: CoreChannel) -> Result<RunningCore, ControllerError> {
+      self.record(Call::Start(channel));
+      Ok(Self::running())
+    }
+
+    async fn stop(&mut self) -> Result<(), ControllerError> {
+      self.record(Call::Stop);
+      Ok(())
+    }
+
+    async fn reload(&mut self) -> Result<RunningCore, ControllerError> {
+      self.record(Call::Reload);
+      Ok(Self::running())
+    }
+
+    async fn health_check(&mut self) -> Result<RunningCore, ControllerError> {
+      Ok(Self::running())
+    }
+  }
 
   #[tokio::test]
-  async fn adapter_forwards_reload_and_restart_to_controller() {
-    let fake = FakeMihomoApi::default();
-    let activator = MihomoRuntimeActivator::new(Arc::new(fake.clone()));
+  async fn activation_routes_reload_and_restart_through_the_lifecycle_actor() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let runtime = CoreRuntime::spawn(
+      &tokio::runtime::Handle::current(),
+      FakeController {
+        calls: Arc::clone(&calls),
+      },
+    );
+    let core = runtime.handle();
+    core
+      .start(CoreChannel::Alpha)
+      .await
+      .expect("core should start");
+    let activator = CoreRuntimeActivator::new(core);
 
     activator
       .reload(Path::new("/tmp/runtime.yaml"))
@@ -85,37 +124,14 @@ mod tests {
       .expect("restart should succeed");
 
     assert_eq!(
-      fake.calls().expect("calls should be available"),
+      *calls.lock().expect("call log lock should be available"),
       vec![
-        MihomoCall::ReloadConfig {
-          path: "/tmp/runtime.yaml".to_string(),
-          force: true,
-        },
-        MihomoCall::Restart,
+        Call::Start(CoreChannel::Alpha),
+        Call::Reload,
+        Call::Stop,
+        Call::Start(CoreChannel::Alpha),
       ]
     );
-  }
-
-  #[tokio::test]
-  async fn adapter_maps_controller_failures_without_retrying() {
-    let fake = FakeMihomoApi::default();
-    fake
-      .fail_next(Error::Fake("injected".to_string()))
-      .expect("failure should be configured");
-    let activator = MihomoRuntimeActivator::new(Arc::new(fake.clone()));
-
-    let error = activator
-      .reload(Path::new("/tmp/runtime.yaml"))
-      .await
-      .expect_err("reload should fail");
-
-    assert!(error.to_string().contains("injected"));
-    assert_eq!(
-      fake.calls().expect("calls should be available"),
-      vec![MihomoCall::ReloadConfig {
-        path: "/tmp/runtime.yaml".to_string(),
-        force: true,
-      }]
-    );
+    assert!(runtime.shutdown().await.is_ok());
   }
 }
