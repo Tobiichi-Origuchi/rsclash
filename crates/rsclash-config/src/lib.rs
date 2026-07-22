@@ -1,5 +1,6 @@
 //! Profile persistence and deterministic Mihomo configuration generation.
 
+mod defaults;
 mod deployment;
 pub mod enhance;
 mod error;
@@ -8,6 +9,7 @@ mod model;
 mod store;
 mod transaction;
 
+pub use defaults::{DEFAULT_RUNTIME_CONFIG, initialize_default_runtime};
 pub use deployment::{
   ActivationMode, CommandRuntimeValidator, DeploymentOutcome, RuntimeActivator, RuntimeDeployer,
   RuntimeStore, RuntimeValidator,

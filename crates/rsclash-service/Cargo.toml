@@ -13,9 +13,14 @@ path = "src/bin/service.rs"
 name = "rsclash-service-install"
 path = "src/bin/install.rs"
 
+[[bin]]
+name = "rsclash-service-setup"
+path = "src/bin/setup.rs"
+
 [dependencies]
 async-trait.workspace = true
 rsclash-core.workspace = true
+rsclash-config.workspace = true
 rsclash-domain.workspace = true
 rustix.workspace = true
 serde.workspace = true

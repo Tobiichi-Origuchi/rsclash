@@ -1,6 +1,6 @@
 use std::{env, path::PathBuf, sync::Arc};
 
-use rsclash_config::{MihomoConfig, ProfileStore, RuntimeStore};
+use rsclash_config::initialize_default_runtime;
 use rsclash_core::{
   CoreBinaries, CoreRuntime, LinuxSidecarConfig, LinuxSidecarController, PreferredController,
 };
@@ -10,22 +10,6 @@ use rsclash_platform::{
 };
 use rsclash_service::{DEFAULT_SERVICE_SOCKET, LinuxServiceController, ServiceClient};
 use tokio::runtime::Handle;
-
-const DEFAULT_RUNTIME_CONFIG: &str = r"mixed-port: 7897
-allow-lan: false
-mode: rule
-log-level: info
-ipv6: false
-proxies: []
-proxy-groups:
-  - name: GLOBAL
-    type: select
-    proxies:
-      - DIRECT
-      - REJECT
-rules:
-  - MATCH,GLOBAL
-";
 
 pub(crate) fn create_core_runtime(runtime: &Handle) -> Result<LinuxBootstrap, String> {
   let home = home_directory()?;
@@ -76,14 +60,7 @@ fn create_core_runtime_for_layout(
   runtime: &Handle,
   layout: BootstrapLayout,
 ) -> Result<LinuxBootstrap, String> {
-  let store = ProfileStore::open(&layout.config_root)
-    .map_err(|error| format!("open the rsclash configuration directory: {error}"))?;
-  let runtime_store = RuntimeStore::open(&store.paths().runtime_config)
-    .map_err(|error| format!("open the Mihomo runtime configuration: {error}"))?;
-  let config = MihomoConfig::parse(DEFAULT_RUNTIME_CONFIG)
-    .map_err(|error| format!("parse the built-in runtime configuration: {error}"))?;
-  runtime_store
-    .initialize_if_missing(&config)
+  let store = initialize_default_runtime(&layout.config_root)
     .map_err(|error| format!("initialize the Mihomo runtime configuration: {error}"))?;
 
   let sidecar = LinuxSidecarController::new(LinuxSidecarConfig::new(
@@ -192,10 +169,11 @@ mod tests {
     );
     let runtime_path = config_root.join("runtime.yaml");
     let generated = fs::read_to_string(&runtime_path).expect("runtime config should be generated");
-    assert!(generated.contains("mixed-port: 7897"));
+    assert!(generated.contains("mixed-port: 17897"));
+    assert!(generated.contains("device: rsclash"));
     fs::write(
       &runtime_path,
-      generated.replace("mixed-port: 7897", "mixed-port: 0"),
+      generated.replace("mixed-port: 17897", "mixed-port: 0"),
     )
     .expect("integration port should be replaced");
 
