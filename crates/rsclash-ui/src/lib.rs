@@ -8,7 +8,7 @@ use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, Stroke, Ui};
 use rsclash_app::{AppClient, AppEventReceiver, ClientError};
 use rsclash_domain::{
   AppSnapshot, AppStatus, CoreChannel, CoreRunMode, CoreState, MihomoConnection, Page,
-  ProxyGroupSnapshot, ProxyMode, ThemeMode, UiCommand,
+  ProfileSourceKind, ProxyGroupSnapshot, ProxyMode, ThemeMode, UiCommand,
 };
 
 pub struct RsClashUi {
@@ -19,6 +19,10 @@ pub struct RsClashUi {
   applied_window_visibility: Option<bool>,
   local_error: Option<String>,
   close_to_tray: bool,
+  local_profile_name: String,
+  local_profile_path: String,
+  remote_profile_name: String,
+  remote_profile_url: String,
 }
 
 impl RsClashUi {
@@ -35,6 +39,10 @@ impl RsClashUi {
       applied_window_visibility: None,
       local_error: None,
       close_to_tray,
+      local_profile_name: String::new(),
+      local_profile_path: String::new(),
+      remote_profile_name: String::new(),
+      remote_profile_url: String::new(),
     }
   }
 
@@ -211,6 +219,7 @@ impl RsClashUi {
     match self.snapshot.page {
       Page::Home => self.home(ui),
       Page::Proxies => self.proxies(ui),
+      Page::Profiles => self.profiles(ui),
       Page::Settings => self.settings(ui),
       page => self.placeholder(ui, page),
     }
@@ -249,6 +258,18 @@ impl RsClashUi {
             proxy_mode_label(&mihomo.mode),
             mihomo.version.as_deref().unwrap_or("版本未知")
           ))
+          .weak(),
+        );
+        ui.label(
+          RichText::new(format!(
+            "配置：{}",
+            self
+              .snapshot
+              .profiles
+              .current()
+              .map_or("默认配置", |profile| profile.name.as_str())
+          ))
+          .small()
           .weak(),
         );
       });
@@ -361,6 +382,109 @@ impl RsClashUi {
         }
       });
     });
+  }
+
+  fn profiles(&mut self, ui: &mut Ui) {
+    let profiles = self.snapshot.profiles.clone();
+    ui.horizontal(|ui| {
+      ui.vertical(|ui| {
+        ui.label(RichText::new("订阅与配置").size(24.0).strong());
+        ui.label(RichText::new("导入本地 YAML 或远程订阅，并激活为当前运行配置").weak());
+      });
+      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if profiles.busy {
+          ui.spinner();
+        } else if ui.button("刷新").clicked() {
+          self.command(UiCommand::RefreshProfiles);
+        }
+      });
+    });
+    ui.add_space(16.0);
+
+    ui.columns(2, |columns| {
+      card(&mut columns[0], "导入本地配置", |ui| {
+        ui.add(egui::TextEdit::singleline(&mut self.local_profile_name).hint_text("配置名称"));
+        ui.add(
+          egui::TextEdit::singleline(&mut self.local_profile_path)
+            .hint_text("/path/to/profile.yaml"),
+        );
+        if ui
+          .add_enabled(!profiles.busy, egui::Button::new("导入本地文件"))
+          .clicked()
+        {
+          self.command(UiCommand::ImportLocalProfile {
+            name: self.local_profile_name.trim().to_string(),
+            path: self.local_profile_path.trim().to_string(),
+          });
+        }
+      });
+      card(&mut columns[1], "添加远程订阅", |ui| {
+        ui.add(egui::TextEdit::singleline(&mut self.remote_profile_name).hint_text("订阅名称"));
+        ui.add(
+          egui::TextEdit::singleline(&mut self.remote_profile_url)
+            .password(true)
+            .hint_text("https://example.com/subscription"),
+        );
+        if ui
+          .add_enabled(!profiles.busy, egui::Button::new("下载并导入"))
+          .clicked()
+        {
+          self.command(UiCommand::ImportRemoteProfile {
+            name: self.remote_profile_name.trim().to_string(),
+            url: self.remote_profile_url.trim().to_string(),
+          });
+        }
+      });
+    });
+    ui.add_space(16.0);
+
+    if profiles.items.is_empty() {
+      empty_state(
+        ui,
+        "还没有配置",
+        "从本地文件或 HTTPS 订阅导入第一个 Mihomo 配置。",
+      );
+      return;
+    }
+
+    for profile in &profiles.items {
+      card(ui, &profile.name, |ui| {
+        ui.horizontal(|ui| {
+          let source = match profile.source {
+            ProfileSourceKind::Local => "本地",
+            ProfileSourceKind::Remote => "远程订阅",
+            ProfileSourceKind::Other => "扩展配置",
+          };
+          ui.label(RichText::new(source).small().weak());
+          if profile.active {
+            ui.label(
+              RichText::new("当前使用")
+                .small()
+                .strong()
+                .color(Color32::from_rgb(38, 162, 105)),
+            );
+          }
+          ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+              .add_enabled(
+                !profiles.busy && !profile.active,
+                egui::Button::new(if profile.active {
+                  "已激活"
+                } else {
+                  "激活"
+                }),
+              )
+              .clicked()
+            {
+              self.command(UiCommand::ActivateProfile {
+                uid: profile.uid.clone(),
+              });
+            }
+          });
+        });
+      });
+      ui.add_space(10.0);
+    }
   }
 
   fn mode_controls(&mut self, ui: &mut Ui, current: &ProxyMode) {

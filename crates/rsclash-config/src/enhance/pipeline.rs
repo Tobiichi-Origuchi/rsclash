@@ -28,6 +28,11 @@ const CONTROL_PLANE_FIELDS: &[&str] = &[
   "unified-delay",
 ];
 
+#[must_use]
+pub fn extract_control_plane(config: &MihomoConfig) -> Mapping {
+  snapshot_control_plane(config.mapping())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TargetPlatform {
   Linux,

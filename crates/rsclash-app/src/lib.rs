@@ -2,6 +2,7 @@
 
 mod change;
 mod mihomo;
+mod profiles;
 mod runtime;
 
 use std::{fmt, future::pending, sync::Arc, time::Duration};
@@ -26,9 +27,11 @@ pub use change::{
   SideEffectTransaction,
 };
 pub use mihomo::MihomoAccess;
+pub use profiles::ProfileAccess;
 pub use runtime::CoreRuntimeActivator;
 
 use mihomo::{MihomoBridgeCommand, MihomoBridgeEvent, run_mihomo_worker};
+use profiles::{ProfileBridgeCommand, ProfileBridgeEvent, run_profile_worker};
 
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 64;
@@ -197,17 +200,18 @@ pub struct BackendHandle {
   core_relay: Option<JoinHandle<()>>,
   core_worker: Option<JoinHandle<()>>,
   mihomo_worker: Option<JoinHandle<()>>,
+  profile_worker: Option<JoinHandle<()>>,
   core_runtime: Option<CoreRuntime>,
   system_recovery: Option<Arc<dyn SystemStateRecovery>>,
 }
 
 impl BackendHandle {
   pub fn spawn(runtime: &Handle, wake: WakeHandle) -> Self {
-    Self::spawn_inner(runtime, wake, None, None, None)
+    Self::spawn_inner(runtime, wake, None, None, None, None)
   }
 
   pub fn spawn_with_core(runtime: &Handle, wake: WakeHandle, core_runtime: CoreRuntime) -> Self {
-    Self::spawn_inner(runtime, wake, Some(core_runtime), None, None)
+    Self::spawn_inner(runtime, wake, Some(core_runtime), None, None, None)
   }
 
   pub fn spawn_with_core_and_mihomo(
@@ -216,7 +220,14 @@ impl BackendHandle {
     core_runtime: CoreRuntime,
     mihomo_access: MihomoAccess,
   ) -> Self {
-    Self::spawn_inner(runtime, wake, Some(core_runtime), None, Some(mihomo_access))
+    Self::spawn_inner(
+      runtime,
+      wake,
+      Some(core_runtime),
+      None,
+      Some(mihomo_access),
+      None,
+    )
   }
 
   pub fn spawn_with_core_and_recovery(
@@ -230,6 +241,7 @@ impl BackendHandle {
       wake,
       Some(core_runtime),
       Some(system_recovery),
+      None,
       None,
     )
   }
@@ -247,6 +259,25 @@ impl BackendHandle {
       Some(core_runtime),
       Some(system_recovery),
       Some(mihomo_access),
+      None,
+    )
+  }
+
+  pub fn spawn_with_core_integrations(
+    runtime: &Handle,
+    wake: WakeHandle,
+    core_runtime: CoreRuntime,
+    system_recovery: Arc<dyn SystemStateRecovery>,
+    mihomo_access: MihomoAccess,
+    profile_access: ProfileAccess,
+  ) -> Self {
+    Self::spawn_inner(
+      runtime,
+      wake,
+      Some(core_runtime),
+      Some(system_recovery),
+      Some(mihomo_access),
+      Some(profile_access),
     )
   }
 
@@ -256,8 +287,10 @@ impl BackendHandle {
     core_runtime: Option<CoreRuntime>,
     system_recovery: Option<Arc<dyn SystemStateRecovery>>,
     mihomo_access: Option<MihomoAccess>,
+    profile_access: Option<ProfileAccess>,
   ) -> Self {
     let core = core_runtime.as_ref().map(CoreRuntime::handle);
+    let profile_core = core.clone();
     let mut initial_snapshot = AppSnapshot::default();
     if let Some(core) = &core {
       initial_snapshot.core = core.current_state().as_ref().clone();
@@ -294,6 +327,18 @@ impl BackendHandle {
       },
       None => (None, None, None),
     };
+    let (profile_command_tx, profile_event_rx, profile_worker) =
+      match (profile_access, profile_core) {
+        (Some(access), Some(core)) => {
+          let (command_tx, command_rx) = mpsc::channel(CORE_EVENT_CAPACITY);
+          let (event_tx, event_rx) = mpsc::channel(CORE_EVENT_CAPACITY);
+          let activator: Arc<dyn rsclash_config::RuntimeActivator> =
+            Arc::new(CoreRuntimeActivator::new(core));
+          let worker = runtime.spawn(run_profile_worker(access, activator, command_rx, event_tx));
+          (Some(command_tx), Some(event_rx), Some(worker))
+        },
+        _ => (None, None, None),
+      };
 
     let coordinator = Coordinator {
       snapshot: (*initial_snapshot).clone(),
@@ -305,6 +350,8 @@ impl BackendHandle {
       core_event_rx,
       mihomo_command_tx,
       mihomo_event_rx,
+      profile_command_tx,
+      profile_event_rx,
     };
     let coordinator = runtime.spawn(coordinator.run());
 
@@ -319,6 +366,7 @@ impl BackendHandle {
       core_relay,
       core_worker,
       mihomo_worker,
+      profile_worker,
       core_runtime,
       system_recovery,
     }
@@ -358,6 +406,10 @@ impl BackendHandle {
     if let Some(mihomo_worker) = self.mihomo_worker.take() {
       mihomo_worker.abort();
       let _ = mihomo_worker.await;
+    }
+    if let Some(profile_worker) = self.profile_worker.take() {
+      profile_worker.abort();
+      let _ = profile_worker.await;
     }
 
     let recovery_result = if let Some(system_recovery) = self.system_recovery.take() {
@@ -399,6 +451,9 @@ impl Drop for BackendHandle {
     if let Some(mihomo_worker) = self.mihomo_worker.take() {
       mihomo_worker.abort();
     }
+    if let Some(profile_worker) = self.profile_worker.take() {
+      profile_worker.abort();
+    }
     let _ = self.system_recovery.take();
     let _ = self.core_runtime.take();
   }
@@ -427,6 +482,8 @@ struct Coordinator {
   core_event_rx: Option<mpsc::Receiver<CoreBridgeEvent>>,
   mihomo_command_tx: Option<mpsc::Sender<MihomoBridgeCommand>>,
   mihomo_event_rx: Option<mpsc::Receiver<MihomoBridgeEvent>>,
+  profile_command_tx: Option<mpsc::Sender<ProfileBridgeCommand>>,
+  profile_event_rx: Option<mpsc::Receiver<ProfileBridgeEvent>>,
 }
 
 impl Coordinator {
@@ -437,9 +494,15 @@ impl Coordinator {
     info!("application coordinator is ready");
 
     loop {
-      tokio::select! {
-        biased;
-        envelope = self.command_rx.recv() => {
+      match receive_coordinator_input(
+        &mut self.command_rx,
+        &mut self.core_event_rx,
+        &mut self.mihomo_event_rx,
+        &mut self.profile_event_rx,
+      )
+      .await
+      {
+        CoordinatorInput::Command(envelope) => {
           let Some(envelope) = envelope else {
             break;
           };
@@ -451,17 +514,17 @@ impl Coordinator {
             break;
           }
         },
-        core_event = receive_core_event(&mut self.core_event_rx), if self.core_event_rx.is_some() => {
-          match core_event {
-            Some(event) => self.handle_core_event(event),
-            None => self.core_event_rx = None,
-          }
+        CoordinatorInput::Core(core_event) => match core_event {
+          Some(event) => self.handle_core_event(event),
+          None => self.core_event_rx = None,
         },
-        mihomo_event = receive_mihomo_event(&mut self.mihomo_event_rx), if self.mihomo_event_rx.is_some() => {
-          match mihomo_event {
-            Some(event) => self.handle_mihomo_event(event),
-            None => self.mihomo_event_rx = None,
-          }
+        CoordinatorInput::Mihomo(mihomo_event) => match mihomo_event {
+          Some(event) => self.handle_mihomo_event(event),
+          None => self.mihomo_event_rx = None,
+        },
+        CoordinatorInput::Profile(profile_event) => match profile_event {
+          Some(event) => self.handle_profile_event(event),
+          None => self.profile_event_rx = None,
         },
       }
     }
@@ -485,6 +548,16 @@ impl Coordinator {
         self.dispatch_mihomo(MihomoBridgeCommand::SelectProxy { group, proxy })
       },
       UiCommand::SetProxyMode(mode) => self.dispatch_mihomo(MihomoBridgeCommand::SetMode(mode)),
+      UiCommand::RefreshProfiles => self.dispatch_profile(ProfileBridgeCommand::Refresh),
+      UiCommand::ImportLocalProfile { name, path } => {
+        self.dispatch_profile(ProfileBridgeCommand::ImportLocal { name, path })
+      },
+      UiCommand::ImportRemoteProfile { name, url } => {
+        self.dispatch_profile(ProfileBridgeCommand::ImportRemote { name, url })
+      },
+      UiCommand::ActivateProfile { uid } => {
+        self.dispatch_profile(ProfileBridgeCommand::Activate { uid })
+      },
       UiCommand::Navigate(page) => {
         self.snapshot.page = page;
         self.publish_snapshot();
@@ -573,6 +646,32 @@ impl Coordinator {
     }
   }
 
+  fn dispatch_profile(&self, command: ProfileBridgeCommand) -> (CommandResult, bool) {
+    let Some(command_tx) = &self.profile_command_tx else {
+      return (
+        Err(CommandError::InvalidState(
+          "the profile runtime is not configured".to_string(),
+        )),
+        false,
+      );
+    };
+    match command_tx.try_send(command) {
+      Ok(()) => (Ok(CommandOutput::Accepted), false),
+      Err(mpsc::error::TrySendError::Full(_)) => (
+        Err(CommandError::InvalidState(
+          "the profile command queue is full".to_string(),
+        )),
+        false,
+      ),
+      Err(mpsc::error::TrySendError::Closed(_)) => (
+        Err(CommandError::InvalidState(
+          "the profile bridge is closed".to_string(),
+        )),
+        false,
+      ),
+    }
+  }
+
   fn handle_core_event(&mut self, event: CoreBridgeEvent) {
     match event {
       CoreBridgeEvent::State(state) => {
@@ -625,6 +724,29 @@ impl Coordinator {
     }
   }
 
+  fn handle_profile_event(&mut self, event: ProfileBridgeEvent) {
+    match event {
+      ProfileBridgeEvent::Snapshot(snapshot) => {
+        let active_changed = self.snapshot.profiles.current().map(|profile| &profile.uid)
+          != snapshot.current().map(|profile| &profile.uid);
+        self.snapshot.profiles = snapshot;
+        self.publish_snapshot();
+        self.emit(AppEvent::ProfilesChanged);
+        if active_changed && let Some(command_tx) = &self.mihomo_command_tx {
+          let _ = command_tx.try_send(MihomoBridgeCommand::Refresh);
+        }
+      },
+      ProfileBridgeEvent::CommandFailed(message) => {
+        self.snapshot.last_error = Some(ErrorView {
+          title: "Profile operation failed".to_string(),
+          detail: message,
+          retryable: true,
+        });
+        self.publish_snapshot();
+      },
+    }
+  }
+
   fn set_window_visible(&mut self, visible: bool) {
     if self.snapshot.window_visible != visible {
       self.snapshot.window_visible = visible;
@@ -644,6 +766,28 @@ impl Coordinator {
   fn emit(&self, event: AppEvent) {
     let _ = self.event_tx.send(event);
     self.wake.wake();
+  }
+}
+
+enum CoordinatorInput {
+  Command(Option<CommandEnvelope>),
+  Core(Option<CoreBridgeEvent>),
+  Mihomo(Option<MihomoBridgeEvent>),
+  Profile(Option<ProfileBridgeEvent>),
+}
+
+async fn receive_coordinator_input(
+  command_rx: &mut mpsc::Receiver<CommandEnvelope>,
+  core_event_rx: &mut Option<mpsc::Receiver<CoreBridgeEvent>>,
+  mihomo_event_rx: &mut Option<mpsc::Receiver<MihomoBridgeEvent>>,
+  profile_event_rx: &mut Option<mpsc::Receiver<ProfileBridgeEvent>>,
+) -> CoordinatorInput {
+  tokio::select! {
+    biased;
+    envelope = command_rx.recv() => CoordinatorInput::Command(envelope),
+    event = receive_core_event(core_event_rx) => CoordinatorInput::Core(event),
+    event = receive_mihomo_event(mihomo_event_rx) => CoordinatorInput::Mihomo(event),
+    event = receive_profile_event(profile_event_rx) => CoordinatorInput::Profile(event),
   }
 }
 
@@ -699,6 +843,16 @@ async fn receive_mihomo_event(
     receiver.recv().await
   } else {
     pending::<Option<MihomoBridgeEvent>>().await
+  }
+}
+
+async fn receive_profile_event(
+  receiver: &mut Option<mpsc::Receiver<ProfileBridgeEvent>>,
+) -> Option<ProfileBridgeEvent> {
+  if let Some(receiver) = receiver {
+    receiver.recv().await
+  } else {
+    pending::<Option<ProfileBridgeEvent>>().await
   }
 }
 

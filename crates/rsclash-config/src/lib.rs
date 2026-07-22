@@ -18,7 +18,7 @@ pub use enhance::{
   ApplicationLayer, BoaScriptExecutor, EnhancementInput, EnhancementPipeline, ListenerPolicy,
   ManualLayer, ScriptExecutor, ScriptLayer, ScriptLimits, ScriptOutput, SequenceEdit,
   SequenceLayers, TargetPlatform, apply_deep_merge, apply_sequence_edit, cleanup_proxy_groups,
-  lowercase_mapping, sort_top_level,
+  extract_control_plane, lowercase_mapping, sort_top_level,
 };
 pub use error::{Error, Result};
 pub use import::{CvrImportOutcome, CvrImportReport, CvrImporter};

@@ -29,6 +29,7 @@ rsclash-core.workspace = true
 rsclash-mihomo.workspace = true
 rsclash-platform.workspace = true
 rsclash-service.workspace = true
+rustls.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros"] }

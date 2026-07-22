@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf, sync::Arc};
 
-use rsclash_app::MihomoAccess;
-use rsclash_config::initialize_default_runtime;
+use rsclash_app::{MihomoAccess, ProfileAccess};
+use rsclash_config::{CommandRuntimeValidator, RuntimeValidator, initialize_default_runtime};
 use rsclash_core::{
   CoreBinaries, CoreRuntime, LinuxSidecarConfig, LinuxSidecarController, PreferredController,
 };
@@ -36,6 +36,7 @@ pub(crate) fn create_core_runtime(runtime: &Handle) -> Result<LinuxBootstrap, St
       config_root,
       runtime_root,
       binaries,
+      use_service: true,
     },
   )
 }
@@ -44,11 +45,13 @@ struct BootstrapLayout {
   config_root: PathBuf,
   runtime_root: PathBuf,
   binaries: CoreBinaries,
+  use_service: bool,
 }
 
 pub(crate) struct LinuxBootstrap {
   pub core_runtime: CoreRuntime,
   pub mihomo_access: MihomoAccess,
+  pub profile_access: ProfileAccess,
   pub system_recovery: Arc<RecoveryManager>,
 }
 
@@ -65,8 +68,19 @@ fn create_core_runtime_for_layout(
   runtime: &Handle,
   layout: BootstrapLayout,
 ) -> Result<LinuxBootstrap, String> {
+  let _ = rustls::crypto::ring::default_provider().install_default();
   let store = initialize_default_runtime(&layout.config_root)
     .map_err(|error| format!("initialize the Mihomo runtime configuration: {error}"))?;
+  let validator_binary = if std::path::Path::new(rsclash_service::DEFAULT_INSTALLED_CORE).is_file()
+  {
+    PathBuf::from(rsclash_service::DEFAULT_INSTALLED_CORE)
+  } else {
+    layout
+      .binaries
+      .for_channel(rsclash_domain::CoreChannel::Stable)
+      .ok_or_else(|| "the stable Mihomo validator binary is missing".to_string())?
+      .to_path_buf()
+  };
 
   let sidecar_config = LinuxSidecarConfig::new(
     layout.binaries,
@@ -76,12 +90,21 @@ fn create_core_runtime_for_layout(
   );
   let sidecar_socket = sidecar_config.socket_path();
   let sidecar = LinuxSidecarController::new(sidecar_config);
-  let service = LinuxServiceController::new(ServiceClient::new(DEFAULT_SERVICE_SOCKET));
-  let controller = PreferredController::new(sidecar).with_service(service);
+  let controller = if layout.use_service {
+    let service = LinuxServiceController::new(ServiceClient::new(DEFAULT_SERVICE_SOCKET));
+    PreferredController::new(sidecar).with_service(service)
+  } else {
+    PreferredController::new(sidecar)
+  };
   let mihomo_access = MihomoAccess::new(
     local_mihomo_client(sidecar_socket)?,
     local_mihomo_client(DEFAULT_CONTROLLER_SOCKET)?,
   );
+  let validator: Arc<dyn RuntimeValidator> = Arc::new(CommandRuntimeValidator::new(
+    validator_binary,
+    &store.paths().root,
+  ));
+  let profile_access = ProfileAccess::new(store.clone(), validator)?;
   let system_recovery = Arc::new(RecoveryManager::new(
     store.paths().root.join("system-recovery.json"),
     Arc::new(UnavailableRecoveryBackend::new(
@@ -91,6 +114,7 @@ fn create_core_runtime_for_layout(
   Ok(LinuxBootstrap {
     core_runtime: CoreRuntime::spawn(runtime, controller),
     mihomo_access,
+    profile_access,
     system_recovery,
   })
 }
@@ -175,6 +199,7 @@ mod tests {
         config_root: config_root.clone(),
         runtime_root: directory.path().join("runtime"),
         binaries: CoreBinaries::new(binary),
+        use_service: false,
       },
     )
     .expect("empty layout should initialize");
@@ -195,11 +220,13 @@ mod tests {
     )
     .expect("integration port should be replaced");
 
-    let backend = BackendHandle::spawn_with_core_and_recovery(
+    let backend = BackendHandle::spawn_with_core_integrations(
       &tokio::runtime::Handle::current(),
       WakeHandle::default(),
       bootstrap.core_runtime,
       bootstrap.system_recovery,
+      bootstrap.mihomo_access,
+      bootstrap.profile_access,
     );
     let mut client = backend.client();
     client
@@ -219,6 +246,52 @@ mod tests {
     })
     .await
     .expect("Mihomo should become ready before the timeout");
+
+    let profile_path = directory.path().join("daily.yaml");
+    fs::write(
+      &profile_path,
+      "mode: global\nproxies: []\nproxy-groups:\n- name: GLOBAL\n  type: select\n  proxies:\n  - DIRECT\nrules:\n- DOMAIN,example.com,DIRECT\n- MATCH,GLOBAL\n",
+    )
+    .expect("the profile fixture should be written");
+    client
+      .request(UiCommand::ImportLocalProfile {
+        name: "Daily".to_string(),
+        path: profile_path.display().to_string(),
+      })
+      .await
+      .expect("profile import should be accepted");
+    let uid = tokio::time::timeout(Duration::from_secs(5), async {
+      loop {
+        if let Some(profile) = client.current_snapshot().profiles.items.first() {
+          return profile.uid.clone();
+        }
+        client
+          .changed()
+          .await
+          .expect("application snapshot channel should remain open");
+      }
+    })
+    .await
+    .expect("profile import should finish before the timeout");
+    client
+      .try_command(UiCommand::ActivateProfile { uid })
+      .expect("profile activation should be accepted");
+    tokio::time::timeout(Duration::from_secs(10), async {
+      loop {
+        if client.current_snapshot().profiles.current().is_some() {
+          return;
+        }
+        client
+          .changed()
+          .await
+          .expect("application snapshot channel should remain open");
+      }
+    })
+    .await
+    .expect("profile activation should finish before the timeout");
+    let activated = fs::read_to_string(&runtime_path).expect("runtime config should be readable");
+    assert!(activated.contains("mixed-port: 0"));
+    assert!(activated.contains("DOMAIN,example.com,DIRECT"));
     assert!(backend.shutdown().await.is_ok());
   }
 

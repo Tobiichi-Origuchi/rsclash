@@ -181,6 +181,36 @@ pub struct MihomoSnapshot {
   pub last_error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProfileSourceKind {
+  Local,
+  Remote,
+  Other,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProfileSummary {
+  pub uid: String,
+  pub name: String,
+  pub source: ProfileSourceKind,
+  pub location: Option<String>,
+  pub updated_at: Option<u64>,
+  pub active: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProfilesSnapshot {
+  pub items: Vec<ProfileSummary>,
+  pub busy: bool,
+}
+
+impl ProfilesSnapshot {
+  pub fn current(&self) -> Option<&ProfileSummary> {
+    self.items.iter().find(|profile| profile.active)
+  }
+}
+
 impl MihomoSnapshot {
   pub fn current_proxy(&self) -> Option<&str> {
     self
@@ -201,6 +231,7 @@ pub struct AppSnapshot {
   pub window_visible: bool,
   pub core: CoreState,
   pub mihomo: MihomoSnapshot,
+  pub profiles: ProfilesSnapshot,
   pub last_error: Option<ErrorView>,
 }
 
@@ -214,6 +245,7 @@ impl Default for AppSnapshot {
       window_visible: true,
       core: CoreState::Stopped,
       mihomo: MihomoSnapshot::default(),
+      profiles: ProfilesSnapshot::default(),
       last_error: None,
     }
   }
@@ -236,6 +268,10 @@ pub enum UiCommand {
   RefreshMihomo,
   SelectProxy { group: String, proxy: String },
   SetProxyMode(ProxyMode),
+  RefreshProfiles,
+  ImportLocalProfile { name: String, path: String },
+  ImportRemoteProfile { name: String, url: String },
+  ActivateProfile { uid: String },
   Navigate(Page),
   SetTheme(ThemeMode),
   SetWindowVisible(bool),
@@ -256,6 +292,7 @@ pub enum AppEvent {
   BackendReady,
   CoreStateChanged(CoreState),
   MihomoStateChanged,
+  ProfilesChanged,
   NavigationChanged(Page),
   ThemeChanged(ThemeMode),
   WindowVisibilityChanged(bool),

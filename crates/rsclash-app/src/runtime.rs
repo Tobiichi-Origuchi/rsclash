@@ -3,6 +3,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use rsclash_config::{Error, Result, RuntimeActivator};
 use rsclash_core::CoreHandle;
+use rsclash_domain::CoreState;
 
 #[derive(Clone, Debug)]
 pub struct CoreRuntimeActivator {
@@ -18,6 +19,9 @@ impl CoreRuntimeActivator {
 #[async_trait]
 impl RuntimeActivator for CoreRuntimeActivator {
   async fn reload(&self, _runtime_path: &Path) -> Result<()> {
+    if self.core.current_state().as_ref() == &CoreState::Stopped {
+      return Ok(());
+    }
     self
       .core
       .reload()
@@ -27,6 +31,9 @@ impl RuntimeActivator for CoreRuntimeActivator {
   }
 
   async fn restart(&self, _runtime_path: &Path) -> Result<()> {
+    if self.core.current_state().as_ref() == &CoreState::Stopped {
+      return Ok(());
+    }
     self
       .core
       .restart_current()

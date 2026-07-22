@@ -12,7 +12,10 @@ rsclash-core.workspace = true
 rsclash-domain.workspace = true
 rsclash-mihomo.workspace = true
 rsclash-platform.workspace = true
+reqwest = { workspace = true, features = ["rustls-no-provider"] }
+rustls.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
