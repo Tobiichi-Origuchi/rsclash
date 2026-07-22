@@ -1,0 +1,33 @@
+[package]
+name = "rsclash-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rsclash"
+path = "src/main.rs"
+
+[features]
+default = ["renderer-glow", "tray"]
+renderer-glow = ["eframe/glow"]
+renderer-wgpu = ["eframe/wgpu"]
+tray = ["dep:tray-icon", "dep:gtk"]
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+rsclash-app.workspace = true
+rsclash-domain.workspace = true
+rsclash-ui.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tray-icon = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18.2", optional = true }
+
+[lints]
+workspace = true
