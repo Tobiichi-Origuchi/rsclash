@@ -120,6 +120,7 @@ impl FakeMihomoApi {
   pub fn update(&self, update: impl FnOnce(&mut FakeMihomoState)) -> Result<()> {
     let mut inner = self.lock()?;
     update(&mut inner.state);
+    drop(inner);
     Ok(())
   }
 
@@ -191,6 +192,7 @@ impl MihomoApi for FakeMihomoApi {
   async fn close_all_connections(&self) -> Result<()> {
     let mut inner = self.record(MihomoCall::CloseAllConnections)?;
     inner.state.connections.connections = Some(Vec::new());
+    drop(inner);
     Ok(())
   }
 
@@ -199,6 +201,7 @@ impl MihomoApi for FakeMihomoApi {
     if let Some(connections) = &mut inner.state.connections.connections {
       connections.retain(|connection| connection.id != connection_id);
     }
+    drop(inner);
     Ok(())
   }
 
@@ -326,6 +329,7 @@ impl MihomoApi for FakeMihomoApi {
       candidate.now = Some(proxy.to_string());
       changed = true;
     }
+    drop(inner);
     if changed {
       Ok(())
     } else {
@@ -343,6 +347,7 @@ impl MihomoApi for FakeMihomoApi {
     if let Some(candidate) = inner.state.proxies.proxies.get_mut(group) {
       candidate.fixed = None;
     }
+    drop(inner);
     Ok(())
   }
 
@@ -469,11 +474,11 @@ fn missing_response(kind: &str, name: &str) -> Error {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use std::sync::Arc;
 
-  use futures_util::StreamExt;
+  use futures_util::StreamExt as _;
 
   use super::{FakeMihomoApi, MihomoCall};
   use crate::{

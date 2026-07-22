@@ -54,13 +54,72 @@ rsclash-mihomo = { path = "crates/rsclash-mihomo" }
 rsclash-ui = { path = "crates/rsclash-ui" }
 
 [workspace.lints.rust]
+future_incompatible = { level = "deny", priority = -1 }
+non_ascii_idents = "deny"
+rust_2018_idioms = { level = "deny", priority = -1 }
+rust_2024_compatibility = { level = "deny", priority = -1 }
 unsafe_code = "forbid"
+unreachable_pub = "deny"
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+warnings = { level = "deny", priority = -1 }
 
 [workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+allow_attributes_without_reason = "deny"
+async_yields_async = "deny"
+await_holding_lock = "deny"
+branches_sharing_code = "deny"
+clone_on_ref_ptr = "deny"
+cloned_instead_of_copied = "deny"
+cognitive_complexity = "deny"
+collection_is_never_read = "deny"
+copy_iterator = "deny"
 dbg_macro = "deny"
+equatable_if_let = "deny"
 expect_used = "deny"
+expl_impl_clone_on_copy = "deny"
+future_not_send = "deny"
+iter_on_empty_collections = "deny"
+iter_on_single_items = "deny"
+iter_with_drain = "deny"
+large_const_arrays = "deny"
+large_futures = "deny"
+large_stack_arrays = "deny"
+large_types_passed_by_value = "deny"
+missing_const_for_fn = "deny"
+mutex_atomic = "deny"
+mutex_integer = "deny"
+needless_collect = "deny"
+needless_continue = "deny"
+needless_pass_by_ref_mut = "deny"
+needless_raw_string_hashes = "deny"
+option_as_ref_cloned = "deny"
+or_fun_call = "deny"
+panic = "deny"
+pathbuf_init_then_push = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+rc_clone_in_vec_init = "deny"
+rc_mutex = "deny"
+redundant_clone = "deny"
+redundant_else = "deny"
+significant_drop_in_scrutinee = "deny"
+significant_drop_tightening = "deny"
+string_lit_as_bytes = "deny"
+suspicious_operation_groupings = "deny"
 todo = "deny"
+trait_duplication_in_bounds = "deny"
+tuple_array_conversions = "deny"
+unimplemented = "deny"
+unnecessary_self_imports = "deny"
+unnecessary_wraps = "deny"
+unused_async = "deny"
+unused_trait_names = "deny"
 unwrap_used = "deny"
+use_self = "deny"
+useless_let_if_seq = "deny"
+wildcard_imports = "deny"
 
 [profile.release]
 codegen-units = 1

@@ -401,7 +401,7 @@ fn rollback_import(
 fn make_backup_read_only(path: &Path) -> Result<()> {
   #[cfg(unix)]
   {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
 
     for entry in
       fs::read_dir(path).map_err(|source| Error::io("read import backup", path, source))?
@@ -430,7 +430,11 @@ fn make_backup_read_only(path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(
+  clippy::expect_used,
+  clippy::panic,
+  reason = "tests use explicit panics and expects for failure diagnostics"
+)]
 mod tests {
   use std::{fs, path::PathBuf};
 
@@ -566,7 +570,7 @@ mod tests {
     fn drop(&mut self) {
       #[cfg(unix)]
       {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt as _;
         let _ignored = fs::set_permissions(&self.path, fs::Permissions::from_mode(0o700));
         let backup_root = self.path.join("backups");
         if let Ok(entries) = fs::read_dir(&backup_root) {
@@ -581,7 +585,7 @@ mod tests {
 
   #[cfg(unix)]
   fn make_tree_writable(path: &std::path::Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     if path.is_dir() {

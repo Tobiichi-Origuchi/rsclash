@@ -61,11 +61,11 @@ impl RuntimeActivator for MihomoRuntimeActivator {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use std::{path::Path, sync::Arc};
 
-  use rsclash_config::RuntimeActivator;
+  use rsclash_config::RuntimeActivator as _;
   use rsclash_mihomo::{Error, FakeMihomoApi, MihomoCall};
 
   use super::MihomoRuntimeActivator;

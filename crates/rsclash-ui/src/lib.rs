@@ -47,7 +47,7 @@ impl RsClashUi {
     loop {
       match self.events.try_recv() {
         Ok(event) => self.last_event = Some(event),
-        Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+        Err(broadcast::error::TryRecvError::Lagged(_)) => {},
         Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
           break;
         },
@@ -200,7 +200,7 @@ impl RsClashUi {
     }
   }
 
-  fn home(&mut self, ui: &mut Ui) {
+  fn home(&self, ui: &mut Ui) {
     ui.label(
       RichText::new("一个不依赖 WebView 的 Mihomo 原生桌面壳")
         .size(22.0)
@@ -271,7 +271,7 @@ impl RsClashUi {
     });
   }
 
-  fn placeholder(&mut self, ui: &mut Ui, page: Page) {
+  fn placeholder(&self, ui: &mut Ui, page: Page) {
     ui.label(RichText::new(page.label()).size(22.0).strong());
     ui.label(RichText::new("页面协议和导航已经就位，业务功能将在后续阶段纵向接入。").weak());
     ui.add_space(18.0);

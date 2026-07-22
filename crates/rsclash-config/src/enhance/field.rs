@@ -131,7 +131,7 @@ fn retain_valid_providers(group: &mut Mapping, providers: &BTreeSet<String>) -> 
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use serde_yaml_ng::{Mapping, Value};
 
@@ -172,7 +172,7 @@ mod tests {
   #[test]
   fn removes_invalid_group_references_and_keeps_valid_providers() {
     let mut mapping = mapping(
-      r#"
+      r"
 proxies: [{name: node, type: ss}]
 proxy-providers: {remote: {type: http}}
 proxy-groups:
@@ -183,7 +183,7 @@ proxy-groups:
     type: select
     use: [remote, missing-provider]
     proxies: [dynamic-node]
-"#,
+",
     );
     cleanup_proxy_groups(&mut mapping);
 

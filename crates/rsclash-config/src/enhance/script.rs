@@ -317,11 +317,11 @@ fn thread_label(id: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use serde_yaml_ng::{Mapping, Value};
 
-  use super::{BoaScriptExecutor, ScriptExecutor, ScriptLayer, ScriptLimits};
+  use super::{BoaScriptExecutor, ScriptExecutor as _, ScriptLayer, ScriptLimits};
 
   fn mapping(source: &str) -> Mapping {
     serde_yaml_ng::from_str(source).expect("test YAML should parse")
@@ -371,13 +371,13 @@ function main(config, profileName) {
       .execute(
         &ScriptLayer {
           id: "noisy".to_string(),
-          source: r#"
+          source: r"
 function main(config) {
   for (let index = 0; index < 3; index += 1) console.log(index);
   config.changed = true;
   return config;
 }
-"#
+"
           .to_string(),
         },
         &mapping("original: true"),

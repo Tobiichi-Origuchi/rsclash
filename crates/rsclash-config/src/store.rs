@@ -1,7 +1,7 @@
 use std::{
   collections::BTreeMap,
   fs::{self, File, OpenOptions},
-  io::{Read, Write},
+  io::{Read as _, Write as _},
   path::{Component, Path, PathBuf},
   sync::atomic::{AtomicU64, Ordering},
 };
@@ -58,7 +58,7 @@ impl ProfileStore {
     Ok(Self { paths })
   }
 
-  pub fn paths(&self) -> &ConfigPaths {
+  pub const fn paths(&self) -> &ConfigPaths {
     &self.paths
   }
 
@@ -358,7 +358,7 @@ pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
   fs::create_dir_all(path).map_err(|source| Error::io("create directory", path, source))?;
   #[cfg(unix)]
   {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
       .map_err(|source| Error::io("restrict directory permissions", path, source))?;
   }
@@ -368,7 +368,7 @@ pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
 fn set_private_file_permissions(file: &File, path: &Path) -> Result<()> {
   #[cfg(unix)]
   {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt as _;
     file
       .set_permissions(fs::Permissions::from_mode(0o600))
       .map_err(|source| Error::io("restrict file permissions", path, source))?;
@@ -401,14 +401,14 @@ struct TemporaryFileGuard {
 }
 
 impl TemporaryFileGuard {
-  fn new(path: PathBuf) -> Self {
+  const fn new(path: PathBuf) -> Self {
     Self {
       path,
       persisted: false,
     }
   }
 
-  fn persist(&mut self) {
+  const fn persist(&mut self) {
     self.persisted = true;
   }
 }
@@ -422,7 +422,7 @@ impl Drop for TemporaryFileGuard {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use std::{
     collections::BTreeMap,

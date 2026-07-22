@@ -135,7 +135,7 @@ fn prepend_unique_names(proxies: &mut Sequence, names: &[String]) {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use serde_yaml_ng::{Mapping, Sequence, Value};
 
@@ -175,7 +175,7 @@ mod tests {
   #[test]
   fn proxy_edit_updates_every_deleted_reference_and_first_selector() {
     let mut config = mapping(
-      r#"
+      r"
 proxies:
   - {name: old, type: ss}
   - {name: keep, type: ss}
@@ -183,7 +183,7 @@ proxy-groups:
   - {name: automatic, type: url-test, proxies: [old, keep]}
   - {name: primary, type: select, proxies: [old, keep, added]}
   - {name: secondary, type: selector, proxies: [old, keep]}
-"#,
+",
     );
     apply_sequence_edit(
       &mut config,

@@ -1,4 +1,8 @@
 #![cfg(unix)]
+#![allow(
+  clippy::expect_used,
+  reason = "integration tests use expect for clear failures"
+)]
 
 use std::{
   fs,
@@ -37,7 +41,6 @@ impl RuntimeActivator for ReloadOnlyActivator {
 
 #[tokio::test]
 #[ignore = "requires a pinned Mihomo binary through RSCLASH_MIHOMO_BIN"]
-#[allow(clippy::expect_used)]
 async fn pinned_mihomo_validates_staging_before_runtime_commit() {
   let binary = std::env::var_os("RSCLASH_MIHOMO_BIN")
     .expect("RSCLASH_MIHOMO_BIN must point to the pinned Mihomo binary");
@@ -70,7 +73,6 @@ struct TestDirectory {
 }
 
 impl TestDirectory {
-  #[allow(clippy::expect_used)]
   fn new() -> Self {
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let path = std::env::temp_dir().join(format!(

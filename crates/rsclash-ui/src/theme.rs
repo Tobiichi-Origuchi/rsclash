@@ -3,12 +3,12 @@ use egui::{
 };
 use rsclash_domain::ThemeMode;
 
-pub fn install_styles(context: &egui::Context) {
+pub(crate) fn install_styles(context: &egui::Context) {
   context.set_style_of(Theme::Light, adwaita_style(false));
   context.set_style_of(Theme::Dark, adwaita_style(true));
 }
 
-pub fn apply_preference(context: &egui::Context, mode: ThemeMode) {
+pub(crate) fn apply_preference(context: &egui::Context, mode: ThemeMode) {
   let preference = match mode {
     ThemeMode::System => ThemePreference::System,
     ThemeMode::Light => ThemePreference::Light,

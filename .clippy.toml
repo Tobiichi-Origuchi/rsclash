@@ -1,0 +1,3 @@
+avoid-breaking-exported-api = true
+cognitive-complexity-threshold = 25
+msrv = "1.92"

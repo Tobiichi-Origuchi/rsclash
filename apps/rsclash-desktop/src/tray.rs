@@ -18,7 +18,7 @@ use std::{
   time::Duration,
 };
 
-pub struct TrayHandle {
+pub(crate) struct TrayHandle {
   #[cfg(not(target_os = "linux"))]
   _tray: TrayIcon,
   #[cfg(target_os = "linux")]
@@ -28,7 +28,7 @@ pub struct TrayHandle {
 }
 
 impl TrayHandle {
-  pub fn new(client: AppClient) -> Result<Self, Box<dyn Error + Send + Sync>> {
+  pub(crate) fn new(client: AppClient) -> Result<Self, Box<dyn Error + Send + Sync>> {
     #[cfg(target_os = "linux")]
     {
       Self::new_linux(client)
@@ -173,7 +173,8 @@ fn app_icon() -> Result<Icon, tray_icon::BadIcon> {
       } else {
         (0, 0, 0, 0)
       };
-      rgba.extend_from_slice(&[red, green, blue, alpha]);
+      let pixel: [u8; 4] = (red, green, blue, alpha).into();
+      rgba.extend_from_slice(&pixel);
     }
   }
 

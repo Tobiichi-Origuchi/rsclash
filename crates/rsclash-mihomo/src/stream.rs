@@ -1,11 +1,11 @@
 use std::{fmt, time::Duration};
 
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt as _, stream};
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::{
   WebSocketStream, client_async,
-  tungstenite::{Message, client::IntoClientRequest},
+  tungstenite::{Message, client::IntoClientRequest as _},
 };
 use tracing::warn;
 
@@ -202,7 +202,11 @@ fn websocket_host(host: &str) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::result_large_err)]
+#[allow(
+  clippy::expect_used,
+  clippy::result_large_err,
+  reason = "tests preserve production errors and use expect for clear failures"
+)]
 mod tests {
   use std::{
     path::PathBuf,
@@ -210,7 +214,7 @@ mod tests {
     time::Duration,
   };
 
-  use futures_util::{SinkExt, StreamExt};
+  use futures_util::{SinkExt as _, StreamExt as _};
   use tokio::net::TcpListener;
   use tokio_tungstenite::{
     accept_async, accept_hdr_async,
@@ -220,7 +224,9 @@ mod tests {
     },
   };
 
-  use crate::{ControllerConfig, ControllerEndpoint, ControllerSecret, MihomoApi, MihomoClient};
+  use crate::{
+    ControllerConfig, ControllerEndpoint, ControllerSecret, MihomoApi as _, MihomoClient,
+  };
 
   #[tokio::test]
   async fn tcp_stream_authenticates_and_reconnects_after_close() {

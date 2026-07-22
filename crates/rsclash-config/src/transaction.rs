@@ -46,11 +46,11 @@ where
     }
   }
 
-  pub fn state(&self) -> DraftState {
+  pub const fn state(&self) -> DraftState {
     self.state
   }
 
-  pub fn get(&self) -> &T {
+  pub const fn get(&self) -> &T {
     &self.working
   }
 
@@ -85,7 +85,7 @@ where
     Ok(self.working.clone())
   }
 
-  fn ensure_active(&self) -> Result<()> {
+  const fn ensure_active(&self) -> Result<()> {
     if matches!(self.state, DraftState::Editing | DraftState::Validated) {
       Ok(())
     } else {
@@ -114,11 +114,11 @@ impl ProfileTransaction {
     })
   }
 
-  pub fn state(&self) -> DraftState {
+  pub const fn state(&self) -> DraftState {
     self.catalog.state()
   }
 
-  pub fn catalog(&self) -> &ProfileCatalog {
+  pub const fn catalog(&self) -> &ProfileCatalog {
     self.catalog.get()
   }
 
@@ -349,7 +349,7 @@ fn restore_snapshots(snapshots: &BTreeMap<PathBuf, Option<Vec<u8>>>) -> Result<(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use std::{
     fs,
@@ -443,10 +443,10 @@ mod tests {
     let directory = TestDirectory::new();
     let store = ProfileStore::open(&directory.path).expect("store should open");
     let catalog: ProfileCatalog = from_yaml(
-      r#"
+      r"
 future_catalog: keep
 items: []
-"#,
+",
     )
     .expect("catalog should parse");
     store.save_catalog(&catalog).expect("catalog should save");

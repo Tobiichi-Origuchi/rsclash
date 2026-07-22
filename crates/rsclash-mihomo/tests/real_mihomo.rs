@@ -1,25 +1,30 @@
 #![cfg(unix)]
+#![allow(
+  clippy::expect_used,
+  clippy::panic,
+  reason = "integration tests use explicit panics and expects for failure diagnostics"
+)]
 
 use std::{
   ffi::OsString,
   fs,
-  os::unix::fs::PermissionsExt,
+  os::unix::fs::PermissionsExt as _,
   path::PathBuf,
   process::{Child, Command, Stdio},
   sync::atomic::{AtomicU64, Ordering},
   time::Duration,
 };
 
-use futures_util::StreamExt;
+use futures_util::StreamExt as _;
 use rsclash_mihomo::{
-  ControllerConfig, ControllerEndpoint, ControllerSecret, MihomoApi, MihomoClient, models::LogLevel,
+  ControllerConfig, ControllerEndpoint, ControllerSecret, MihomoApi as _, MihomoClient,
+  models::LogLevel,
 };
 
 const CONFIG: &str = include_str!("fixtures/minimal-config.yaml");
 
 #[tokio::test]
 #[ignore = "requires a pinned Mihomo binary through RSCLASH_MIHOMO_BIN"]
-#[allow(clippy::expect_used)]
 async fn pinned_mihomo_supports_rest_and_all_streams() {
   let binary = std::env::var_os("RSCLASH_MIHOMO_BIN")
     .expect("RSCLASH_MIHOMO_BIN must point to the pinned Mihomo binary");
@@ -85,7 +90,6 @@ async fn pinned_mihomo_supports_rest_and_all_streams() {
   assert_eq!(reloaded.version, version.version);
 }
 
-#[allow(clippy::expect_used)]
 async fn wait_until_ready(
   client: &MihomoClient,
   core: &mut TestCore,
@@ -106,7 +110,6 @@ async fn wait_until_ready(
   panic!("Mihomo did not become ready before the integration timeout");
 }
 
-#[allow(clippy::expect_used)]
 async fn next_item<T>(stream: &mut rsclash_mihomo::MihomoStream<T>) -> T {
   tokio::time::timeout(Duration::from_secs(5), stream.next())
     .await
@@ -124,7 +127,6 @@ struct TestCore {
 }
 
 impl TestCore {
-  #[allow(clippy::expect_used)]
   fn start(binary: OsString) -> Self {
     let directory = unique_test_directory();
     fs::create_dir_all(&directory).expect("test directory should be created");
@@ -177,7 +179,6 @@ fn unique_test_directory() -> PathBuf {
   ))
 }
 
-#[allow(clippy::expect_used)]
 fn reserve_tcp_port() -> u16 {
   let listener =
     std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback test port should be available");
@@ -187,9 +188,8 @@ fn reserve_tcp_port() -> u16 {
     .port()
 }
 
-#[allow(clippy::expect_used)]
 async fn generate_proxy_log(port: u16) {
-  use tokio::io::AsyncWriteExt;
+  use tokio::io::AsyncWriteExt as _;
 
   let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
     .await

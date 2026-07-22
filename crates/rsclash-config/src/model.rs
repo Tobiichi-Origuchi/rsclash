@@ -29,7 +29,7 @@ where
 pub struct MihomoConfig(Mapping);
 
 impl MihomoConfig {
-  pub fn new(mapping: Mapping) -> Self {
+  pub const fn new(mapping: Mapping) -> Self {
     Self(mapping)
   }
 
@@ -37,11 +37,11 @@ impl MihomoConfig {
     from_yaml(source)
   }
 
-  pub fn mapping(&self) -> &Mapping {
+  pub const fn mapping(&self) -> &Mapping {
     &self.0
   }
 
-  pub fn mapping_mut(&mut self) -> &mut Mapping {
+  pub const fn mapping_mut(&mut self) -> &mut Mapping {
     &mut self.0
   }
 
@@ -250,7 +250,7 @@ impl ProfileItem {
       .ok_or_else(|| Error::InvalidConfiguration("profile file is missing".to_string()))
   }
 
-  pub fn is_source(&self) -> bool {
+  pub const fn is_source(&self) -> bool {
     matches!(self.kind, Some(ProfileKind::Remote | ProfileKind::Local))
   }
 }
@@ -402,7 +402,7 @@ pub struct ScriptLog {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use serde_yaml_ng::Value;
 
@@ -412,12 +412,12 @@ mod tests {
 
   #[test]
   fn verge_round_trip_preserves_unknown_fields() {
-    let source = r#"
+    let source = r"
 theme_mode: system
 enable_tun_mode: true
 future_setting:
   nested: 42
-"#;
+";
     let mut config: VergeConfig = from_yaml(source).expect("verge config should parse");
     config.theme_mode = Some("dark".to_string());
     let encoded = to_yaml(&config).expect("verge config should serialize");
@@ -436,7 +436,7 @@ future_setting:
 
   #[test]
   fn profiles_preserve_unknown_types_and_nested_options() {
-    let source = r#"
+    let source = r"
 current: future
 future_catalog_key: keep
 items:
@@ -447,7 +447,7 @@ items:
       timeout_seconds: 15
       future_option: keep
     future_item: keep
-"#;
+";
     let catalog: ProfileCatalog = from_yaml(source).expect("profiles should parse");
     let current = catalog
       .current_item()
@@ -475,12 +475,12 @@ items:
 
   #[test]
   fn mihomo_mapping_round_trip_keeps_arbitrary_schema() {
-    let source = r#"
+    let source = r"
 mixed-port: 7890
 future:
   - one
   - two
-"#;
+";
     let mut config = MihomoConfig::parse(source).expect("Mihomo config should parse");
     config.insert("mode", Value::String("rule".to_string()));
     let round_trip =

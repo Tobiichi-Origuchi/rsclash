@@ -299,7 +299,7 @@ impl CoreUpdaterChannel {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use serde_json::json;
 

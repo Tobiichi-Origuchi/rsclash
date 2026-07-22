@@ -158,7 +158,7 @@ impl BackendHandle {
   pub fn spawn(runtime: &Handle, wake: WakeHandle) -> Self {
     let initial_snapshot = Arc::new(AppSnapshot::default());
     let (command_tx, command_rx) = mpsc::channel(COMMAND_CAPACITY);
-    let (snapshot_tx, snapshot_rx) = watch::channel(initial_snapshot.clone());
+    let (snapshot_tx, snapshot_rx) = watch::channel(Arc::clone(&initial_snapshot));
     let (event_tx, _) = broadcast::channel(EVENT_CAPACITY);
 
     let coordinator = Coordinator {
@@ -318,7 +318,7 @@ mod tests {
 
   async fn wait_for_snapshot(
     client: &mut super::AppClient,
-    predicate: impl Fn(&rsclash_domain::AppSnapshot) -> bool,
+    predicate: impl Fn(&rsclash_domain::AppSnapshot) -> bool + Send + Sync,
   ) {
     let result = timeout(Duration::from_secs(1), async {
       loop {

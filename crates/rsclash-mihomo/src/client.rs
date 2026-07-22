@@ -82,11 +82,11 @@ impl MihomoClient {
     })
   }
 
-  pub fn endpoint(&self) -> &ControllerEndpoint {
+  pub const fn endpoint(&self) -> &ControllerEndpoint {
     &self.config.endpoint
   }
 
-  pub(crate) fn controller_config(&self) -> &ControllerConfig {
+  pub(crate) const fn controller_config(&self) -> &ControllerConfig {
     &self.config
   }
 
@@ -492,7 +492,7 @@ impl RequestSpec {
     Ok(self)
   }
 
-  fn with_timeout(mut self, timeout: Duration) -> Self {
+  const fn with_timeout(mut self, timeout: Duration) -> Self {
     self.timeout = Some(timeout);
     self
   }
@@ -559,7 +559,7 @@ fn is_delay_timeout_error(error: &Error) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use std::time::Duration;
   #[cfg(unix)]
@@ -569,12 +569,12 @@ mod tests {
   };
 
   use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::TcpListener,
   };
 
   use super::MihomoClient;
-  use crate::{ControllerConfig, ControllerSecret, MihomoApi, models::VersionInfo};
+  use crate::{ControllerConfig, ControllerSecret, MihomoApi as _, models::VersionInfo};
 
   #[tokio::test]
   async fn http_transport_sends_bearer_token_and_decodes_version() {

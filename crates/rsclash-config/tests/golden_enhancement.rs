@@ -1,3 +1,8 @@
+#![allow(
+  clippy::expect_used,
+  reason = "fixture tests use expect for clear failures"
+)]
+
 use rsclash_config::{
   ApplicationLayer, BoaScriptExecutor, EnhancementInput, EnhancementPipeline, ListenerPolicy,
   ManualLayer, MihomoConfig, ScriptLayer, SequenceEdit, SequenceLayers, TargetPlatform,
@@ -8,7 +13,6 @@ const FIXTURE_ROOT: &str = "tests/fixtures/golden/cvr-6219452";
 const CVR_REFERENCE_COMMIT: &str = "62194521681d1c70b674e8a0414eeac50bc034b0";
 
 #[test]
-#[allow(clippy::expect_used)]
 fn runtime_is_semantically_equivalent_to_cvr_golden() {
   assert_eq!(CVR_REFERENCE_COMMIT.len(), 40);
   let input = EnhancementInput {
@@ -72,12 +76,10 @@ fn runtime_is_semantically_equivalent_to_cvr_golden() {
   assert_eq!(runtime.script_logs["profile-script"][0].level, "warn");
 }
 
-#[allow(clippy::expect_used)]
 fn mapping(source: &str) -> Mapping {
   serde_yaml_ng::from_str(source).expect("fixture mapping should parse")
 }
 
-#[allow(clippy::expect_used)]
 fn sequence(source: &str) -> SequenceEdit {
   serde_yaml_ng::from_str(source).expect("fixture sequence should parse")
 }

@@ -463,7 +463,7 @@ fn is_ipv4_shorthand_loopback(address: &str) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use serde_yaml_ng::{Mapping, Value};
 
@@ -534,12 +534,12 @@ proxy-groups: [{name: select, type: select, proxies: [node, missing]}]
       },
       application: ApplicationLayer {
         defaults: mapping(
-          r#"
+          r"
 mode: rule
 mixed-port: 7890
 allow-lan: true
 external-controller: 127.0.0.1:9090
-"#,
+",
         ),
         listeners: ListenerPolicy {
           external_controller: true,

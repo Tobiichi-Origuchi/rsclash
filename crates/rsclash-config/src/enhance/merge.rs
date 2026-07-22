@@ -24,7 +24,7 @@ fn deep_merge(target: &mut Value, patch: Value) {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use serde_yaml_ng::{Mapping, Value};
 
@@ -37,21 +37,21 @@ mod tests {
   #[test]
   fn merge_recurses_into_mappings_and_replaces_other_values() {
     let mut config = mapping(
-      r#"
+      r"
 mixed-port: 7890
 dns:
   enable: true
   nameserver: [system]
 rules: [original]
-"#,
+",
     );
     let patch = mapping(
-      r#"
+      r"
 MIXED-PORT: 7891
 DNS:
   ipv6: true
 rules: [replacement]
-"#,
+",
     );
 
     apply_deep_merge(&mut config, &patch);

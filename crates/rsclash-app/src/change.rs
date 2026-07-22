@@ -4,14 +4,14 @@ use thiserror::Error;
 #[async_trait]
 pub trait ChangeAction: Send {
   fn name(&self) -> &str;
-  async fn prepare(self: Box<Self>) -> std::result::Result<Box<dyn PreparedChange>, String>;
+  async fn prepare(self: Box<Self>) -> Result<Box<dyn PreparedChange>, String>;
 }
 
 #[async_trait]
 pub trait PreparedChange: Send {
   fn name(&self) -> &str;
-  async fn commit(&mut self) -> std::result::Result<(), String>;
-  async fn compensate(&mut self) -> std::result::Result<(), String>;
+  async fn commit(&mut self) -> Result<(), String>;
+  async fn compensate(&mut self) -> Result<(), String>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,7 +116,11 @@ async fn compensate(
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(
+  clippy::expect_used,
+  clippy::panic,
+  reason = "tests use explicit panics and expects for failure diagnostics"
+)]
 mod tests {
   use std::sync::{Arc, Mutex};
 
@@ -158,7 +162,7 @@ mod tests {
       self.name
     }
 
-    async fn prepare(self: Box<Self>) -> std::result::Result<Box<dyn PreparedChange>, String> {
+    async fn prepare(self: Box<Self>) -> Result<Box<dyn PreparedChange>, String> {
       self.record("prepare");
       if self.fail_prepare {
         Err("injected prepare failure".to_string())
@@ -174,7 +178,7 @@ mod tests {
       self.name
     }
 
-    async fn commit(&mut self) -> std::result::Result<(), String> {
+    async fn commit(&mut self) -> Result<(), String> {
       self.record("commit");
       if self.fail_commit {
         Err("injected commit failure".to_string())
@@ -183,7 +187,7 @@ mod tests {
       }
     }
 
-    async fn compensate(&mut self) -> std::result::Result<(), String> {
+    async fn compensate(&mut self) -> Result<(), String> {
       self.record("compensate");
       if self.fail_compensate {
         Err("injected compensation failure".to_string())

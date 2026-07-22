@@ -1,3 +1,8 @@
+#![allow(
+  clippy::expect_used,
+  reason = "fixture tests use expect for clear failures"
+)]
+
 use rsclash_mihomo::models::{Connections, LogEntry, Memory, Proxies, Traffic, VersionInfo};
 
 #[test]
@@ -17,7 +22,6 @@ fn controller_fixtures_remain_compatible() {
   assert_eq!(log.level, "info");
 }
 
-#[allow(clippy::expect_used)]
 fn decode<T>(fixture: &str) -> T
 where
   T: serde::de::DeserializeOwned,

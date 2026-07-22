@@ -3,7 +3,7 @@ use std::{path::Path, sync::Arc};
 use egui::{FontData, FontDefinitions, FontFamily};
 use tracing::{debug, info};
 
-pub fn install_system_cjk_font(context: &egui::Context) {
+pub(crate) fn install_system_cjk_font(context: &egui::Context) {
   let Some(path) = font_candidates().into_iter().find(|path| path.exists()) else {
     debug!("no system CJK fallback font was found");
     return;

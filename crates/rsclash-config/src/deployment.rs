@@ -200,7 +200,7 @@ impl PreparedRuntime {
     }
   }
 
-  fn had_previous(&self) -> bool {
+  const fn had_previous(&self) -> bool {
     self.previous.is_some()
   }
 }
@@ -249,9 +249,7 @@ impl<'a> RuntimeDeployer<'a> {
     let mut prepared = self.store.prepare(config, self.validator).await?;
     let journal = self.store.create_journal(&prepared)?;
     if let Err(commit_error) = prepared.commit_file() {
-      return self
-        .handle_commit_failure(&prepared, &journal, commit_error)
-        .await;
+      return self.handle_commit_failure(&prepared, &journal, commit_error);
     }
 
     match self.activator.reload(self.store.path()).await {
@@ -304,7 +302,7 @@ impl<'a> RuntimeDeployer<'a> {
     }
   }
 
-  async fn handle_commit_failure(
+  fn handle_commit_failure(
     &self,
     prepared: &PreparedRuntime,
     journal: &RollbackJournal,
@@ -358,7 +356,7 @@ impl<'a> RuntimeDeployer<'a> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
   use std::{
     fs,

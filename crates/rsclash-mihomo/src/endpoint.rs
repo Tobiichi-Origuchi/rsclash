@@ -29,7 +29,7 @@ impl ControllerEndpoint {
     }
   }
 
-  pub fn is_local(&self) -> bool {
+  pub const fn is_local(&self) -> bool {
     matches!(self, Self::UnixSocket(_) | Self::NamedPipe(_))
   }
 
@@ -53,7 +53,7 @@ impl ControllerSecret {
     &self.0
   }
 
-  pub fn is_empty(&self) -> bool {
+  pub const fn is_empty(&self) -> bool {
     self.0.is_empty()
   }
 }
@@ -102,12 +102,12 @@ impl ControllerConfig {
     self
   }
 
-  pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+  pub const fn with_request_timeout(mut self, timeout: Duration) -> Self {
     self.request_timeout = timeout;
     self
   }
 
-  pub fn with_max_safe_retries(mut self, retries: u8) -> Self {
+  pub const fn with_max_safe_retries(mut self, retries: u8) -> Self {
     self.max_safe_retries = retries;
     self
   }
