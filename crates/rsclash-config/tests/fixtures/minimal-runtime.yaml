@@ -1,0 +1,14 @@
+mixed-port: 0
+allow-lan: false
+mode: rule
+log-level: debug
+ipv6: false
+proxies: []
+proxy-groups:
+  - name: GLOBAL
+    type: select
+    proxies:
+      - DIRECT
+      - REJECT
+rules:
+  - MATCH,GLOBAL

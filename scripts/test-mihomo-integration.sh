@@ -36,3 +36,5 @@ fi
 
 RSCLASH_MIHOMO_BIN="${BINARY}" \
   cargo test -p rsclash-mihomo --test real_mihomo -- --ignored --nocapture
+RSCLASH_MIHOMO_BIN="${BINARY}" \
+  cargo test -p rsclash-config --test real_mihomo -- --ignored --nocapture
