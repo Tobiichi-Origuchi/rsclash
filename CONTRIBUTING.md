@@ -18,7 +18,8 @@ sudo apt-get install \
   libgtk-3-dev \
   libwayland-dev \
   libxkbcommon-dev \
-  pkg-config
+  pkg-config \
+  shellcheck
 ```
 
 Install the pinned repository tools with:
@@ -28,6 +29,8 @@ cargo install --locked taplo-cli --version 0.10.0
 cargo install --locked cargo-deny --version 0.20.2
 ```
 
+Install actionlint 1.7.10 from its official release and place the `actionlint` binary on `PATH`.
+
 ## Required checks
 
 Run the complete local gate before committing:
@@ -36,10 +39,10 @@ Run the complete local gate before committing:
 ./scripts/check.sh
 ```
 
-The script checks Rust and TOML formatting, TOML validity, compilation of every target and feature,
-strict Clippy lints, unit and documentation tests, rustdoc warnings, dependency advisories,
-licenses, duplicate versions, and dependency sources. `cargo-deny` refreshes its advisory database,
-so the complete check may require network access.
+The script checks Rust and TOML formatting, TOML validity, shell scripts, GitHub Actions workflows,
+compilation of every target and feature, strict Clippy lints, unit and documentation tests, rustdoc
+warnings, dependency advisories, licenses, duplicate versions, and dependency sources.
+`cargo-deny` refreshes its advisory database, so the complete check may require network access.
 
 Use the real Mihomo integration suite after changing the client or runtime deployment code:
 

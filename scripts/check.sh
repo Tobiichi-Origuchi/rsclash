@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "${ROOT_DIR}"
 
-required_commands=(cargo taplo)
+required_commands=(actionlint cargo shellcheck taplo)
 for command_name in "${required_commands[@]}"; do
   if ! command -v "${command_name}" >/dev/null 2>&1; then
     echo "Required command not found: ${command_name}" >&2
@@ -20,6 +20,8 @@ fi
 cargo fmt --all -- --check
 taplo format --check
 taplo lint
+shellcheck scripts/*.sh
+actionlint
 cargo check --locked --workspace --all-targets --all-features
 cargo clippy --locked --workspace --all-targets --all-features
 cargo test --locked --workspace --all-targets --all-features
