@@ -17,6 +17,7 @@ publish = false
 
 [workspace.dependencies]
 async-trait = "0.1.89"
+boa_engine = "0.21.1"
 eframe = { version = "0.35.0", default-features = false, features = [
     "accesskit",
     "default_fonts",
