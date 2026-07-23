@@ -55,13 +55,16 @@ jobs:
 
       - name: Install actionlint 1.7.10
         run: |
+          install_directory="${RUNNER_TEMP}/actionlint-bin"
+          mkdir --parents "${install_directory}"
           curl --fail --location --silent --show-error \
             https://github.com/rhysd/actionlint/releases/download/v1.7.10/actionlint_1.7.10_linux_amd64.tar.gz \
             --output /tmp/actionlint.tar.gz
           echo "f4c76b71db5755a713e6055cbb0857ed07e103e028bda117817660ebadb4386f  /tmp/actionlint.tar.gz" \
             | sha256sum --check --status
           tar --extract --gzip --file /tmp/actionlint.tar.gz \
-            --directory "${CARGO_HOME}/bin" actionlint
+            --directory "${install_directory}" actionlint
+          echo "${install_directory}" >> "${GITHUB_PATH}"
 
       - name: Run complete quality gate
         run: ./scripts/check.sh
