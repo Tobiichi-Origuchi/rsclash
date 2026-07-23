@@ -328,6 +328,7 @@ fn render_variant_string_list(values: &[String]) -> String {
 mod tests {
   use std::{
     collections::BTreeMap,
+    env,
     sync::{Arc, Mutex},
   };
 
@@ -335,7 +336,7 @@ mod tests {
     HTTP_SCHEMA, HTTPS_SCHEMA, LinuxSystemProxyBackend, ROOT_SCHEMA, SOCKS_SCHEMA, SettingsRunner,
     parse_endpoint, parse_variant_string_list, render_variant_string_list,
   };
-  use crate::{Result, SystemProxyBackend as _, SystemProxySnapshot};
+  use crate::{Result, SystemProxyBackend as _, SystemProxyService, SystemProxySnapshot};
 
   #[derive(Default)]
   struct FakeSettings {
@@ -471,6 +472,59 @@ mod tests {
       .expect("original settings should restore");
     assert_eq!(
       backend.current().await.expect("settings should read"),
+      original
+    );
+  }
+
+  #[tokio::test]
+  #[ignore = "modifies the desktop proxy; requires RSCLASH_SYSTEM_PROXY_SMOKE_RECOVERY"]
+  async fn real_gsettings_round_trip_restores_the_original_state() {
+    let recovery_path = env::var_os("RSCLASH_SYSTEM_PROXY_SMOKE_RECOVERY")
+      .expect("the explicit recovery journal path should be provided");
+    let backend = Arc::new(LinuxSystemProxyBackend::new());
+    let original = backend
+      .current()
+      .await
+      .expect("the original desktop proxy should be readable");
+    let service = SystemProxyService::new(
+      recovery_path,
+      Arc::<LinuxSystemProxyBackend>::clone(&backend),
+    );
+
+    let enable_result = service
+      .enable(
+        "127.0.0.1",
+        17_897,
+        vec![
+          "localhost".to_string(),
+          "127.0.0.0/8".to_string(),
+          "::1".to_string(),
+        ],
+      )
+      .await;
+    let status_result = service.status().await;
+    let mut restore_result = service.disable().await;
+    let mut final_result = backend.current().await;
+    if restore_result.is_err()
+      || !final_result
+        .as_ref()
+        .is_ok_and(|current| current == &original)
+    {
+      backend
+        .apply(&original)
+        .await
+        .expect("the emergency proxy restore should succeed");
+      restore_result = service.disable().await;
+      final_result = backend.current().await;
+    }
+
+    enable_result.expect("the real system proxy should enable");
+    let status = status_result.expect("the enabled system proxy should be readable");
+    assert!(status.enabled_by_app);
+    assert!(status.applied);
+    restore_result.expect("the original system proxy should restore");
+    assert_eq!(
+      final_result.expect("the restored system proxy should be readable"),
       original
     );
   }

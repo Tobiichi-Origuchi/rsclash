@@ -196,7 +196,7 @@ impl SystemProxyService {
       https_proxy: Some(endpoint.clone()),
       socks_proxy: Some(endpoint),
       bypass,
-      auto_config_url: None,
+      auto_config_url: original.auto_config_url.clone(),
     };
     self
       .recovery
