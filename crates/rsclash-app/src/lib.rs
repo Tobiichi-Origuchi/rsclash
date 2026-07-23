@@ -33,7 +33,10 @@ pub use runtime::CoreRuntimeActivator;
 pub use system_proxy::SystemProxyAccess;
 
 use mihomo::{MihomoBridgeCommand, MihomoBridgeEvent, run_mihomo_worker};
-use profiles::{ProfileBridgeCommand, ProfileBridgeEvent, run_profile_worker};
+use profiles::{
+  ProfileBridgeCommand, ProfileBridgeEvent, ProfileImportCommand, ProfileMutationCommand,
+  ProfileUpdateCommand, run_profile_worker,
+};
 use system_proxy::{SystemProxyBridgeCommand, SystemProxyBridgeEvent, run_system_proxy_worker};
 
 const COMMAND_CAPACITY: usize = 64;
@@ -607,13 +610,39 @@ impl Coordinator {
       UiCommand::SetProxyMode(mode) => self.dispatch_mihomo(MihomoBridgeCommand::SetMode(mode)),
       UiCommand::RefreshProfiles => self.dispatch_profile(ProfileBridgeCommand::Refresh),
       UiCommand::ImportLocalProfile { name, path } => {
-        self.dispatch_profile(ProfileBridgeCommand::ImportLocal { name, path })
+        self.dispatch_profile(ProfileBridgeCommand::Import(ProfileImportCommand::Local {
+          name,
+          path,
+        }))
       },
       UiCommand::ImportRemoteProfile { name, url } => {
-        self.dispatch_profile(ProfileBridgeCommand::ImportRemote { name, url })
+        self.dispatch_profile(ProfileBridgeCommand::Import(ProfileImportCommand::Remote {
+          name,
+          url,
+        }))
       },
       UiCommand::ActivateProfile { uid } => {
         self.dispatch_profile(ProfileBridgeCommand::Activate { uid })
+      },
+      UiCommand::RenameProfile { uid, name } => self.dispatch_profile(
+        ProfileBridgeCommand::Mutate(ProfileMutationCommand::Rename { uid, name }),
+      ),
+      UiCommand::DuplicateProfile { uid } => self.dispatch_profile(ProfileBridgeCommand::Mutate(
+        ProfileMutationCommand::Duplicate { uid },
+      )),
+      UiCommand::DeleteProfiles { uids } => self.dispatch_profile(ProfileBridgeCommand::Mutate(
+        ProfileMutationCommand::Delete { uids },
+      )),
+      UiCommand::ReorderProfile { uid, new_index } => self.dispatch_profile(
+        ProfileBridgeCommand::Mutate(ProfileMutationCommand::Reorder { uid, new_index }),
+      ),
+      UiCommand::UpdateProfile { uid } => {
+        self.dispatch_profile(ProfileBridgeCommand::Update(ProfileUpdateCommand::One {
+          uid,
+        }))
+      },
+      UiCommand::UpdateAllProfiles => {
+        self.dispatch_profile(ProfileBridgeCommand::Update(ProfileUpdateCommand::All))
       },
       UiCommand::RefreshSystemProxy => {
         self.dispatch_system_proxy(SystemProxyBridgeCommand::Refresh)
@@ -858,6 +887,11 @@ impl Coordinator {
         self.publish_snapshot();
         self.emit(AppEvent::ProfilesChanged);
         if active_changed && let Some(command_tx) = &self.mihomo_command_tx {
+          let _ = command_tx.try_send(MihomoBridgeCommand::Refresh);
+        }
+      },
+      ProfileBridgeEvent::RuntimeChanged => {
+        if let Some(command_tx) = &self.mihomo_command_tx {
           let _ = command_tx.try_send(MihomoBridgeCommand::Refresh);
         }
       },

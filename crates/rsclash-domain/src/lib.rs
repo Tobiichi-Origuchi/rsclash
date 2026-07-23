@@ -198,6 +198,10 @@ pub struct SystemProxyView {
 pub enum ProfileSourceKind {
   Local,
   Remote,
+  Merge,
+  Rules,
+  Proxies,
+  Groups,
   Other,
 }
 
@@ -286,6 +290,12 @@ pub enum UiCommand {
   ImportLocalProfile { name: String, path: String },
   ImportRemoteProfile { name: String, url: String },
   ActivateProfile { uid: String },
+  RenameProfile { uid: String, name: String },
+  DuplicateProfile { uid: String },
+  DeleteProfiles { uids: Vec<String> },
+  ReorderProfile { uid: String, new_index: usize },
+  UpdateProfile { uid: String },
+  UpdateAllProfiles,
   RefreshSystemProxy,
   SetSystemProxy(bool),
   Navigate(Page),

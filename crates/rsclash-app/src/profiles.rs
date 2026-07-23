@@ -1,4 +1,5 @@
 use std::{
+  collections::BTreeSet,
   fs,
   path::{Path, PathBuf},
   sync::{
@@ -50,13 +51,35 @@ impl ProfileAccess {
 #[derive(Clone, Debug)]
 pub(crate) enum ProfileBridgeCommand {
   Refresh,
-  ImportLocal { name: String, path: String },
-  ImportRemote { name: String, url: String },
+  Import(ProfileImportCommand),
   Activate { uid: String },
+  Mutate(ProfileMutationCommand),
+  Update(ProfileUpdateCommand),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ProfileImportCommand {
+  Local { name: String, path: String },
+  Remote { name: String, url: String },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ProfileMutationCommand {
+  Rename { uid: String, name: String },
+  Duplicate { uid: String },
+  Delete { uids: Vec<String> },
+  Reorder { uid: String, new_index: usize },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ProfileUpdateCommand {
+  One { uid: String },
+  All,
 }
 
 pub(crate) enum ProfileBridgeEvent {
   Snapshot(ProfilesSnapshot),
+  RuntimeChanged,
   CommandFailed(String),
 }
 
@@ -86,18 +109,9 @@ impl ProfileWorker {
     while let Some(command) = command_rx.recv().await {
       match command {
         ProfileBridgeCommand::Refresh => self.refresh().await,
-        ProfileBridgeCommand::ImportLocal { name, path } => {
+        ProfileBridgeCommand::Import(command) => {
           self.set_busy(true).await;
-          let store = self.access.store.clone();
-          let result = spawn_blocking(move || import_local(&store, &name, Path::new(&path)))
-            .await
-            .map_err(|error| format!("local profile import task failed: {error}"))
-            .and_then(|result| result);
-          self.finish_operation(result).await;
-        },
-        ProfileBridgeCommand::ImportRemote { name, url } => {
-          self.set_busy(true).await;
-          let result = self.import_remote(name, url).await;
+          let result = self.import(command).await;
           self.finish_operation(result).await;
         },
         ProfileBridgeCommand::Activate { uid } => {
@@ -105,13 +119,60 @@ impl ProfileWorker {
           let result = self.activate(uid).await;
           self.finish_operation(result).await;
         },
+        ProfileBridgeCommand::Mutate(command) => {
+          self.set_busy(true).await;
+          let result = self.mutate(command).await;
+          self.finish_operation(result).await;
+        },
+        ProfileBridgeCommand::Update(command) => {
+          self.set_busy(true).await;
+          let result = match command {
+            ProfileUpdateCommand::One { uid } => self.update_remote(uid).await,
+            ProfileUpdateCommand::All => self.update_all_remote().await,
+          };
+          self.finish_operation(result).await;
+        },
       }
     }
   }
 
+  async fn import(&self, command: ProfileImportCommand) -> Result<(), String> {
+    match command {
+      ProfileImportCommand::Local { name, path } => {
+        let store = self.access.store.clone();
+        spawn_blocking(move || import_local(&store, &name, Path::new(&path)))
+          .await
+          .map_err(|error| format!("local profile import task failed: {error}"))?
+      },
+      ProfileImportCommand::Remote { name, url } => self.import_remote(name, url).await,
+    }
+  }
+
+  async fn mutate(&self, command: ProfileMutationCommand) -> Result<(), String> {
+    let store = self.access.store.clone();
+    spawn_blocking(move || match command {
+      ProfileMutationCommand::Rename { uid, name } => rename_profile(&store, &uid, &name),
+      ProfileMutationCommand::Duplicate { uid } => duplicate_profile(&store, &uid),
+      ProfileMutationCommand::Delete { uids } => delete_profiles(&store, &uids),
+      ProfileMutationCommand::Reorder { uid, new_index } => {
+        reorder_profile(&store, &uid, new_index)
+      },
+    })
+    .await
+    .map_err(|error| format!("profile mutation task failed: {error}"))?
+  }
+
   async fn import_remote(&self, name: String, url: String) -> Result<(), String> {
     validate_profile_name(&name)?;
-    let parsed = Url::parse(&url).map_err(|error| format!("invalid subscription URL: {error}"))?;
+    let content = self.download_remote(&url).await?;
+    let store = self.access.store.clone();
+    spawn_blocking(move || import_content(&store, &name, ProfileKind::Remote, Some(url), content))
+      .await
+      .map_err(|error| format!("remote profile import task failed: {error}"))?
+  }
+
+  async fn download_remote(&self, url: &str) -> Result<Vec<u8>, String> {
+    let parsed = Url::parse(url).map_err(|error| format!("invalid subscription URL: {error}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
       return Err("subscription URL must use HTTP or HTTPS".to_string());
     }
@@ -147,10 +208,65 @@ impl ProfileWorker {
       }
       content.extend_from_slice(&chunk);
     }
+    Ok(content)
+  }
+
+  async fn update_remote(&self, uid: String) -> Result<(), String> {
     let store = self.access.store.clone();
-    spawn_blocking(move || import_content(&store, &name, ProfileKind::Remote, Some(url), content))
+    let lookup_uid = uid.clone();
+    let profile = spawn_blocking(move || remote_profile(&store, &lookup_uid))
       .await
-      .map_err(|error| format!("remote profile import task failed: {error}"))?
+      .map_err(|error| format!("profile lookup task failed: {error}"))??;
+    let content = self.download_remote(&profile.url).await?;
+    let store = self.access.store.clone();
+    let replace_uid = uid.clone();
+    let rollback = spawn_blocking(move || replace_profile(&store, &replace_uid, content))
+      .await
+      .map_err(|error| format!("profile update task failed: {error}"))??;
+
+    if !profile.active {
+      return Ok(());
+    }
+    if let Err(update_error) = self.activate(uid.clone()).await {
+      let store = self.access.store.clone();
+      let restore_uid = uid;
+      let restore = spawn_blocking(move || restore_profile(&store, &restore_uid, rollback))
+        .await
+        .map_err(|error| format!("profile restore task failed: {error}"))
+        .and_then(|result| result);
+      return match restore {
+        Ok(()) => Err(format!(
+          "activate updated profile: {update_error}; the previous subscription was restored"
+        )),
+        Err(restore_error) => Err(format!(
+          "activate updated profile: {update_error}; restore previous subscription: {restore_error}"
+        )),
+      };
+    }
+    let _ = self.event_tx.send(ProfileBridgeEvent::RuntimeChanged).await;
+    Ok(())
+  }
+
+  async fn update_all_remote(&self) -> Result<(), String> {
+    let store = self.access.store.clone();
+    let uids = spawn_blocking(move || remote_profile_uids(&store))
+      .await
+      .map_err(|error| format!("profile lookup task failed: {error}"))??;
+    let mut failures = Vec::new();
+    for uid in uids {
+      if let Err(error) = self.update_remote(uid.clone()).await {
+        failures.push(format!("{uid}: {error}"));
+      }
+    }
+    if failures.is_empty() {
+      Ok(())
+    } else {
+      Err(format!(
+        "{} subscription update(s) failed: {}",
+        failures.len(),
+        failures.join("; ")
+      ))
+    }
   }
 
   async fn activate(&self, uid: String) -> Result<(), String> {
@@ -267,13 +383,7 @@ fn import_content(
   content: Vec<u8>,
 ) -> Result<(), String> {
   validate_profile_name(name)?;
-  let source =
-    std::str::from_utf8(&content).map_err(|_| "profile must be valid UTF-8 YAML".to_string())?;
-  let config =
-    MihomoConfig::parse(source).map_err(|error| format!("parse profile YAML: {error}"))?;
-  if config.mapping().is_empty() {
-    return Err("profile YAML must not be empty".to_string());
-  }
+  validate_source_content(&content)?;
   let uid = unique_profile_uid();
   let item = ProfileItem {
     uid: Some(uid.clone()),
@@ -290,6 +400,245 @@ fn import_content(
     .map_err(|error| error.to_string())?;
   transaction.validate().map_err(|error| error.to_string())?;
   transaction.commit().map_err(|error| error.to_string())?;
+  Ok(())
+}
+
+struct RemoteProfile {
+  url: String,
+  active: bool,
+}
+
+struct ProfileRollback {
+  content: Vec<u8>,
+  updated_at: Option<u64>,
+}
+
+fn remote_profile(store: &ProfileStore, uid: &str) -> Result<RemoteProfile, String> {
+  let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+  let item = catalog
+    .get(uid)
+    .ok_or_else(|| format!("profile {uid} does not exist"))?;
+  if item.kind != Some(ProfileKind::Remote) {
+    return Err(format!("profile {uid} is not a remote subscription"));
+  }
+  let url = item
+    .url
+    .clone()
+    .filter(|url| !url.is_empty())
+    .ok_or_else(|| format!("remote profile {uid} has no subscription URL"))?;
+  Ok(RemoteProfile {
+    url,
+    active: catalog.current.as_deref() == Some(uid),
+  })
+}
+
+fn remote_profile_uids(store: &ProfileStore) -> Result<Vec<String>, String> {
+  let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+  Ok(
+    catalog
+      .items()
+      .iter()
+      .filter(|item| item.kind == Some(ProfileKind::Remote))
+      .filter_map(|item| item.uid.clone())
+      .collect(),
+  )
+}
+
+fn rename_profile(store: &ProfileStore, uid: &str, name: &str) -> Result<(), String> {
+  validate_profile_name(name)?;
+  let mut transaction = store.begin().map_err(|error| error.to_string())?;
+  if transaction.catalog().get(uid).is_none() {
+    return Err(format!("profile {uid} does not exist"));
+  }
+  let name = name.trim().to_string();
+  transaction
+    .edit_catalog(|catalog| {
+      if let Some(item) = catalog
+        .items_mut()
+        .iter_mut()
+        .find(|item| item.uid.as_deref() == Some(uid))
+      {
+        item.name = Some(name);
+      }
+    })
+    .map_err(|error| error.to_string())?;
+  transaction.validate().map_err(|error| error.to_string())?;
+  transaction.commit().map_err(|error| error.to_string())?;
+  Ok(())
+}
+
+fn duplicate_profile(store: &ProfileStore, uid: &str) -> Result<(), String> {
+  let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+  let source = catalog
+    .get(uid)
+    .cloned()
+    .ok_or_else(|| format!("profile {uid} does not exist"))?;
+  if matches!(
+    source.kind,
+    Some(ProfileKind::Script | ProfileKind::Unknown(_)) | None
+  ) {
+    return Err(format!("profile {uid} cannot be duplicated"));
+  }
+  let source_file = source
+    .require_file()
+    .map_err(|error| error.to_string())?
+    .to_string();
+  let content = store
+    .read_profile(&source_file)
+    .map_err(|error| error.to_string())?
+    .into_bytes();
+  let new_uid = unique_profile_uid();
+  let extension = Path::new(&source_file)
+    .extension()
+    .and_then(|extension| extension.to_str())
+    .filter(|extension| !extension.is_empty())
+    .unwrap_or("yaml");
+  let mut copy = source;
+  copy.uid = Some(new_uid.clone());
+  copy.file = Some(format!("{new_uid}.{extension}"));
+  copy.name = Some(format!(
+    "{} (copy)",
+    copy.name.as_deref().unwrap_or("Unnamed profile")
+  ));
+  copy.selected = None;
+  copy.updated = Some(unix_seconds());
+  copy.file_data = None;
+
+  let mut transaction = store.begin().map_err(|error| error.to_string())?;
+  transaction
+    .add_profile(copy, content)
+    .map_err(|error| error.to_string())?;
+  transaction.validate().map_err(|error| error.to_string())?;
+  transaction.commit().map_err(|error| error.to_string())?;
+  Ok(())
+}
+
+fn delete_profiles(store: &ProfileStore, uids: &[String]) -> Result<(), String> {
+  let unique = uids
+    .iter()
+    .map(String::as_str)
+    .filter(|uid| !uid.is_empty())
+    .collect::<BTreeSet<_>>();
+  if unique.is_empty() {
+    return Err("select at least one profile to delete".to_string());
+  }
+  let mut transaction = store.begin().map_err(|error| error.to_string())?;
+  for uid in &unique {
+    if transaction.catalog().get(uid).is_none() {
+      return Err(format!("profile {uid} does not exist"));
+    }
+  }
+  for uid in unique {
+    transaction
+      .remove_profile(uid)
+      .map_err(|error| error.to_string())?;
+  }
+  transaction.validate().map_err(|error| error.to_string())?;
+  transaction.commit().map_err(|error| error.to_string())?;
+  Ok(())
+}
+
+fn reorder_profile(store: &ProfileStore, uid: &str, new_index: usize) -> Result<(), String> {
+  let mut transaction = store.begin().map_err(|error| error.to_string())?;
+  let item_count = transaction.catalog().items().len();
+  if new_index >= item_count {
+    return Err(format!(
+      "profile index {new_index} is outside the {item_count}-item catalog"
+    ));
+  }
+  let old_index = transaction
+    .catalog()
+    .items()
+    .iter()
+    .position(|item| item.uid.as_deref() == Some(uid))
+    .ok_or_else(|| format!("profile {uid} does not exist"))?;
+  transaction
+    .edit_catalog(|catalog| {
+      let item = catalog.items_mut().remove(old_index);
+      catalog.items_mut().insert(new_index, item);
+    })
+    .map_err(|error| error.to_string())?;
+  transaction.validate().map_err(|error| error.to_string())?;
+  transaction.commit().map_err(|error| error.to_string())?;
+  Ok(())
+}
+
+fn replace_profile(
+  store: &ProfileStore,
+  uid: &str,
+  content: Vec<u8>,
+) -> Result<ProfileRollback, String> {
+  validate_source_content(&content)?;
+  let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+  let item = catalog
+    .get(uid)
+    .ok_or_else(|| format!("profile {uid} does not exist"))?;
+  if item.kind != Some(ProfileKind::Remote) {
+    return Err(format!("profile {uid} is not a remote subscription"));
+  }
+  let previous = ProfileRollback {
+    content: store
+      .read_profile(item.require_file().map_err(|error| error.to_string())?)
+      .map_err(|error| error.to_string())?
+      .into_bytes(),
+    updated_at: item.updated,
+  };
+  let mut transaction = store.begin().map_err(|error| error.to_string())?;
+  transaction
+    .edit_catalog(|catalog| {
+      if let Some(item) = catalog
+        .items_mut()
+        .iter_mut()
+        .find(|item| item.uid.as_deref() == Some(uid))
+      {
+        item.updated = Some(unix_seconds());
+      }
+    })
+    .map_err(|error| error.to_string())?;
+  transaction
+    .stage_profile(uid, content)
+    .map_err(|error| error.to_string())?;
+  transaction.validate().map_err(|error| error.to_string())?;
+  transaction.commit().map_err(|error| error.to_string())?;
+  Ok(previous)
+}
+
+fn restore_profile(
+  store: &ProfileStore,
+  uid: &str,
+  rollback: ProfileRollback,
+) -> Result<(), String> {
+  let mut transaction = store.begin().map_err(|error| error.to_string())?;
+  if transaction.catalog().get(uid).is_none() {
+    return Err(format!("profile {uid} does not exist"));
+  }
+  transaction
+    .edit_catalog(|catalog| {
+      if let Some(item) = catalog
+        .items_mut()
+        .iter_mut()
+        .find(|item| item.uid.as_deref() == Some(uid))
+      {
+        item.updated = rollback.updated_at;
+      }
+    })
+    .map_err(|error| error.to_string())?;
+  transaction
+    .stage_profile(uid, rollback.content)
+    .map_err(|error| error.to_string())?;
+  transaction.validate().map_err(|error| error.to_string())?;
+  transaction.commit().map_err(|error| error.to_string())?;
+  Ok(())
+}
+
+fn validate_source_content(content: &[u8]) -> Result<(), String> {
+  let source =
+    std::str::from_utf8(content).map_err(|_| "profile must be valid UTF-8 YAML".to_string())?;
+  let config =
+    MihomoConfig::parse(source).map_err(|error| format!("parse profile YAML: {error}"))?;
+  if config.mapping().is_empty() {
+    return Err("profile YAML must not be empty".to_string());
+  }
   Ok(())
 }
 
@@ -365,6 +714,10 @@ fn load_snapshot(store: &ProfileStore) -> Result<ProfilesSnapshot, String> {
       let source = match item.kind.as_ref() {
         Some(ProfileKind::Local) => ProfileSourceKind::Local,
         Some(ProfileKind::Remote) => ProfileSourceKind::Remote,
+        Some(ProfileKind::Merge) => ProfileSourceKind::Merge,
+        Some(ProfileKind::Rules) => ProfileSourceKind::Rules,
+        Some(ProfileKind::Proxies) => ProfileSourceKind::Proxies,
+        Some(ProfileKind::Groups) => ProfileSourceKind::Groups,
         _ => ProfileSourceKind::Other,
       };
       Some(ProfileSummary {
@@ -445,8 +798,8 @@ mod tests {
   };
 
   use super::{
-    ProfileAccess, ProfileWorker, import_local, load_snapshot, prepare_activation,
-    set_current_profile,
+    ProfileAccess, ProfileWorker, delete_profiles, duplicate_profile, import_content, import_local,
+    load_snapshot, prepare_activation, rename_profile, reorder_profile, set_current_profile,
   };
 
   static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -511,12 +864,94 @@ mod tests {
     fs::remove_file(source).expect("the local source should be removed");
   }
 
+  #[test]
+  fn profile_lifecycle_mutations_are_transactional() {
+    let directory = TestDirectory::new();
+    let store =
+      initialize_default_runtime(&directory.root).expect("the default runtime should initialize");
+    let content = b"mode: rule\nproxies: []\nproxy-groups: []\nrules: []\n".to_vec();
+    import_content(
+      &store,
+      "Original",
+      rsclash_config::ProfileKind::Local,
+      None,
+      content.clone(),
+    )
+    .expect("the profile should import");
+    let original_uid = store
+      .load_catalog()
+      .expect("the catalog should load")
+      .items()[0]
+      .uid
+      .clone()
+      .expect("the profile should have a UID");
+
+    rename_profile(&store, &original_uid, "Renamed").expect("the profile should rename");
+    duplicate_profile(&store, &original_uid).expect("the profile should duplicate");
+    let catalog = store.load_catalog().expect("the catalog should load");
+    assert_eq!(catalog.items().len(), 2);
+    assert_eq!(
+      catalog
+        .get(&original_uid)
+        .and_then(|item| item.name.as_deref()),
+      Some("Renamed")
+    );
+    let copy = catalog
+      .items()
+      .iter()
+      .find(|item| item.uid.as_deref() != Some(original_uid.as_str()))
+      .expect("the copy should exist");
+    let copy_uid = copy.uid.clone().expect("the copy should have a UID");
+    assert_eq!(copy.name.as_deref(), Some("Renamed (copy)"));
+    assert_eq!(
+      store
+        .read_profile(copy.require_file().expect("the copy should have a file"))
+        .expect("the copy should be readable")
+        .as_bytes(),
+      content
+    );
+
+    reorder_profile(&store, &copy_uid, 0).expect("the copy should move to the beginning");
+    assert_eq!(
+      store
+        .load_catalog()
+        .expect("the catalog should load")
+        .items()[0]
+        .uid
+        .as_deref(),
+      Some(copy_uid.as_str())
+    );
+    set_current_profile(&store, &original_uid).expect("the original should become current");
+    delete_profiles(&store, &[original_uid, copy_uid])
+      .expect("the profiles should be deleted together");
+    let catalog = store.load_catalog().expect("the catalog should load");
+    assert!(catalog.items().is_empty());
+    assert!(catalog.current.is_none());
+    assert_eq!(
+      fs::read_dir(&store.paths().profiles_dir)
+        .expect("the profiles directory should be readable")
+        .count(),
+      0
+    );
+  }
+
   struct AcceptValidator;
 
   #[async_trait::async_trait]
   impl RuntimeValidator for AcceptValidator {
     async fn validate(&self, _staging_path: &std::path::Path) -> ConfigResult<()> {
       Ok(())
+    }
+  }
+
+  struct RejectValidator;
+
+  #[async_trait::async_trait]
+  impl RuntimeValidator for RejectValidator {
+    async fn validate(&self, _staging_path: &std::path::Path) -> ConfigResult<()> {
+      Err(rsclash_config::Error::RuntimeValidation(
+        "rejected by test validator".to_string(),
+      ))
     }
   }
 
@@ -583,6 +1018,82 @@ mod tests {
     assert_eq!(
       catalog.items()[0].kind,
       Some(rsclash_config::ProfileKind::Remote)
+    );
+  }
+
+  #[tokio::test]
+  async fn active_remote_update_restores_source_when_runtime_validation_fails() {
+    let directory = TestDirectory::new();
+    let store =
+      initialize_default_runtime(&directory.root).expect("the default runtime should initialize");
+    let listener = TcpListener::bind("127.0.0.1:0")
+      .await
+      .expect("the HTTP listener should bind");
+    let address = listener
+      .local_addr()
+      .expect("the HTTP listener should have an address");
+    let server = tokio::spawn(async move {
+      let (mut socket, _) = listener.accept().await.expect("the client should connect");
+      let mut request = [0_u8; 1_024];
+      let _ = socket
+        .read(&mut request)
+        .await
+        .expect("the request should be readable");
+      let body =
+        b"mode: rule\nproxies:\n- name: Updated\n  type: direct\nproxy-groups: []\nrules: []\n";
+      let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+      );
+      socket
+        .write_all(response.as_bytes())
+        .await
+        .expect("the response head should send");
+      socket
+        .write_all(body)
+        .await
+        .expect("the response body should send");
+    });
+    let old_content =
+      b"mode: rule\nproxies:\n- name: Original\n  type: direct\nproxy-groups: []\nrules: []\n";
+    import_content(
+      &store,
+      "Remote",
+      rsclash_config::ProfileKind::Remote,
+      Some(format!("http://{address}/subscription")),
+      old_content.to_vec(),
+    )
+    .expect("the remote profile should import");
+    let catalog = store.load_catalog().expect("the catalog should load");
+    let item = catalog.items()[0].clone();
+    let uid = item.uid.clone().expect("the profile should have a UID");
+    let previous_updated = item.updated;
+    let file = item.file.clone().expect("the profile should have a file");
+    set_current_profile(&store, &uid).expect("the profile should become current");
+
+    let access = ProfileAccess::new(store.clone(), Arc::new(RejectValidator))
+      .expect("profile access should build");
+    let (event_tx, _event_rx) = mpsc::channel(4);
+    let worker = ProfileWorker::new(access, Arc::new(NoopActivator), event_tx);
+    let error = worker
+      .update_remote(uid.clone())
+      .await
+      .expect_err("runtime validation should reject the update");
+    server.await.expect("the HTTP server should finish");
+
+    assert!(error.contains("previous subscription was restored"));
+    assert_eq!(
+      store
+        .read_profile(&file)
+        .expect("the restored profile should be readable")
+        .as_bytes(),
+      old_content
+    );
+    let catalog = store.load_catalog().expect("the catalog should load");
+    assert_eq!(catalog.current.as_deref(), Some(uid.as_str()));
+    assert_eq!(
+      catalog.get(&uid).and_then(|item| item.updated),
+      previous_updated
     );
   }
 

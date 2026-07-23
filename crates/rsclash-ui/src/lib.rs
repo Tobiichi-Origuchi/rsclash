@@ -2,7 +2,10 @@
 
 mod theme;
 
-use std::sync::Arc;
+use std::{
+  collections::{BTreeMap, BTreeSet},
+  sync::Arc,
+};
 
 use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, Stroke, Ui};
 use rsclash_app::{AppClient, AppEventReceiver, ClientError};
@@ -23,6 +26,12 @@ pub struct RsClashUi {
   local_profile_path: String,
   remote_profile_name: String,
   remote_profile_url: String,
+  renaming_profile: Option<String>,
+  profile_name_edits: BTreeMap<String, String>,
+  pending_profile_delete: Option<String>,
+  profile_batch_mode: bool,
+  selected_profiles: BTreeSet<String>,
+  pending_batch_delete: bool,
 }
 
 impl RsClashUi {
@@ -43,6 +52,12 @@ impl RsClashUi {
       local_profile_path: String::new(),
       remote_profile_name: String::new(),
       remote_profile_url: String::new(),
+      renaming_profile: None,
+      profile_name_edits: BTreeMap::new(),
+      pending_profile_delete: None,
+      profile_batch_mode: false,
+      selected_profiles: BTreeSet::new(),
+      pending_batch_delete: false,
     }
   }
 
@@ -481,6 +496,10 @@ impl RsClashUi {
 
   fn profiles(&mut self, ui: &mut Ui) {
     let profiles = self.snapshot.profiles.clone();
+    let has_remote = profiles
+      .items
+      .iter()
+      .any(|profile| profile.source == ProfileSourceKind::Remote);
     ui.horizontal(|ui| {
       ui.vertical(|ui| {
         ui.label(RichText::new("订阅与配置").size(24.0).strong());
@@ -489,8 +508,30 @@ impl RsClashUi {
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if profiles.busy {
           ui.spinner();
-        } else if ui.button("刷新").clicked() {
+        } else if ui.button("刷新列表").clicked() {
           self.command(UiCommand::RefreshProfiles);
+        }
+        if ui
+          .add_enabled(!profiles.busy && has_remote, egui::Button::new("更新全部"))
+          .clicked()
+        {
+          self.command(UiCommand::UpdateAllProfiles);
+        }
+        if !profiles.items.is_empty()
+          && ui
+            .add_enabled(
+              !profiles.busy,
+              egui::Button::new(if self.profile_batch_mode {
+                "完成批量管理"
+              } else {
+                "批量管理"
+              }),
+            )
+            .clicked()
+        {
+          self.profile_batch_mode = !self.profile_batch_mode;
+          self.selected_profiles.clear();
+          self.pending_batch_delete = false;
         }
       });
     });
@@ -542,12 +583,84 @@ impl RsClashUi {
       return;
     }
 
-    for profile in &profiles.items {
+    if self.profile_batch_mode {
+      card(ui, "批量管理", |ui| {
+        ui.horizontal_wrapped(|ui| {
+          ui.label(format!(
+            "已选择 {} / {} 项",
+            self.selected_profiles.len(),
+            profiles.items.len()
+          ));
+          if ui
+            .add_enabled(!profiles.busy, egui::Button::new("全选"))
+            .clicked()
+          {
+            self
+              .selected_profiles
+              .extend(profiles.items.iter().map(|profile| profile.uid.clone()));
+          }
+          if ui
+            .add_enabled(
+              !profiles.busy && !self.selected_profiles.is_empty(),
+              egui::Button::new("清除选择"),
+            )
+            .clicked()
+          {
+            self.selected_profiles.clear();
+            self.pending_batch_delete = false;
+          }
+          let delete_label = if self.pending_batch_delete {
+            "确认删除选中项"
+          } else {
+            "删除选中项"
+          };
+          if ui
+            .add_enabled(
+              !profiles.busy && !self.selected_profiles.is_empty(),
+              egui::Button::new(delete_label),
+            )
+            .clicked()
+          {
+            if self.pending_batch_delete {
+              self.command(UiCommand::DeleteProfiles {
+                uids: self.selected_profiles.iter().cloned().collect(),
+              });
+              self.selected_profiles.clear();
+              self.pending_batch_delete = false;
+              self.profile_batch_mode = false;
+            } else {
+              self.pending_batch_delete = true;
+            }
+          }
+        });
+        if self.pending_batch_delete {
+          ui.label(RichText::new("此操作会同时删除所选配置文件，无法撤销。").weak());
+        }
+      });
+      ui.add_space(10.0);
+    }
+
+    for (profile_index, profile) in profiles.items.iter().enumerate() {
       card(ui, &profile.name, |ui| {
         ui.horizontal(|ui| {
+          if self.profile_batch_mode {
+            let mut selected = self.selected_profiles.contains(&profile.uid);
+            if ui.checkbox(&mut selected, "").changed() {
+              if selected {
+                self.selected_profiles.insert(profile.uid.clone());
+              } else {
+                self.selected_profiles.remove(&profile.uid);
+              }
+              self.pending_batch_delete = false;
+            }
+          }
           let source = match profile.source {
             ProfileSourceKind::Local => "本地",
             ProfileSourceKind::Remote => "远程订阅",
+            ProfileSourceKind::Merge => "合并配置",
+            ProfileSourceKind::Rules => "规则扩展",
+            ProfileSourceKind::Proxies => "代理扩展",
+            ProfileSourceKind::Groups => "代理组扩展",
             ProfileSourceKind::Other => "扩展配置",
           };
           ui.label(RichText::new(source).small().weak());
@@ -559,23 +672,139 @@ impl RsClashUi {
                 .color(Color32::from_rgb(38, 162, 105)),
             );
           }
-          ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui
-              .add_enabled(
-                !profiles.busy && !profile.active,
-                egui::Button::new(if profile.active {
-                  "已激活"
-                } else {
-                  "激活"
-                }),
-              )
-              .clicked()
-            {
-              self.command(UiCommand::ActivateProfile {
-                uid: profile.uid.clone(),
-              });
-            }
+        });
+        if self.profile_batch_mode {
+          return;
+        }
+
+        if self.renaming_profile.as_deref() == Some(profile.uid.as_str()) {
+          let edit = self
+            .profile_name_edits
+            .entry(profile.uid.clone())
+            .or_insert_with(|| profile.name.clone());
+          let mut save = false;
+          let mut cancel = false;
+          ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(edit).hint_text("配置名称"));
+            save = ui
+              .add_enabled(!profiles.busy, egui::Button::new("保存"))
+              .clicked();
+            cancel = ui.button("取消").clicked();
           });
+          if save {
+            let name = self
+              .profile_name_edits
+              .get(&profile.uid)
+              .cloned()
+              .unwrap_or_default();
+            self.command(UiCommand::RenameProfile {
+              uid: profile.uid.clone(),
+              name,
+            });
+            self.renaming_profile = None;
+          } else if cancel {
+            self.renaming_profile = None;
+          }
+        }
+
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| {
+          let source_profile = matches!(
+            profile.source,
+            ProfileSourceKind::Local | ProfileSourceKind::Remote
+          );
+          if ui
+            .add_enabled(
+              !profiles.busy && source_profile && !profile.active,
+              egui::Button::new(if profile.active {
+                "已激活"
+              } else {
+                "激活"
+              }),
+            )
+            .clicked()
+          {
+            self.command(UiCommand::ActivateProfile {
+              uid: profile.uid.clone(),
+            });
+          }
+          if profile.source == ProfileSourceKind::Remote
+            && ui
+              .add_enabled(!profiles.busy, egui::Button::new("更新"))
+              .clicked()
+          {
+            self.command(UiCommand::UpdateProfile {
+              uid: profile.uid.clone(),
+            });
+          }
+          if ui
+            .add_enabled(
+              !profiles.busy && profile.source != ProfileSourceKind::Other,
+              egui::Button::new("复制"),
+            )
+            .clicked()
+          {
+            self.command(UiCommand::DuplicateProfile {
+              uid: profile.uid.clone(),
+            });
+          }
+          if ui
+            .add_enabled(!profiles.busy, egui::Button::new("重命名"))
+            .clicked()
+          {
+            self
+              .profile_name_edits
+              .insert(profile.uid.clone(), profile.name.clone());
+            self.renaming_profile = Some(profile.uid.clone());
+          }
+          if ui
+            .add_enabled(
+              !profiles.busy && profile_index > 0,
+              egui::Button::new("上移"),
+            )
+            .clicked()
+          {
+            self.command(UiCommand::ReorderProfile {
+              uid: profile.uid.clone(),
+              new_index: profile_index - 1,
+            });
+          }
+          if ui
+            .add_enabled(
+              !profiles.busy && profile_index + 1 < profiles.items.len(),
+              egui::Button::new("下移"),
+            )
+            .clicked()
+          {
+            self.command(UiCommand::ReorderProfile {
+              uid: profile.uid.clone(),
+              new_index: profile_index + 1,
+            });
+          }
+          let delete_pending = self.pending_profile_delete.as_deref() == Some(profile.uid.as_str());
+          if ui
+            .add_enabled(
+              !profiles.busy,
+              egui::Button::new(if delete_pending {
+                "确认删除"
+              } else {
+                "删除"
+              }),
+            )
+            .clicked()
+          {
+            if delete_pending {
+              self.command(UiCommand::DeleteProfiles {
+                uids: vec![profile.uid.clone()],
+              });
+              self.pending_profile_delete = None;
+            } else {
+              self.pending_profile_delete = Some(profile.uid.clone());
+            }
+          }
+          if delete_pending && ui.button("取消删除").clicked() {
+            self.pending_profile_delete = None;
+          }
         });
       });
       ui.add_space(10.0);
