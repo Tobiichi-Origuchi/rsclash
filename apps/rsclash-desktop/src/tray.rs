@@ -2,10 +2,10 @@ use std::sync::LazyLock;
 
 use ksni::{
   TrayMethods as _,
-  menu::{MenuItem, StandardItem},
+  menu::{CheckmarkItem, MenuItem, RadioGroup, RadioItem, StandardItem, SubMenu},
 };
 use rsclash_app::AppClient;
-use rsclash_domain::UiCommand;
+use rsclash_domain::{MihomoConnection, ProxyMode, UiCommand};
 use tokio::runtime::Handle as RuntimeHandle;
 use tracing::{debug, warn};
 
@@ -79,11 +79,59 @@ impl ksni::Tray for AppTray {
   }
 
   fn menu(&self) -> Vec<MenuItem<Self>> {
+    let snapshot = self.client.current_snapshot();
+    let system_proxy = &snapshot.system_proxy;
+    let mihomo_ready = snapshot.mihomo.connection == MihomoConnection::Connected;
+    let can_toggle_system_proxy = system_proxy.enabled
+      || (system_proxy.available && mihomo_ready && snapshot.mihomo.mixed_port.is_some());
+    let current_mode = snapshot.mihomo.mode.clone();
     vec![
       StandardItem {
         label: "显示或隐藏 rsclash".to_owned(),
         icon_name: "view-restore-symbolic".to_owned(),
         activate: Box::new(|tray: &mut Self| tray.send(UiCommand::ToggleWindow)),
+        ..Default::default()
+      }
+      .into(),
+      CheckmarkItem {
+        label: "系统代理".to_owned(),
+        enabled: can_toggle_system_proxy && !system_proxy.busy,
+        checked: system_proxy.enabled,
+        activate: Box::new(|tray: &mut Self| {
+          let enabled = tray.client.current_snapshot().system_proxy.enabled;
+          tray.send(UiCommand::SetSystemProxy(!enabled));
+        }),
+        ..Default::default()
+      }
+      .into(),
+      SubMenu {
+        label: format!("代理模式：{}", proxy_mode_label(&current_mode)),
+        enabled: mihomo_ready,
+        submenu: vec![
+          RadioGroup {
+            selected: proxy_mode_index(&current_mode),
+            select: Box::new(|tray: &mut Self, selected| {
+              if let Some(mode) = proxy_mode_from_index(selected) {
+                tray.send(UiCommand::SetProxyMode(mode));
+              }
+            }),
+            options: vec![
+              RadioItem {
+                label: "规则".to_owned(),
+                ..Default::default()
+              },
+              RadioItem {
+                label: "全局".to_owned(),
+                ..Default::default()
+              },
+              RadioItem {
+                label: "直连".to_owned(),
+                ..Default::default()
+              },
+            ],
+          }
+          .into(),
+        ],
         ..Default::default()
       }
       .into(),
@@ -96,6 +144,32 @@ impl ksni::Tray for AppTray {
       }
       .into(),
     ]
+  }
+}
+
+const fn proxy_mode_index(mode: &ProxyMode) -> usize {
+  match mode {
+    ProxyMode::Rule | ProxyMode::Unknown(_) => 0,
+    ProxyMode::Global => 1,
+    ProxyMode::Direct => 2,
+  }
+}
+
+const fn proxy_mode_from_index(index: usize) -> Option<ProxyMode> {
+  match index {
+    0 => Some(ProxyMode::Rule),
+    1 => Some(ProxyMode::Global),
+    2 => Some(ProxyMode::Direct),
+    _ => None,
+  }
+}
+
+const fn proxy_mode_label(mode: &ProxyMode) -> &str {
+  match mode {
+    ProxyMode::Rule => "规则",
+    ProxyMode::Global => "全局",
+    ProxyMode::Direct => "直连",
+    ProxyMode::Unknown(_) => "未知",
   }
 }
 
@@ -129,7 +203,9 @@ fn app_icon() -> ksni::Icon {
 
 #[cfg(test)]
 mod tests {
-  use super::{APP_ICON, ICON_SIZE};
+  use rsclash_domain::ProxyMode;
+
+  use super::{APP_ICON, ICON_SIZE, proxy_mode_from_index, proxy_mode_index, proxy_mode_label};
 
   #[test]
   fn icon_uses_argb_network_byte_order() {
@@ -140,5 +216,19 @@ mod tests {
 
     let center = ((16 * ICON_SIZE + 16) * 4) as usize;
     assert_eq!(&APP_ICON.data[center..center + 4], &[255, 28, 113, 216]);
+  }
+
+  #[test]
+  fn proxy_modes_have_stable_tray_indices() {
+    for (index, mode, label) in [
+      (0, ProxyMode::Rule, "规则"),
+      (1, ProxyMode::Global, "全局"),
+      (2, ProxyMode::Direct, "直连"),
+    ] {
+      assert_eq!(proxy_mode_index(&mode), index);
+      assert_eq!(proxy_mode_from_index(index), Some(mode.clone()));
+      assert_eq!(proxy_mode_label(&mode), label);
+    }
+    assert_eq!(proxy_mode_from_index(3), None);
   }
 }
