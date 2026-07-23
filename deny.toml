@@ -32,6 +32,7 @@ unused-allowed-license = "warn"
 unused-license-exception = "deny"
 exceptions = [
   { name = "epaint_default_fonts", allow = ["OFL-1.1", "Ubuntu-font-1.0"] },
+  { name = "webpki-root-certs", allow = ["CDLA-Permissive-2.0"] },
 ]
 
 [licenses.private]
