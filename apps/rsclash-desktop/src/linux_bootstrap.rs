@@ -182,6 +182,10 @@ mod tests {
   use rsclash_core::CoreBinaries;
   use rsclash_domain::{CoreChannel, CoreState, UiCommand};
   use rsclash_platform::RecoveryOutcome;
+  use tokio::{
+    io::{AsyncReadExt as _, AsyncWriteExt as _},
+    net::{TcpListener, TcpStream},
+  };
 
   use super::{BootstrapLayout, create_core_runtime_for_layout};
 
@@ -213,9 +217,10 @@ mod tests {
     let generated = fs::read_to_string(&runtime_path).expect("runtime config should be generated");
     assert!(generated.contains("mixed-port: 17897"));
     assert!(generated.contains("device: rsclash"));
+    let mixed_port = available_port();
     fs::write(
       &runtime_path,
-      generated.replace("mixed-port: 17897", "mixed-port: 0"),
+      generated.replace("mixed-port: 17897", &format!("mixed-port: {mixed_port}")),
     )
     .expect("integration port should be replaced");
 
@@ -289,9 +294,77 @@ mod tests {
     .await
     .expect("profile activation should finish before the timeout");
     let activated = fs::read_to_string(&runtime_path).expect("runtime config should be readable");
-    assert!(activated.contains("mixed-port: 0"));
+    assert!(activated.contains(&format!("mixed-port: {mixed_port}")));
     assert!(activated.contains("DOMAIN,example.com,DIRECT"));
+    assert_proxy_connection(mixed_port).await;
     assert!(backend.shutdown().await.is_ok());
+  }
+
+  async fn assert_proxy_connection(mixed_port: u16) {
+    let origin = TcpListener::bind("127.0.0.1:0")
+      .await
+      .expect("the local origin should bind");
+    let origin_address = origin
+      .local_addr()
+      .expect("the local origin should have an address");
+    let server = tokio::spawn(async move {
+      let (mut stream, _) = origin
+        .accept()
+        .await
+        .expect("Mihomo should reach the origin");
+      let mut request = [0_u8; 2_048];
+      let read = stream
+        .read(&mut request)
+        .await
+        .expect("the proxied request should be readable");
+      assert!(
+        String::from_utf8_lossy(&request[..read]).contains("/rsclash-ready"),
+        "the origin should receive the requested path"
+      );
+      stream
+        .write_all(
+          b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\nrsclash-proxy-ok",
+        )
+        .await
+        .expect("the origin response should send");
+    });
+
+    let mut proxy = tokio::time::timeout(Duration::from_secs(5), async {
+      loop {
+        match TcpStream::connect(("127.0.0.1", mixed_port)).await {
+          Ok(stream) => return stream,
+          Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+      }
+    })
+    .await
+    .expect("the mixed listener should accept connections");
+    let request = format!(
+      "GET http://{origin_address}/rsclash-ready HTTP/1.1\r\nHost: {origin_address}\r\nConnection: close\r\n\r\n"
+    );
+    proxy
+      .write_all(request.as_bytes())
+      .await
+      .expect("the proxy request should send");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), proxy.read_to_end(&mut response))
+      .await
+      .expect("the proxy response should arrive")
+      .expect("the proxy response should be readable");
+    assert!(
+      String::from_utf8_lossy(&response).contains("rsclash-proxy-ok"),
+      "the request should complete through Mihomo's mixed listener"
+    );
+    server.await.expect("the local origin should finish");
+  }
+
+  fn available_port() -> u16 {
+    let listener =
+      std::net::TcpListener::bind("127.0.0.1:0").expect("an integration port should be available");
+    listener
+      .local_addr()
+      .expect("the integration listener should have an address")
+      .port()
   }
 
   struct TestDirectory(PathBuf);
