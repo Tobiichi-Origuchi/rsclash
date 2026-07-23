@@ -104,8 +104,9 @@ fn create_core_runtime_for_layout(
     validator_binary,
     &store.paths().root,
   ));
-  let profile_access = ProfileAccess::new(store.clone(), validator)?;
   let system_proxy_backend: Arc<dyn SystemProxyBackend> = Arc::new(LinuxSystemProxyBackend::new());
+  let profile_access = ProfileAccess::new(store.clone(), validator)?
+    .with_system_proxy_backend(Arc::clone(&system_proxy_backend));
   let system_proxy = Arc::new(SystemProxyService::new(
     store.paths().root.join("system-recovery.json"),
     system_proxy_backend,

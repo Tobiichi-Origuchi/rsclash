@@ -9,25 +9,36 @@ use std::{
   time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use reqwest::{Client, Url, redirect::Policy};
+use reqwest::{Client, Proxy, Url, header::HeaderMap, redirect::Policy};
 use rsclash_config::{
   ApplicationLayer, EnhancementInput, EnhancementPipeline, ListenerPolicy, MihomoConfig,
-  NativeTransform, ProfileItem, ProfileKind, ProfileStore, RuntimeActivator, RuntimeDeployer,
-  RuntimeStore, RuntimeValidator, TargetPlatform, extract_control_plane,
+  NativeTransform, ProfileItem, ProfileKind, ProfileOptions, ProfileStore, RuntimeActivator,
+  RuntimeDeployer, RuntimeStore, RuntimeValidator, SubscriptionInfo, TargetPlatform,
+  extract_control_plane,
 };
-use rsclash_domain::{ProfileSourceKind, ProfileSummary, ProfilesSnapshot};
+use rsclash_domain::{
+  ProfileDownloadProxy, ProfileSourceKind, ProfileSummary, ProfilesSnapshot, RemoteProfileOptions,
+  SubscriptionUsage,
+};
+use rsclash_platform::SystemProxyBackend;
 use serde_yaml_ng::Value;
-use tokio::{sync::mpsc, task::spawn_blocking};
+use tokio::{
+  sync::mpsc,
+  task::spawn_blocking,
+  time::{MissedTickBehavior, interval},
+};
 
 const MAX_PROFILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROFILE_NAME_CHARS: usize = 128;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTO_UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct ProfileAccess {
   store: ProfileStore,
   validator: Arc<dyn RuntimeValidator>,
-  http: Client,
+  direct_http: Client,
+  system_proxy: Option<Arc<dyn SystemProxyBackend>>,
 }
 
 impl ProfileAccess {
@@ -38,13 +49,20 @@ impl ProfileAccess {
       .timeout(DOWNLOAD_TIMEOUT)
       .redirect(Policy::limited(5))
       .user_agent(concat!("rsclash/", env!("CARGO_PKG_VERSION")))
+      .no_proxy()
       .build()
       .map_err(|error| format!("build the subscription HTTP client: {error}"))?;
     Ok(Self {
       store,
       validator,
-      http,
+      direct_http: http,
+      system_proxy: None,
     })
+  }
+
+  pub fn with_system_proxy_backend(mut self, backend: Arc<dyn SystemProxyBackend>) -> Self {
+    self.system_proxy = Some(backend);
+    self
   }
 }
 
@@ -59,16 +77,37 @@ pub(crate) enum ProfileBridgeCommand {
 
 #[derive(Clone, Debug)]
 pub(crate) enum ProfileImportCommand {
-  Local { name: String, path: String },
-  Remote { name: String, url: String },
+  Local {
+    name: String,
+    path: String,
+  },
+  Remote {
+    name: String,
+    url: String,
+    options: RemoteProfileOptions,
+  },
 }
 
 #[derive(Clone, Debug)]
 pub(crate) enum ProfileMutationCommand {
-  Rename { uid: String, name: String },
-  Duplicate { uid: String },
-  Delete { uids: Vec<String> },
-  Reorder { uid: String, new_index: usize },
+  Rename {
+    uid: String,
+    name: String,
+  },
+  Duplicate {
+    uid: String,
+  },
+  Delete {
+    uids: Vec<String>,
+  },
+  Reorder {
+    uid: String,
+    new_index: usize,
+  },
+  SetRemoteOptions {
+    uid: String,
+    options: RemoteProfileOptions,
+  },
 }
 
 #[derive(Clone, Debug)]
@@ -106,33 +145,51 @@ impl ProfileWorker {
 
   async fn run(mut self, mut command_rx: mpsc::Receiver<ProfileBridgeCommand>) {
     self.refresh().await;
-    while let Some(command) = command_rx.recv().await {
-      match command {
-        ProfileBridgeCommand::Refresh => self.refresh().await,
-        ProfileBridgeCommand::Import(command) => {
-          self.set_busy(true).await;
-          let result = self.import(command).await;
-          self.finish_operation(result).await;
+    self.update_automatic_profiles().await;
+    let mut auto_update = interval(AUTO_UPDATE_POLL_INTERVAL);
+    auto_update.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    auto_update.tick().await;
+    loop {
+      let command = tokio::select! {
+        command = command_rx.recv() => command,
+        _ = auto_update.tick() => {
+          self.update_automatic_profiles().await;
+          continue;
         },
-        ProfileBridgeCommand::Activate { uid } => {
-          self.set_busy(true).await;
-          let result = self.activate(uid).await;
-          self.finish_operation(result).await;
-        },
-        ProfileBridgeCommand::Mutate(command) => {
-          self.set_busy(true).await;
-          let result = self.mutate(command).await;
-          self.finish_operation(result).await;
-        },
-        ProfileBridgeCommand::Update(command) => {
-          self.set_busy(true).await;
-          let result = match command {
-            ProfileUpdateCommand::One { uid } => self.update_remote(uid).await,
-            ProfileUpdateCommand::All => self.update_all_remote().await,
-          };
-          self.finish_operation(result).await;
-        },
-      }
+      };
+      let Some(command) = command else {
+        break;
+      };
+      self.handle_command(command).await;
+    }
+  }
+
+  async fn handle_command(&mut self, command: ProfileBridgeCommand) {
+    match command {
+      ProfileBridgeCommand::Refresh => self.refresh().await,
+      ProfileBridgeCommand::Import(command) => {
+        self.set_busy(true).await;
+        let result = self.import(command).await;
+        self.finish_operation(result).await;
+      },
+      ProfileBridgeCommand::Activate { uid } => {
+        self.set_busy(true).await;
+        let result = self.activate(uid).await;
+        self.finish_operation(result).await;
+      },
+      ProfileBridgeCommand::Mutate(command) => {
+        self.set_busy(true).await;
+        let result = self.mutate(command).await;
+        self.finish_operation(result).await;
+      },
+      ProfileBridgeCommand::Update(command) => {
+        self.set_busy(true).await;
+        let result = match command {
+          ProfileUpdateCommand::One { uid } => self.update_remote(uid).await,
+          ProfileUpdateCommand::All => self.update_all_remote().await,
+        };
+        self.finish_operation(result).await;
+      },
     }
   }
 
@@ -144,7 +201,9 @@ impl ProfileWorker {
           .await
           .map_err(|error| format!("local profile import task failed: {error}"))?
       },
-      ProfileImportCommand::Remote { name, url } => self.import_remote(name, url).await,
+      ProfileImportCommand::Remote { name, url, options } => {
+        self.import_remote(name, url, options).await
+      },
     }
   }
 
@@ -157,28 +216,54 @@ impl ProfileWorker {
       ProfileMutationCommand::Reorder { uid, new_index } => {
         reorder_profile(&store, &uid, new_index)
       },
+      ProfileMutationCommand::SetRemoteOptions { uid, options } => {
+        set_remote_options(&store, &uid, &options)
+      },
     })
     .await
     .map_err(|error| format!("profile mutation task failed: {error}"))?
   }
 
-  async fn import_remote(&self, name: String, url: String) -> Result<(), String> {
+  async fn import_remote(
+    &self,
+    name: String,
+    url: String,
+    mut options: RemoteProfileOptions,
+  ) -> Result<(), String> {
     validate_profile_name(&name)?;
-    let content = self.download_remote(&url).await?;
+    normalize_remote_options(&mut options);
+    validate_remote_options(&options)?;
+    let download = self.download_remote(&url, &options).await?;
+    if options.update_interval_minutes.is_none() {
+      options.update_interval_minutes = download.suggested_update_interval_minutes;
+    }
     let store = self.access.store.clone();
-    spawn_blocking(move || import_content(&store, &name, ProfileKind::Remote, Some(url), content))
-      .await
-      .map_err(|error| format!("remote profile import task failed: {error}"))?
+    spawn_blocking(move || {
+      import_content(
+        &store,
+        &name,
+        ProfileKind::Remote,
+        Some(url),
+        Some(options),
+        download,
+      )
+    })
+    .await
+    .map_err(|error| format!("remote profile import task failed: {error}"))?
   }
 
-  async fn download_remote(&self, url: &str) -> Result<Vec<u8>, String> {
+  async fn download_remote(
+    &self,
+    url: &str,
+    options: &RemoteProfileOptions,
+  ) -> Result<DownloadedProfile, String> {
     let parsed = Url::parse(url).map_err(|error| format!("invalid subscription URL: {error}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
       return Err("subscription URL must use HTTP or HTTPS".to_string());
     }
-    let mut response = self
-      .access
-      .http
+    let client = self.http_client(options, parsed.scheme()).await?;
+    let headers;
+    let mut response = client
       .get(parsed)
       .send()
       .await
@@ -194,6 +279,7 @@ impl ProfileWorker {
         MAX_PROFILE_BYTES / 1024 / 1024
       ));
     }
+    headers = response.headers().clone();
     let mut content = Vec::new();
     while let Some(chunk) = response
       .chunk()
@@ -208,7 +294,83 @@ impl ProfileWorker {
       }
       content.extend_from_slice(&chunk);
     }
-    Ok(content)
+    if content.starts_with(&[0xef, 0xbb, 0xbf]) {
+      content.drain(..3);
+    }
+    let metadata = parse_subscription_headers(&headers);
+    Ok(DownloadedProfile {
+      content,
+      usage: metadata.usage,
+      home_page: metadata.home_page,
+      suggested_update_interval_minutes: metadata.suggested_update_interval_minutes,
+    })
+  }
+
+  async fn http_client(
+    &self,
+    options: &RemoteProfileOptions,
+    target_scheme: &str,
+  ) -> Result<Client, String> {
+    if options.user_agent.is_none()
+      && options.timeout_seconds == DOWNLOAD_TIMEOUT.as_secs()
+      && options.download_proxy == ProfileDownloadProxy::Direct
+      && !options.accept_invalid_certs
+    {
+      return Ok(self.access.direct_http.clone());
+    }
+
+    let proxy_url = match options.download_proxy {
+      ProfileDownloadProxy::Direct => None,
+      ProfileDownloadProxy::System => {
+        let backend =
+          self.access.system_proxy.as_ref().ok_or_else(|| {
+            "system proxy downloads are not available on this platform".to_string()
+          })?;
+        let snapshot = backend
+          .current()
+          .await
+          .map_err(|error| format!("read system proxy settings: {error}"))?;
+        if !snapshot.enabled || snapshot.mode.as_deref() != Some("manual") {
+          return Err("the system proxy is not configured in manual mode".to_string());
+        }
+        let endpoint = if target_scheme == "https" {
+          snapshot.https_proxy.or(snapshot.http_proxy)
+        } else {
+          snapshot.http_proxy
+        }
+        .ok_or_else(|| format!("the system proxy has no endpoint for {target_scheme}"))?;
+        Some(format!("http://{endpoint}"))
+      },
+      ProfileDownloadProxy::Mihomo => {
+        let store = self.access.store.clone();
+        Some(
+          spawn_blocking(move || mihomo_proxy_url(&store))
+            .await
+            .map_err(|error| format!("Mihomo proxy lookup task failed: {error}"))??,
+        )
+      },
+    };
+
+    let timeout_seconds = options.timeout_seconds;
+    let mut builder = Client::builder()
+      .connect_timeout(Duration::from_secs(timeout_seconds.min(10)))
+      .timeout(Duration::from_secs(timeout_seconds))
+      .redirect(Policy::limited(5))
+      .danger_accept_invalid_certs(options.accept_invalid_certs)
+      .no_proxy();
+    if let Some(user_agent) = options.user_agent.as_deref() {
+      builder = builder.user_agent(user_agent);
+    } else {
+      builder = builder.user_agent(concat!("rsclash/", env!("CARGO_PKG_VERSION")));
+    }
+    if let Some(proxy_url) = proxy_url {
+      let proxy =
+        Proxy::all(&proxy_url).map_err(|error| format!("configure download proxy: {error}"))?;
+      builder = builder.proxy(proxy);
+    }
+    builder
+      .build()
+      .map_err(|error| format!("build subscription HTTP client: {error}"))
   }
 
   async fn update_remote(&self, uid: String) -> Result<(), String> {
@@ -217,10 +379,10 @@ impl ProfileWorker {
     let profile = spawn_blocking(move || remote_profile(&store, &lookup_uid))
       .await
       .map_err(|error| format!("profile lookup task failed: {error}"))??;
-    let content = self.download_remote(&profile.url).await?;
+    let download = self.download_remote(&profile.url, &profile.options).await?;
     let store = self.access.store.clone();
     let replace_uid = uid.clone();
-    let rollback = spawn_blocking(move || replace_profile(&store, &replace_uid, content))
+    let rollback = spawn_blocking(move || replace_profile(&store, &replace_uid, download))
       .await
       .map_err(|error| format!("profile update task failed: {error}"))??;
 
@@ -252,6 +414,10 @@ impl ProfileWorker {
     let uids = spawn_blocking(move || remote_profile_uids(&store))
       .await
       .map_err(|error| format!("profile lookup task failed: {error}"))??;
+    self.update_remote_profiles(uids).await
+  }
+
+  async fn update_remote_profiles(&self, uids: Vec<String>) -> Result<(), String> {
     let mut failures = Vec::new();
     for uid in uids {
       if let Err(error) = self.update_remote(uid.clone()).await {
@@ -267,6 +433,25 @@ impl ProfileWorker {
         failures.join("; ")
       ))
     }
+  }
+
+  async fn update_automatic_profiles(&mut self) {
+    let store = self.access.store.clone();
+    let result = spawn_blocking(move || due_remote_profile_uids(&store, unix_seconds()))
+      .await
+      .map_err(|error| format!("automatic profile lookup task failed: {error}"))
+      .and_then(|result| result);
+    let uids = match result {
+      Ok(uids) if uids.is_empty() => return,
+      Ok(uids) => uids,
+      Err(error) => {
+        self.fail(error).await;
+        return;
+      },
+    };
+    self.set_busy(true).await;
+    let result = self.update_remote_profiles(uids).await;
+    self.finish_operation(result).await;
   }
 
   async fn activate(&self, uid: String) -> Result<(), String> {
@@ -319,12 +504,10 @@ impl ProfileWorker {
   }
 
   async fn finish_operation(&mut self, result: Result<(), String>) {
-    match result {
-      Ok(()) => self.refresh().await,
-      Err(error) => {
-        self.set_busy(false).await;
-        self.fail(error).await;
-      },
+    let error = result.err();
+    self.refresh().await;
+    if let Some(error) = error {
+      self.fail(error).await;
     }
   }
 
@@ -372,7 +555,14 @@ fn import_local(store: &ProfileStore, name: &str, source: &Path) -> Result<(), S
   }
   let content = fs::read(source)
     .map_err(|error| format!("read local profile {}: {error}", source.display()))?;
-  import_content(store, name, ProfileKind::Local, None, content)
+  import_content(
+    store,
+    name,
+    ProfileKind::Local,
+    None,
+    None,
+    DownloadedProfile::from_content(content),
+  )
 }
 
 fn import_content(
@@ -380,10 +570,11 @@ fn import_content(
   name: &str,
   kind: ProfileKind,
   url: Option<String>,
-  content: Vec<u8>,
+  options: Option<RemoteProfileOptions>,
+  download: DownloadedProfile,
 ) -> Result<(), String> {
   validate_profile_name(name)?;
-  validate_source_content(&content)?;
+  validate_source_content(&download.content)?;
   let uid = unique_profile_uid();
   let item = ProfileItem {
     uid: Some(uid.clone()),
@@ -391,12 +582,15 @@ fn import_content(
     name: Some(name.trim().to_string()),
     file: Some(format!("{uid}.yaml")),
     url,
+    extra: download.usage,
+    option: options.as_ref().map(remote_options_to_config),
+    home: download.home_page,
     updated: Some(unix_seconds()),
     ..ProfileItem::default()
   };
   let mut transaction = store.begin().map_err(|error| error.to_string())?;
   transaction
-    .add_profile(item, content)
+    .add_profile(item, download.content)
     .map_err(|error| error.to_string())?;
   transaction.validate().map_err(|error| error.to_string())?;
   transaction.commit().map_err(|error| error.to_string())?;
@@ -406,11 +600,33 @@ fn import_content(
 struct RemoteProfile {
   url: String,
   active: bool,
+  options: RemoteProfileOptions,
+}
+
+struct DownloadedProfile {
+  content: Vec<u8>,
+  usage: Option<SubscriptionInfo>,
+  home_page: Option<String>,
+  suggested_update_interval_minutes: Option<u64>,
+}
+
+impl DownloadedProfile {
+  const fn from_content(content: Vec<u8>) -> Self {
+    Self {
+      content,
+      usage: None,
+      home_page: None,
+      suggested_update_interval_minutes: None,
+    }
+  }
 }
 
 struct ProfileRollback {
   content: Vec<u8>,
   updated_at: Option<u64>,
+  usage: Option<SubscriptionInfo>,
+  home_page: Option<String>,
+  options: Option<ProfileOptions>,
 }
 
 fn remote_profile(store: &ProfileStore, uid: &str) -> Result<RemoteProfile, String> {
@@ -429,6 +645,7 @@ fn remote_profile(store: &ProfileStore, uid: &str) -> Result<RemoteProfile, Stri
   Ok(RemoteProfile {
     url,
     active: catalog.current.as_deref() == Some(uid),
+    options: remote_options_from_config(item.option.as_ref()),
   })
 }
 
@@ -439,6 +656,35 @@ fn remote_profile_uids(store: &ProfileStore) -> Result<Vec<String>, String> {
       .items()
       .iter()
       .filter(|item| item.kind == Some(ProfileKind::Remote))
+      .filter_map(|item| item.uid.clone())
+      .collect(),
+  )
+}
+
+fn due_remote_profile_uids(store: &ProfileStore, now: u64) -> Result<Vec<String>, String> {
+  let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+  Ok(
+    catalog
+      .items()
+      .iter()
+      .filter(|item| item.kind == Some(ProfileKind::Remote))
+      .filter(|item| {
+        let options = item.option.as_ref();
+        if !options
+          .and_then(|options| options.allow_auto_update)
+          .unwrap_or(true)
+        {
+          return false;
+        }
+        let Some(interval_minutes) = options.and_then(|options| options.update_interval) else {
+          return false;
+        };
+        let due_at = item
+          .updated
+          .unwrap_or(0)
+          .saturating_add(interval_minutes.saturating_mul(60));
+        now >= due_at
+      })
       .filter_map(|item| item.uid.clone())
       .collect(),
   )
@@ -563,12 +809,45 @@ fn reorder_profile(store: &ProfileStore, uid: &str, new_index: usize) -> Result<
   Ok(())
 }
 
+fn set_remote_options(
+  store: &ProfileStore,
+  uid: &str,
+  options: &RemoteProfileOptions,
+) -> Result<(), String> {
+  validate_remote_options(options)?;
+  let mut transaction = store.begin().map_err(|error| error.to_string())?;
+  let item = transaction
+    .catalog()
+    .get(uid)
+    .ok_or_else(|| format!("profile {uid} does not exist"))?;
+  if item.kind != Some(ProfileKind::Remote) {
+    return Err(format!("profile {uid} is not a remote subscription"));
+  }
+  let options = options.clone();
+  transaction
+    .edit_catalog(|catalog| {
+      if let Some(item) = catalog
+        .items_mut()
+        .iter_mut()
+        .find(|item| item.uid.as_deref() == Some(uid))
+      {
+        let mut configured = item.option.clone().unwrap_or_default();
+        apply_remote_options(&mut configured, &options);
+        item.option = Some(configured);
+      }
+    })
+    .map_err(|error| error.to_string())?;
+  transaction.validate().map_err(|error| error.to_string())?;
+  transaction.commit().map_err(|error| error.to_string())?;
+  Ok(())
+}
+
 fn replace_profile(
   store: &ProfileStore,
   uid: &str,
-  content: Vec<u8>,
+  download: DownloadedProfile,
 ) -> Result<ProfileRollback, String> {
-  validate_source_content(&content)?;
+  validate_source_content(&download.content)?;
   let catalog = store.load_catalog().map_err(|error| error.to_string())?;
   let item = catalog
     .get(uid)
@@ -582,7 +861,13 @@ fn replace_profile(
       .map_err(|error| error.to_string())?
       .into_bytes(),
     updated_at: item.updated,
+    usage: item.extra,
+    home_page: item.home.clone(),
+    options: item.option.clone(),
   };
+  let suggested_interval = download.suggested_update_interval_minutes;
+  let usage = download.usage;
+  let home_page = download.home_page;
   let mut transaction = store.begin().map_err(|error| error.to_string())?;
   transaction
     .edit_catalog(|catalog| {
@@ -592,11 +877,24 @@ fn replace_profile(
         .find(|item| item.uid.as_deref() == Some(uid))
       {
         item.updated = Some(unix_seconds());
+        item.extra = usage;
+        item.home = home_page;
+        if item
+          .option
+          .as_ref()
+          .is_none_or(|options| options.update_interval.is_none())
+          && let Some(interval) = suggested_interval
+        {
+          item
+            .option
+            .get_or_insert_with(ProfileOptions::default)
+            .update_interval = Some(interval);
+        }
       }
     })
     .map_err(|error| error.to_string())?;
   transaction
-    .stage_profile(uid, content)
+    .stage_profile(uid, download.content)
     .map_err(|error| error.to_string())?;
   transaction.validate().map_err(|error| error.to_string())?;
   transaction.commit().map_err(|error| error.to_string())?;
@@ -620,6 +918,9 @@ fn restore_profile(
         .find(|item| item.uid.as_deref() == Some(uid))
       {
         item.updated = rollback.updated_at;
+        item.extra = rollback.usage;
+        item.home = rollback.home_page;
+        item.option = rollback.options;
       }
     })
     .map_err(|error| error.to_string())?;
@@ -629,6 +930,143 @@ fn restore_profile(
   transaction.validate().map_err(|error| error.to_string())?;
   transaction.commit().map_err(|error| error.to_string())?;
   Ok(())
+}
+
+fn remote_options_from_config(options: Option<&ProfileOptions>) -> RemoteProfileOptions {
+  let options = options.cloned().unwrap_or_default();
+  let download_proxy = if options.self_proxy.unwrap_or(false) {
+    ProfileDownloadProxy::Mihomo
+  } else if options.with_proxy.unwrap_or(false) {
+    ProfileDownloadProxy::System
+  } else {
+    ProfileDownloadProxy::Direct
+  };
+  RemoteProfileOptions {
+    user_agent: options.user_agent,
+    update_interval_minutes: options.update_interval,
+    timeout_seconds: options
+      .timeout_seconds
+      .unwrap_or(DOWNLOAD_TIMEOUT.as_secs()),
+    download_proxy,
+    accept_invalid_certs: options.danger_accept_invalid_certs.unwrap_or(false),
+    allow_auto_update: options.allow_auto_update.unwrap_or(true),
+  }
+}
+
+fn remote_options_to_config(options: &RemoteProfileOptions) -> ProfileOptions {
+  let mut configured = ProfileOptions::default();
+  apply_remote_options(&mut configured, options);
+  configured
+}
+
+fn apply_remote_options(configured: &mut ProfileOptions, options: &RemoteProfileOptions) {
+  configured.user_agent = options
+    .user_agent
+    .as_deref()
+    .map(str::trim)
+    .filter(|user_agent| !user_agent.is_empty())
+    .map(str::to_string);
+  configured.update_interval = options.update_interval_minutes;
+  configured.timeout_seconds = Some(options.timeout_seconds);
+  configured.danger_accept_invalid_certs = Some(options.accept_invalid_certs);
+  configured.allow_auto_update = Some(options.allow_auto_update);
+  configured.with_proxy = Some(options.download_proxy == ProfileDownloadProxy::System);
+  configured.self_proxy = Some(options.download_proxy == ProfileDownloadProxy::Mihomo);
+}
+
+fn normalize_remote_options(options: &mut RemoteProfileOptions) {
+  options.user_agent = options
+    .user_agent
+    .as_deref()
+    .map(str::trim)
+    .filter(|user_agent| !user_agent.is_empty())
+    .map(str::to_string);
+}
+
+fn validate_remote_options(options: &RemoteProfileOptions) -> Result<(), String> {
+  if !(1..=300).contains(&options.timeout_seconds) {
+    return Err("subscription timeout must be between 1 and 300 seconds".to_string());
+  }
+  if options
+    .update_interval_minutes
+    .is_some_and(|minutes| !(1..=525_600).contains(&minutes))
+  {
+    return Err("subscription update interval must be between 1 minute and 1 year".to_string());
+  }
+  if options
+    .user_agent
+    .as_ref()
+    .is_some_and(|user_agent| user_agent.chars().count() > 512)
+  {
+    return Err("subscription User-Agent exceeds 512 characters".to_string());
+  }
+  Ok(())
+}
+
+fn mihomo_proxy_url(store: &ProfileStore) -> Result<String, String> {
+  let source = fs::read_to_string(&store.paths().runtime_config).map_err(|error| {
+    format!(
+      "read runtime config {}: {error}",
+      store.paths().runtime_config.display()
+    )
+  })?;
+  let runtime = MihomoConfig::parse(&source).map_err(|error| error.to_string())?;
+  let port = runtime
+    .get("mixed-port")
+    .and_then(Value::as_u64)
+    .and_then(|port| u16::try_from(port).ok())
+    .filter(|port| *port != 0)
+    .ok_or_else(|| "the runtime config has no valid mixed-port".to_string())?;
+  Ok(format!("http://127.0.0.1:{port}"))
+}
+
+struct SubscriptionHeaders {
+  usage: Option<SubscriptionInfo>,
+  home_page: Option<String>,
+  suggested_update_interval_minutes: Option<u64>,
+}
+
+fn parse_subscription_headers(headers: &HeaderMap) -> SubscriptionHeaders {
+  let usage = headers.iter().find_map(|(name, value)| {
+    let name = name.as_str();
+    let prefix = name.strip_suffix("subscription-userinfo")?;
+    if !prefix.is_empty() && !prefix.ends_with('-') {
+      return None;
+    }
+    let value = value.to_str().ok()?;
+    Some(SubscriptionInfo {
+      upload: parse_header_u64(value, "upload").unwrap_or(0),
+      download: parse_header_u64(value, "download").unwrap_or(0),
+      total: parse_header_u64(value, "total").unwrap_or(0),
+      expire: parse_header_u64(value, "expire").unwrap_or(0),
+    })
+  });
+  let home_page = headers
+    .get("profile-web-page-url")
+    .and_then(|value| value.to_str().ok())
+    .map(str::trim)
+    .filter(|value| !value.is_empty())
+    .map(str::to_string);
+  let suggested_update_interval_minutes = headers
+    .get("profile-update-interval")
+    .and_then(|value| value.to_str().ok())
+    .and_then(|value| value.trim().parse::<u64>().ok())
+    .and_then(|hours| hours.checked_mul(60))
+    .filter(|minutes| *minutes != 0);
+  SubscriptionHeaders {
+    usage,
+    home_page,
+    suggested_update_interval_minutes,
+  }
+}
+
+fn parse_header_u64(value: &str, key: &str) -> Option<u64> {
+  value.split(';').find_map(|field| {
+    let (name, value) = field.trim().split_once('=')?;
+    (name.trim().eq_ignore_ascii_case(key))
+      .then(|| value.trim().parse::<u64>().ok())
+      .flatten()
+  })
 }
 
 fn validate_source_content(content: &[u8]) -> Result<(), String> {
@@ -727,6 +1165,15 @@ fn load_snapshot(store: &ProfileStore) -> Result<ProfilesSnapshot, String> {
         source,
         location: None,
         updated_at: item.updated,
+        home_page: item.home.clone(),
+        usage: item.extra.map(|usage| SubscriptionUsage {
+          upload: usage.upload,
+          download: usage.download,
+          total: usage.total,
+          expire: usage.expire,
+        }),
+        remote_options: (item.kind == Some(ProfileKind::Remote))
+          .then(|| remote_options_from_config(item.option.as_ref())),
       })
     })
     .collect();
@@ -798,8 +1245,9 @@ mod tests {
   };
 
   use super::{
-    ProfileAccess, ProfileWorker, delete_profiles, duplicate_profile, import_content, import_local,
-    load_snapshot, prepare_activation, rename_profile, reorder_profile, set_current_profile,
+    DownloadedProfile, ProfileAccess, ProfileWorker, delete_profiles, due_remote_profile_uids,
+    duplicate_profile, import_content, import_local, load_snapshot, prepare_activation,
+    rename_profile, reorder_profile, set_current_profile, set_remote_options,
   };
 
   static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -875,7 +1323,8 @@ mod tests {
       "Original",
       rsclash_config::ProfileKind::Local,
       None,
-      content.clone(),
+      None,
+      DownloadedProfile::from_content(content.clone()),
     )
     .expect("the profile should import");
     let original_uid = store
@@ -982,13 +1431,14 @@ mod tests {
     let server = tokio::spawn(async move {
       let (mut socket, _) = listener.accept().await.expect("the client should connect");
       let mut request = [0_u8; 1_024];
-      let _ = socket
+      let read = socket
         .read(&mut request)
         .await
         .expect("the request should be readable");
+      assert!(String::from_utf8_lossy(&request[..read]).contains("user-agent: rsclash-test-agent"));
       let body = b"mode: rule\nproxies: []\nproxy-groups: []\nrules: []\n";
       let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nSubscription-Userinfo: upload=1024; download=2048; total=8192; expire=2000000000\r\nProfile-Update-Interval: 6\r\nProfile-Web-Page-Url: https://portal.example.com/\r\nConnection: close\r\n\r\n",
         body.len()
       );
       socket
@@ -1004,11 +1454,16 @@ mod tests {
       .expect("profile access should build");
     let (event_tx, _event_rx) = mpsc::channel(4);
     let worker = ProfileWorker::new(access, Arc::new(NoopActivator), event_tx);
+    let options = rsclash_domain::RemoteProfileOptions {
+      user_agent: Some("rsclash-test-agent".to_string()),
+      ..rsclash_domain::RemoteProfileOptions::default()
+    };
 
     worker
       .import_remote(
         "Remote test".to_string(),
         format!("http://{address}/subscription?token=secret"),
+        options,
       )
       .await
       .expect("the remote profile should import");
@@ -1018,6 +1473,55 @@ mod tests {
     assert_eq!(
       catalog.items()[0].kind,
       Some(rsclash_config::ProfileKind::Remote)
+    );
+    assert_eq!(
+      catalog.items()[0].extra,
+      Some(rsclash_config::SubscriptionInfo {
+        upload: 1_024,
+        download: 2_048,
+        total: 8_192,
+        expire: 2_000_000_000,
+      })
+    );
+    assert_eq!(
+      catalog.items()[0].home.as_deref(),
+      Some("https://portal.example.com/")
+    );
+    let options = catalog.items()[0]
+      .option
+      .as_ref()
+      .expect("remote options should be stored");
+    assert_eq!(options.user_agent.as_deref(), Some("rsclash-test-agent"));
+    assert_eq!(options.update_interval, Some(360));
+    let uid = catalog.items()[0]
+      .uid
+      .as_deref()
+      .expect("the remote profile should have a UID");
+    let updated = catalog.items()[0]
+      .updated
+      .expect("the remote profile should have an update time");
+    assert!(
+      due_remote_profile_uids(&store, updated + 360 * 60 - 1)
+        .expect("the automatic update schedule should load")
+        .is_empty()
+    );
+    assert_eq!(
+      due_remote_profile_uids(&store, updated + 360 * 60)
+        .expect("the automatic update schedule should load"),
+      vec![uid.to_string()]
+    );
+
+    let disabled = rsclash_domain::RemoteProfileOptions {
+      user_agent: Some("replacement-agent".to_string()),
+      update_interval_minutes: Some(5),
+      allow_auto_update: false,
+      ..rsclash_domain::RemoteProfileOptions::default()
+    };
+    set_remote_options(&store, uid, &disabled).expect("the remote options should update");
+    assert!(
+      due_remote_profile_uids(&store, u64::MAX)
+        .expect("the disabled automatic update schedule should load")
+        .is_empty()
     );
   }
 
@@ -1061,7 +1565,8 @@ mod tests {
       "Remote",
       rsclash_config::ProfileKind::Remote,
       Some(format!("http://{address}/subscription")),
-      old_content.to_vec(),
+      Some(rsclash_domain::RemoteProfileOptions::default()),
+      DownloadedProfile::from_content(old_content.to_vec()),
     )
     .expect("the remote profile should import");
     let catalog = store.load_catalog().expect("the catalog should load");

@@ -5,13 +5,15 @@ mod theme;
 use std::{
   collections::{BTreeMap, BTreeSet},
   sync::Arc,
+  time::{SystemTime, UNIX_EPOCH},
 };
 
 use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, Stroke, Ui};
 use rsclash_app::{AppClient, AppEventReceiver, ClientError};
 use rsclash_domain::{
   AppSnapshot, AppStatus, CoreChannel, CoreRunMode, CoreState, MihomoConnection, Page,
-  ProfileSourceKind, ProxyGroupSnapshot, ProxyMode, ThemeMode, UiCommand,
+  ProfileDownloadProxy, ProfileSourceKind, ProxyGroupSnapshot, ProxyMode, RemoteProfileOptions,
+  ThemeMode, UiCommand,
 };
 
 pub struct RsClashUi {
@@ -26,12 +28,15 @@ pub struct RsClashUi {
   local_profile_path: String,
   remote_profile_name: String,
   remote_profile_url: String,
+  remote_profile_options: RemoteProfileOptions,
   renaming_profile: Option<String>,
   profile_name_edits: BTreeMap<String, String>,
   pending_profile_delete: Option<String>,
   profile_batch_mode: bool,
   selected_profiles: BTreeSet<String>,
   pending_batch_delete: bool,
+  editing_profile_options: Option<String>,
+  profile_options_edits: BTreeMap<String, RemoteProfileOptions>,
 }
 
 impl RsClashUi {
@@ -52,12 +57,15 @@ impl RsClashUi {
       local_profile_path: String::new(),
       remote_profile_name: String::new(),
       remote_profile_url: String::new(),
+      remote_profile_options: RemoteProfileOptions::default(),
       renaming_profile: None,
       profile_name_edits: BTreeMap::new(),
       pending_profile_delete: None,
       profile_batch_mode: false,
       selected_profiles: BTreeSet::new(),
       pending_batch_delete: false,
+      editing_profile_options: None,
+      profile_options_edits: BTreeMap::new(),
     }
   }
 
@@ -561,6 +569,9 @@ impl RsClashUi {
             .password(true)
             .hint_text("https://example.com/subscription"),
         );
+        ui.collapsing("下载选项", |ui| {
+          remote_profile_options_editor(ui, &mut self.remote_profile_options);
+        });
         if ui
           .add_enabled(!profiles.busy, egui::Button::new("下载并导入"))
           .clicked()
@@ -568,6 +579,7 @@ impl RsClashUi {
           self.command(UiCommand::ImportRemoteProfile {
             name: self.remote_profile_name.trim().to_string(),
             url: self.remote_profile_url.trim().to_string(),
+            options: self.remote_profile_options.clone(),
           });
         }
       });
@@ -673,6 +685,37 @@ impl RsClashUi {
             );
           }
         });
+        if let Some(usage) = profile.usage {
+          let used = usage.upload.saturating_add(usage.download);
+          ui.label(
+            RichText::new(format!(
+              "流量：{} / {} · 到期时间：{}",
+              format_bytes(used),
+              format_bytes(usage.total),
+              if usage.expire == 0 {
+                "未提供".to_string()
+              } else {
+                usage.expire.to_string()
+              }
+            ))
+            .small()
+            .weak(),
+          );
+        }
+        if let Some(updated_at) = profile.updated_at {
+          ui.label(
+            RichText::new(format!("最近更新：{}", format_update_age(updated_at)))
+              .small()
+              .weak(),
+          );
+        }
+        if let Some(home_page) = profile.home_page.as_deref() {
+          ui.label(
+            RichText::new(format!("订阅主页：{home_page}"))
+              .small()
+              .weak(),
+          );
+        }
         if self.profile_batch_mode {
           return;
         }
@@ -707,6 +750,38 @@ impl RsClashUi {
           }
         }
 
+        if self.editing_profile_options.as_deref() == Some(profile.uid.as_str())
+          && let Some(original) = profile.remote_options.as_ref()
+        {
+          let edit = self
+            .profile_options_edits
+            .entry(profile.uid.clone())
+            .or_insert_with(|| original.clone());
+          remote_profile_options_editor(ui, edit);
+          let mut save = false;
+          let mut cancel = false;
+          ui.horizontal(|ui| {
+            save = ui
+              .add_enabled(!profiles.busy, egui::Button::new("保存下载设置"))
+              .clicked();
+            cancel = ui.button("取消").clicked();
+          });
+          if save {
+            let options = self
+              .profile_options_edits
+              .get(&profile.uid)
+              .cloned()
+              .unwrap_or_default();
+            self.command(UiCommand::SetRemoteProfileOptions {
+              uid: profile.uid.clone(),
+              options,
+            });
+            self.editing_profile_options = None;
+          } else if cancel {
+            self.editing_profile_options = None;
+          }
+        }
+
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
           let source_profile = matches!(
@@ -736,6 +811,16 @@ impl RsClashUi {
             self.command(UiCommand::UpdateProfile {
               uid: profile.uid.clone(),
             });
+          }
+          if let Some(options) = profile.remote_options.as_ref()
+            && ui
+              .add_enabled(!profiles.busy, egui::Button::new("下载设置"))
+              .clicked()
+          {
+            self
+              .profile_options_edits
+              .insert(profile.uid.clone(), options.clone());
+            self.editing_profile_options = Some(profile.uid.clone());
           }
           if ui
             .add_enabled(
@@ -943,6 +1028,84 @@ impl RsClashUi {
     if let Err(error) = self.client.try_command(command) {
       self.local_error = Some(client_error_message(&error));
     }
+  }
+}
+
+fn remote_profile_options_editor(ui: &mut Ui, options: &mut RemoteProfileOptions) {
+  ui.horizontal(|ui| {
+    ui.label("User-Agent");
+    ui.add(
+      egui::TextEdit::singleline(options.user_agent.get_or_insert_with(String::new))
+        .hint_text(concat!("rsclash/", env!("CARGO_PKG_VERSION"))),
+    );
+  });
+  ui.horizontal(|ui| {
+    ui.label("HTTP 超时");
+    ui.add(
+      egui::DragValue::new(&mut options.timeout_seconds)
+        .range(1..=300)
+        .suffix(" 秒"),
+    );
+  });
+  ui.horizontal(|ui| {
+    let mut scheduled = options.update_interval_minutes.is_some();
+    if ui.checkbox(&mut scheduled, "定时自动更新").changed() {
+      options.update_interval_minutes = scheduled.then_some(1_440);
+    }
+    if let Some(interval) = options.update_interval_minutes.as_mut() {
+      ui.add(
+        egui::DragValue::new(interval)
+          .range(1..=525_600)
+          .suffix(" 分钟"),
+      );
+    }
+  });
+  ui.horizontal(|ui| {
+    ui.label("下载代理");
+    egui::ComboBox::from_id_salt(("profile-download-proxy", ui.id()))
+      .selected_text(match options.download_proxy {
+        ProfileDownloadProxy::Direct => "直连",
+        ProfileDownloadProxy::System => "系统代理",
+        ProfileDownloadProxy::Mihomo => "Mihomo 代理",
+      })
+      .show_ui(ui, |ui| {
+        ui.selectable_value(
+          &mut options.download_proxy,
+          ProfileDownloadProxy::Direct,
+          "直连",
+        );
+        ui.selectable_value(
+          &mut options.download_proxy,
+          ProfileDownloadProxy::System,
+          "系统代理",
+        );
+        ui.selectable_value(
+          &mut options.download_proxy,
+          ProfileDownloadProxy::Mihomo,
+          "Mihomo 代理",
+        );
+      });
+  });
+  ui.checkbox(
+    &mut options.accept_invalid_certs,
+    "接受无效 TLS 证书（不安全）",
+  );
+  ui.checkbox(&mut options.allow_auto_update, "允许定时自动更新");
+}
+
+fn format_update_age(updated_at: u64) -> String {
+  let now = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs();
+  let Some(age) = now.checked_sub(updated_at) else {
+    return "时间异常".to_string();
+  };
+  match age {
+    0..=59 => "刚刚".to_string(),
+    60..=3_599 => format!("{} 分钟前", age / 60),
+    3_600..=86_399 => format!("{} 小时前", age / 3_600),
+    _ => format!("{} 天前", age / 86_400),
   }
 }
 

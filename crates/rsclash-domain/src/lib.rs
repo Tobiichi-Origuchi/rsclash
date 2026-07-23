@@ -205,6 +205,46 @@ pub enum ProfileSourceKind {
   Other,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProfileDownloadProxy {
+  #[default]
+  Direct,
+  System,
+  Mihomo,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RemoteProfileOptions {
+  pub user_agent: Option<String>,
+  pub update_interval_minutes: Option<u64>,
+  pub timeout_seconds: u64,
+  pub download_proxy: ProfileDownloadProxy,
+  pub accept_invalid_certs: bool,
+  pub allow_auto_update: bool,
+}
+
+impl Default for RemoteProfileOptions {
+  fn default() -> Self {
+    Self {
+      user_agent: None,
+      update_interval_minutes: None,
+      timeout_seconds: 30,
+      download_proxy: ProfileDownloadProxy::Direct,
+      accept_invalid_certs: false,
+      allow_auto_update: true,
+    }
+  }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SubscriptionUsage {
+  pub upload: u64,
+  pub download: u64,
+  pub total: u64,
+  pub expire: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProfileSummary {
   pub uid: String,
@@ -212,6 +252,9 @@ pub struct ProfileSummary {
   pub source: ProfileSourceKind,
   pub location: Option<String>,
   pub updated_at: Option<u64>,
+  pub home_page: Option<String>,
+  pub usage: Option<SubscriptionUsage>,
+  pub remote_options: Option<RemoteProfileOptions>,
   pub active: bool,
 }
 
@@ -284,17 +327,45 @@ pub enum UiCommand {
   RestartCore(CoreChannel),
   ReloadCore,
   RefreshMihomo,
-  SelectProxy { group: String, proxy: String },
+  SelectProxy {
+    group: String,
+    proxy: String,
+  },
   SetProxyMode(ProxyMode),
   RefreshProfiles,
-  ImportLocalProfile { name: String, path: String },
-  ImportRemoteProfile { name: String, url: String },
-  ActivateProfile { uid: String },
-  RenameProfile { uid: String, name: String },
-  DuplicateProfile { uid: String },
-  DeleteProfiles { uids: Vec<String> },
-  ReorderProfile { uid: String, new_index: usize },
-  UpdateProfile { uid: String },
+  ImportLocalProfile {
+    name: String,
+    path: String,
+  },
+  ImportRemoteProfile {
+    name: String,
+    url: String,
+    options: RemoteProfileOptions,
+  },
+  ActivateProfile {
+    uid: String,
+  },
+  RenameProfile {
+    uid: String,
+    name: String,
+  },
+  DuplicateProfile {
+    uid: String,
+  },
+  DeleteProfiles {
+    uids: Vec<String>,
+  },
+  ReorderProfile {
+    uid: String,
+    new_index: usize,
+  },
+  SetRemoteProfileOptions {
+    uid: String,
+    options: RemoteProfileOptions,
+  },
+  UpdateProfile {
+    uid: String,
+  },
   UpdateAllProfiles,
   RefreshSystemProxy,
   SetSystemProxy(bool),

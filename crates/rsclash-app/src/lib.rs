@@ -615,10 +615,11 @@ impl Coordinator {
           path,
         }))
       },
-      UiCommand::ImportRemoteProfile { name, url } => {
+      UiCommand::ImportRemoteProfile { name, url, options } => {
         self.dispatch_profile(ProfileBridgeCommand::Import(ProfileImportCommand::Remote {
           name,
           url,
+          options,
         }))
       },
       UiCommand::ActivateProfile { uid } => {
@@ -635,6 +636,9 @@ impl Coordinator {
       )),
       UiCommand::ReorderProfile { uid, new_index } => self.dispatch_profile(
         ProfileBridgeCommand::Mutate(ProfileMutationCommand::Reorder { uid, new_index }),
+      ),
+      UiCommand::SetRemoteProfileOptions { uid, options } => self.dispatch_profile(
+        ProfileBridgeCommand::Mutate(ProfileMutationCommand::SetRemoteOptions { uid, options }),
       ),
       UiCommand::UpdateProfile { uid } => {
         self.dispatch_profile(ProfileBridgeCommand::Update(ProfileUpdateCommand::One {
