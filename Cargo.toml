@@ -123,8 +123,8 @@ useless_let_if_seq = "deny"
 wildcard_imports = "deny"
 
 [profile.release]
+opt-level = "z"
+lto = "fat"
 codegen-units = 1
-lto = "thin"
-opt-level = 3
-panic = "unwind"
+panic = "abort"
 strip = "symbols"
