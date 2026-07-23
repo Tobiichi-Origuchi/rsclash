@@ -30,6 +30,9 @@ pub struct MihomoClient {
 
 impl MihomoClient {
   pub fn new(config: ControllerConfig) -> Result<Self> {
+    #[cfg(feature = "rustls-ring")]
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let (builder, base_url, sends_authorization) = match &config.endpoint {
       ControllerEndpoint::Http { host, port } => {
         if host.trim().is_empty() || host.contains('/') {
