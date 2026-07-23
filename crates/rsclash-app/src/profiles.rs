@@ -18,7 +18,7 @@ use rsclash_config::{
 };
 use rsclash_domain::{
   ProfileDownloadProxy, ProfileSourceKind, ProfileSummary, ProfilesSnapshot, RemoteProfileOptions,
-  SubscriptionUsage,
+  SensitiveString, SubscriptionUsage,
 };
 use rsclash_platform::SystemProxyBackend;
 use serde_yaml_ng::Value;
@@ -73,6 +73,7 @@ pub(crate) enum ProfileBridgeCommand {
   Activate { uid: String },
   Mutate(ProfileMutationCommand),
   Update(ProfileUpdateCommand),
+  Content(ProfileContentCommand),
 }
 
 #[derive(Clone, Debug)]
@@ -116,9 +117,27 @@ pub(crate) enum ProfileUpdateCommand {
   All,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ProfileContentCommand {
+  Load {
+    uid: String,
+  },
+  Save {
+    uid: String,
+    content: SensitiveString,
+  },
+}
+
 pub(crate) enum ProfileBridgeEvent {
   Snapshot(ProfilesSnapshot),
   RuntimeChanged,
+  ContentLoaded {
+    uid: String,
+    content: SensitiveString,
+  },
+  ContentSaved {
+    uid: String,
+  },
   CommandFailed(String),
 }
 
@@ -189,6 +208,52 @@ impl ProfileWorker {
           ProfileUpdateCommand::All => self.update_all_remote().await,
         };
         self.finish_operation(result).await;
+      },
+      ProfileBridgeCommand::Content(command) => {
+        self.set_busy(true).await;
+        let result = self.content(command).await;
+        if let Ok(event) = &result {
+          match event {
+            ProfileContentResult::Loaded { uid, content } => {
+              let _ = self
+                .event_tx
+                .send(ProfileBridgeEvent::ContentLoaded {
+                  uid: uid.clone(),
+                  content: content.clone(),
+                })
+                .await;
+            },
+            ProfileContentResult::Saved { uid } => {
+              let _ = self
+                .event_tx
+                .send(ProfileBridgeEvent::ContentSaved { uid: uid.clone() })
+                .await;
+            },
+          }
+        }
+        self.finish_operation(result.map(|_| ())).await;
+      },
+    }
+  }
+
+  async fn content(&self, command: ProfileContentCommand) -> Result<ProfileContentResult, String> {
+    match command {
+      ProfileContentCommand::Load { uid } => {
+        let store = self.access.store.clone();
+        let loaded_uid = uid.clone();
+        let content = spawn_blocking(move || load_profile_content(&store, &loaded_uid))
+          .await
+          .map_err(|error| format!("profile read task failed: {error}"))??;
+        Ok(ProfileContentResult::Loaded {
+          uid,
+          content: SensitiveString::new(content),
+        })
+      },
+      ProfileContentCommand::Save { uid, content } => {
+        self
+          .save_profile_content(uid.clone(), content.into_inner())
+          .await?;
+        Ok(ProfileContentResult::Saved { uid })
       },
     }
   }
@@ -454,6 +519,63 @@ impl ProfileWorker {
     self.finish_operation(result).await;
   }
 
+  async fn save_profile_content(&self, uid: String, content: String) -> Result<(), String> {
+    if content.len() > MAX_PROFILE_BYTES {
+      return Err(format!(
+        "profile exceeds the {} MiB limit",
+        MAX_PROFILE_BYTES / 1024 / 1024
+      ));
+    }
+    let store = self.access.store.clone();
+    let save_uid = uid.clone();
+    let prepared =
+      spawn_blocking(move || replace_editable_profile(&store, &save_uid, content.into_bytes()))
+        .await
+        .map_err(|error| format!("profile save task failed: {error}"))??;
+    let active_changed = prepared.active_uid.is_some();
+    let validation = if let Some(active_uid) = prepared.active_uid {
+      self.activate(active_uid).await
+    } else if let Some(validation_uid) = prepared.validation_uid {
+      self.validate_profile_runtime(validation_uid).await
+    } else {
+      Ok(())
+    };
+    if let Err(save_error) = validation {
+      let store = self.access.store.clone();
+      let restore_uid = uid;
+      let restore =
+        spawn_blocking(move || restore_profile(&store, &restore_uid, prepared.rollback))
+          .await
+          .map_err(|error| format!("profile restore task failed: {error}"))
+          .and_then(|result| result);
+      return match restore {
+        Ok(()) => Err(format!(
+          "activate edited profile: {save_error}; the previous file was restored"
+        )),
+        Err(restore_error) => Err(format!(
+          "activate edited profile: {save_error}; restore previous file: {restore_error}"
+        )),
+      };
+    }
+    if active_changed {
+      let _ = self.event_tx.send(ProfileBridgeEvent::RuntimeChanged).await;
+    }
+    Ok(())
+  }
+
+  async fn validate_profile_runtime(&self, uid: String) -> Result<(), String> {
+    let store = self.access.store.clone();
+    let prepared = spawn_blocking(move || prepare_activation(&store, &uid))
+      .await
+      .map_err(|error| format!("profile preparation task failed: {error}"))??;
+    let runtime_store =
+      RuntimeStore::open(&prepared.runtime_path).map_err(|error| error.to_string())?;
+    runtime_store
+      .validate_config(&prepared.next_runtime, self.access.validator.as_ref())
+      .await
+      .map_err(|error| format!("validate edited profile runtime: {error}"))
+  }
+
   async fn activate(&self, uid: String) -> Result<(), String> {
     let store = self.access.store.clone();
     let prepared = spawn_blocking(move || prepare_activation(&store, &uid))
@@ -531,6 +653,16 @@ impl ProfileWorker {
       .send(ProfileBridgeEvent::Snapshot(self.snapshot.clone()))
       .await;
   }
+}
+
+enum ProfileContentResult {
+  Loaded {
+    uid: String,
+    content: SensitiveString,
+  },
+  Saved {
+    uid: String,
+  },
 }
 
 struct PreparedActivation {
@@ -842,6 +974,117 @@ fn set_remote_options(
   Ok(())
 }
 
+struct PreparedProfileEdit {
+  rollback: ProfileRollback,
+  active_uid: Option<String>,
+  validation_uid: Option<String>,
+}
+
+fn load_profile_content(store: &ProfileStore, uid: &str) -> Result<String, String> {
+  let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+  let item = catalog
+    .get(uid)
+    .ok_or_else(|| format!("profile {uid} does not exist"))?;
+  ensure_editable_profile(item)?;
+  let content = store
+    .read_profile(item.require_file().map_err(|error| error.to_string())?)
+    .map_err(|error| error.to_string())?;
+  if content.len() > MAX_PROFILE_BYTES {
+    return Err(format!(
+      "profile exceeds the {} MiB editor limit",
+      MAX_PROFILE_BYTES / 1024 / 1024
+    ));
+  }
+  Ok(content)
+}
+
+fn replace_editable_profile(
+  store: &ProfileStore,
+  uid: &str,
+  content: Vec<u8>,
+) -> Result<PreparedProfileEdit, String> {
+  validate_source_content(&content)?;
+  let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+  let item = catalog
+    .get(uid)
+    .ok_or_else(|| format!("profile {uid} does not exist"))?;
+  ensure_editable_profile(item)?;
+  let rollback = profile_rollback(store, item)?;
+  let validation_uid = item.is_source().then(|| uid.to_string());
+  let active_uid = catalog
+    .current
+    .as_ref()
+    .filter(|active_uid| profile_affects_active_runtime(&catalog, uid, active_uid))
+    .cloned();
+  let mut transaction = store.begin().map_err(|error| error.to_string())?;
+  transaction
+    .edit_catalog(|catalog| {
+      if let Some(item) = catalog
+        .items_mut()
+        .iter_mut()
+        .find(|item| item.uid.as_deref() == Some(uid))
+      {
+        item.updated = Some(unix_seconds());
+      }
+    })
+    .map_err(|error| error.to_string())?;
+  transaction
+    .stage_profile(uid, content)
+    .map_err(|error| error.to_string())?;
+  transaction.validate().map_err(|error| error.to_string())?;
+  transaction.commit().map_err(|error| error.to_string())?;
+  Ok(PreparedProfileEdit {
+    rollback,
+    active_uid,
+    validation_uid,
+  })
+}
+
+fn ensure_editable_profile(item: &ProfileItem) -> Result<(), String> {
+  if matches!(
+    item.kind.as_ref(),
+    Some(
+      ProfileKind::Remote
+        | ProfileKind::Local
+        | ProfileKind::Merge
+        | ProfileKind::Rules
+        | ProfileKind::Proxies
+        | ProfileKind::Groups
+    )
+  ) {
+    Ok(())
+  } else {
+    Err(format!(
+      "profile {} does not support YAML editing",
+      item.uid.as_deref().unwrap_or("unknown")
+    ))
+  }
+}
+
+fn profile_affects_active_runtime(
+  catalog: &ProfileCatalog,
+  edited_uid: &str,
+  active_uid: &str,
+) -> bool {
+  if edited_uid == active_uid || edited_uid == "Merge" {
+    return true;
+  }
+  catalog
+    .get(active_uid)
+    .and_then(|item| item.option.as_ref())
+    .is_some_and(|options| {
+      [
+        options.merge.as_deref(),
+        options.rules.as_deref(),
+        options.proxies.as_deref(),
+        options.groups.as_deref(),
+      ]
+      .into_iter()
+      .flatten()
+      .any(|uid| uid == edited_uid)
+    })
+}
+
 fn replace_profile(
   store: &ProfileStore,
   uid: &str,
@@ -855,16 +1098,7 @@ fn replace_profile(
   if item.kind != Some(ProfileKind::Remote) {
     return Err(format!("profile {uid} is not a remote subscription"));
   }
-  let previous = ProfileRollback {
-    content: store
-      .read_profile(item.require_file().map_err(|error| error.to_string())?)
-      .map_err(|error| error.to_string())?
-      .into_bytes(),
-    updated_at: item.updated,
-    usage: item.extra,
-    home_page: item.home.clone(),
-    options: item.option.clone(),
-  };
+  let previous = profile_rollback(store, item)?;
   let suggested_interval = download.suggested_update_interval_minutes;
   let usage = download.usage;
   let home_page = download.home_page;
@@ -899,6 +1133,19 @@ fn replace_profile(
   transaction.validate().map_err(|error| error.to_string())?;
   transaction.commit().map_err(|error| error.to_string())?;
   Ok(previous)
+}
+
+fn profile_rollback(store: &ProfileStore, item: &ProfileItem) -> Result<ProfileRollback, String> {
+  Ok(ProfileRollback {
+    content: store
+      .read_profile(item.require_file().map_err(|error| error.to_string())?)
+      .map_err(|error| error.to_string())?
+      .into_bytes(),
+    updated_at: item.updated,
+    usage: item.extra,
+    home_page: item.home.clone(),
+    options: item.option.clone(),
+  })
 }
 
 fn restore_profile(
@@ -1790,6 +2037,21 @@ mod tests {
     assert_eq!(
       catalog.get(&uid).and_then(|item| item.updated),
       previous_updated
+    );
+
+    let edited =
+      "mode: rule\nproxies:\n- name: Edited\n  type: direct\nproxy-groups: []\nrules: []\n";
+    let error = worker
+      .save_profile_content(uid.clone(), edited.to_string())
+      .await
+      .expect_err("runtime validation should reject the edited profile");
+    assert!(error.contains("previous file was restored"));
+    assert_eq!(
+      store
+        .read_profile(&file)
+        .expect("the editor rollback should be readable")
+        .as_bytes(),
+      old_content
     );
   }
 

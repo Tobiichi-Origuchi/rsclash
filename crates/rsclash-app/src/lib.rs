@@ -34,8 +34,8 @@ pub use system_proxy::SystemProxyAccess;
 
 use mihomo::{MihomoBridgeCommand, MihomoBridgeEvent, run_mihomo_worker};
 use profiles::{
-  ProfileBridgeCommand, ProfileBridgeEvent, ProfileImportCommand, ProfileMutationCommand,
-  ProfileUpdateCommand, run_profile_worker,
+  ProfileBridgeCommand, ProfileBridgeEvent, ProfileContentCommand, ProfileImportCommand,
+  ProfileMutationCommand, ProfileUpdateCommand, run_profile_worker,
 };
 use system_proxy::{SystemProxyBridgeCommand, SystemProxyBridgeEvent, run_system_proxy_worker};
 
@@ -640,6 +640,17 @@ impl Coordinator {
       UiCommand::SetRemoteProfileOptions { uid, options } => self.dispatch_profile(
         ProfileBridgeCommand::Mutate(ProfileMutationCommand::SetRemoteOptions { uid, options }),
       ),
+      UiCommand::LoadProfileContent { uid } => {
+        self.dispatch_profile(ProfileBridgeCommand::Content(ProfileContentCommand::Load {
+          uid,
+        }))
+      },
+      UiCommand::SaveProfileContent { uid, content } => {
+        self.dispatch_profile(ProfileBridgeCommand::Content(ProfileContentCommand::Save {
+          uid,
+          content,
+        }))
+      },
       UiCommand::UpdateProfile { uid } => {
         self.dispatch_profile(ProfileBridgeCommand::Update(ProfileUpdateCommand::One {
           uid,
@@ -898,6 +909,12 @@ impl Coordinator {
         if let Some(command_tx) = &self.mihomo_command_tx {
           let _ = command_tx.try_send(MihomoBridgeCommand::Refresh);
         }
+      },
+      ProfileBridgeEvent::ContentLoaded { uid, content } => {
+        self.emit(AppEvent::ProfileContentLoaded { uid, content });
+      },
+      ProfileBridgeEvent::ContentSaved { uid } => {
+        self.emit(AppEvent::ProfileContentSaved { uid });
       },
       ProfileBridgeEvent::CommandFailed(message) => {
         self.snapshot.last_error = Some(ErrorView {

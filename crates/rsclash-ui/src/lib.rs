@@ -4,6 +4,7 @@ mod theme;
 
 use std::{
   collections::{BTreeMap, BTreeSet},
+  hash::{DefaultHasher, Hash as _, Hasher as _},
   sync::Arc,
   time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,10 +12,26 @@ use std::{
 use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, Stroke, Ui};
 use rsclash_app::{AppClient, AppEventReceiver, ClientError};
 use rsclash_domain::{
-  AppSnapshot, AppStatus, CoreChannel, CoreRunMode, CoreState, MihomoConnection, Page,
+  AppEvent, AppSnapshot, AppStatus, CoreChannel, CoreRunMode, CoreState, MihomoConnection, Page,
   ProfileDownloadProxy, ProfileSourceKind, ProxyGroupSnapshot, ProxyMode, RemoteProfileOptions,
-  ThemeMode, UiCommand,
+  SensitiveString, ThemeMode, UiCommand,
 };
+
+struct ProfileEditor {
+  uid: String,
+  name: String,
+  content: String,
+  dirty: bool,
+  highlighter: YamlHighlightCache,
+}
+
+#[derive(Default)]
+struct YamlHighlightCache {
+  source_hash: u64,
+  dark_mode: bool,
+  initialized: bool,
+  job: egui::text::LayoutJob,
+}
 
 pub struct RsClashUi {
   client: AppClient,
@@ -37,6 +54,8 @@ pub struct RsClashUi {
   pending_batch_delete: bool,
   editing_profile_options: Option<String>,
   profile_options_edits: BTreeMap<String, RemoteProfileOptions>,
+  profile_editor: Option<ProfileEditor>,
+  pending_editor_close: bool,
 }
 
 impl RsClashUi {
@@ -66,6 +85,8 @@ impl RsClashUi {
       pending_batch_delete: false,
       editing_profile_options: None,
       profile_options_edits: BTreeMap::new(),
+      profile_editor: None,
+      pending_editor_close: false,
     }
   }
 
@@ -75,7 +96,37 @@ impl RsClashUi {
       self.snapshot = snapshot;
     }
 
-    while self.events.try_recv().is_some() {}
+    while let Some(event) = self.events.try_recv() {
+      match event {
+        AppEvent::ProfileContentLoaded { uid, content } => {
+          let name = self
+            .snapshot
+            .profiles
+            .items
+            .iter()
+            .find(|profile| profile.uid == uid)
+            .map_or_else(|| uid.clone(), |profile| profile.name.clone());
+          self.profile_editor = Some(ProfileEditor {
+            uid,
+            name,
+            content: content.into_inner(),
+            dirty: false,
+            highlighter: YamlHighlightCache::default(),
+          });
+          self.pending_editor_close = false;
+        },
+        AppEvent::ProfileContentSaved { uid } => {
+          if let Some(editor) = self
+            .profile_editor
+            .as_mut()
+            .filter(|editor| editor.uid == uid)
+          {
+            editor.dirty = false;
+          }
+        },
+        _ => {},
+      }
+    }
 
     if self.applied_theme != Some(self.snapshot.theme) {
       theme::apply_preference(context, self.snapshot.theme);
@@ -545,6 +596,11 @@ impl RsClashUi {
     });
     ui.add_space(16.0);
 
+    if self.profile_editor.is_some() {
+      self.profile_yaml_editor(ui, profiles.busy);
+      ui.add_space(16.0);
+    }
+
     ui.columns(2, |columns| {
       card(&mut columns[0], "导入本地配置", |ui| {
         ui.add(egui::TextEdit::singleline(&mut self.local_profile_name).hint_text("配置名称"));
@@ -825,6 +881,17 @@ impl RsClashUi {
           if ui
             .add_enabled(
               !profiles.busy && profile.source != ProfileSourceKind::Other,
+              egui::Button::new("编辑 YAML"),
+            )
+            .clicked()
+          {
+            self.command(UiCommand::LoadProfileContent {
+              uid: profile.uid.clone(),
+            });
+          }
+          if ui
+            .add_enabled(
+              !profiles.busy && profile.source != ProfileSourceKind::Other,
               egui::Button::new("复制"),
             )
             .clicked()
@@ -893,6 +960,92 @@ impl RsClashUi {
         });
       });
       ui.add_space(10.0);
+    }
+  }
+
+  fn profile_yaml_editor(&mut self, ui: &mut Ui, busy: bool) {
+    let mut save = None;
+    let mut close = false;
+    let mut cancel_close = false;
+    if let Some(editor) = self.profile_editor.as_mut() {
+      card(ui, &format!("YAML 编辑器 · {}", editor.name), |ui| {
+        ui.label(
+          RichText::new("保存前会创建快照并重新生成、校验受影响的运行配置。")
+            .small()
+            .weak(),
+        );
+        let dark_mode = ui.visuals().dark_mode;
+        let ProfileEditor {
+          uid,
+          content,
+          dirty,
+          highlighter,
+          ..
+        } = editor;
+        let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap_width: f32| {
+          let mut job = highlighter.layout(buffer.as_str(), dark_mode);
+          job.wrap.max_width = wrap_width;
+          ui.fonts_mut(|fonts| fonts.layout_job(job))
+        };
+        let response = ui.add_enabled(
+          !busy,
+          egui::TextEdit::multiline(content)
+            .code_editor()
+            .desired_rows(24)
+            .desired_width(f32::INFINITY)
+            .layouter(&mut layouter),
+        );
+        if response.changed() {
+          *dirty = true;
+          self.pending_editor_close = false;
+        }
+        ui.horizontal(|ui| {
+          if ui
+            .add_enabled(!busy && *dirty, egui::Button::new("保存并校验"))
+            .clicked()
+          {
+            save = Some((uid.clone(), content.clone()));
+          }
+          let close_label = if self.pending_editor_close && *dirty {
+            "确认放弃修改"
+          } else {
+            "关闭编辑器"
+          };
+          if ui
+            .add_enabled(!busy, egui::Button::new(close_label))
+            .clicked()
+          {
+            if *dirty && !self.pending_editor_close {
+              self.pending_editor_close = true;
+            } else {
+              close = true;
+            }
+          }
+          if self.pending_editor_close
+            && *dirty
+            && ui
+              .add_enabled(!busy, egui::Button::new("继续编辑"))
+              .clicked()
+          {
+            cancel_close = true;
+          }
+          if busy {
+            ui.spinner();
+          }
+        });
+      });
+    }
+    if let Some((uid, content)) = save {
+      self.command(UiCommand::SaveProfileContent {
+        uid,
+        content: SensitiveString::new(content),
+      });
+    }
+    if close {
+      self.profile_editor = None;
+      self.pending_editor_close = false;
+    } else if cancel_close {
+      self.pending_editor_close = false;
     }
   }
 
@@ -1093,6 +1246,96 @@ fn remote_profile_options_editor(ui: &mut Ui, options: &mut RemoteProfileOptions
   ui.checkbox(&mut options.allow_auto_update, "允许定时自动更新");
 }
 
+impl YamlHighlightCache {
+  fn layout(&mut self, source: &str, dark_mode: bool) -> egui::text::LayoutJob {
+    let mut hasher = DefaultHasher::new();
+    source.hash(&mut hasher);
+    let source_hash = hasher.finish();
+    if !self.initialized || self.source_hash != source_hash || self.dark_mode != dark_mode {
+      self.source_hash = source_hash;
+      self.dark_mode = dark_mode;
+      self.initialized = true;
+      self.job = highlight_yaml(source, dark_mode);
+    }
+    self.job.clone()
+  }
+}
+
+fn highlight_yaml(source: &str, dark_mode: bool) -> egui::text::LayoutJob {
+  let font_id = egui::FontId::monospace(13.0);
+  let normal = egui::TextFormat {
+    font_id: font_id.clone(),
+    color: if dark_mode {
+      Color32::from_rgb(238, 238, 236)
+    } else {
+      Color32::from_rgb(46, 52, 54)
+    },
+    ..egui::TextFormat::default()
+  };
+  let key = egui::TextFormat {
+    font_id: font_id.clone(),
+    color: if dark_mode {
+      Color32::from_rgb(138, 226, 252)
+    } else {
+      Color32::from_rgb(28, 113, 216)
+    },
+    ..egui::TextFormat::default()
+  };
+  let comment = egui::TextFormat {
+    font_id,
+    color: if dark_mode {
+      Color32::from_rgb(143, 161, 179)
+    } else {
+      Color32::from_rgb(94, 92, 100)
+    },
+    italics: true,
+    ..egui::TextFormat::default()
+  };
+  let mut job = egui::text::LayoutJob::default();
+  for line in source.split_inclusive('\n') {
+    let comment_start = yaml_comment_start(line).unwrap_or(line.len());
+    let (code, comment_text) = line.split_at(comment_start);
+    let indentation = code.len().saturating_sub(code.trim_start().len());
+    let trimmed = &code[indentation..];
+    let key_end = (!trimmed.starts_with('-'))
+      .then(|| trimmed.find(':'))
+      .flatten()
+      .filter(|index| *index != 0)
+      .map(|index| indentation + index + 1);
+    if let Some(key_end) = key_end {
+      job.append(&code[..indentation], 0.0, normal.clone());
+      job.append(&code[indentation..key_end], 0.0, key.clone());
+      job.append(&code[key_end..], 0.0, normal.clone());
+    } else {
+      job.append(code, 0.0, normal.clone());
+    }
+    if !comment_text.is_empty() {
+      job.append(comment_text, 0.0, comment.clone());
+    }
+  }
+  job
+}
+
+fn yaml_comment_start(line: &str) -> Option<usize> {
+  let mut single_quote = false;
+  let mut double_quote = false;
+  let mut escaped = false;
+  for (index, character) in line.char_indices() {
+    if escaped {
+      escaped = false;
+      continue;
+    }
+    match character {
+      '\\' if double_quote => escaped = true,
+      '\'' if !double_quote => single_quote = !single_quote,
+      '"' if !single_quote => double_quote = !double_quote,
+      '#' if !single_quote && !double_quote => return Some(index),
+      _ => {},
+    }
+  }
+  None
+}
+
 fn format_update_age(updated_at: u64) -> String {
   let now = SystemTime::now()
     .duration_since(UNIX_EPOCH)
@@ -1245,7 +1488,7 @@ fn client_error_message(error: &ClientError) -> String {
 mod tests {
   use rsclash_domain::{CoreChannel, CoreRunMode, CoreState, Page};
 
-  use super::{format_bytes, tun_capability};
+  use super::{format_bytes, highlight_yaml, tun_capability, yaml_comment_start};
 
   #[test]
   fn every_page_has_a_non_empty_native_label() {
@@ -1261,6 +1504,13 @@ mod tests {
     assert_eq!(format_bytes(0), "0 B");
     assert_eq!(format_bytes(1_024), "1.0 KiB");
     assert_eq!(format_bytes(5 * 1_024 * 1_024), "5.0 MiB");
+  }
+
+  #[test]
+  fn yaml_highlighter_keeps_quoted_hashes_in_values() {
+    let source = "name: '#value' # comment\n";
+    assert_eq!(yaml_comment_start(source), source.rfind('#'));
+    assert!(highlight_yaml(source, true).sections.len() >= 3);
   }
 
   #[test]

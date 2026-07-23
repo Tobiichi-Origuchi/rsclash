@@ -363,6 +363,13 @@ pub enum UiCommand {
     uid: String,
     options: RemoteProfileOptions,
   },
+  LoadProfileContent {
+    uid: String,
+  },
+  SaveProfileContent {
+    uid: String,
+    content: SensitiveString,
+  },
   UpdateProfile {
     uid: String,
   },
@@ -390,6 +397,13 @@ pub enum AppEvent {
   CoreStateChanged(CoreState),
   MihomoStateChanged,
   ProfilesChanged,
+  ProfileContentLoaded {
+    uid: String,
+    content: SensitiveString,
+  },
+  ProfileContentSaved {
+    uid: String,
+  },
   SystemProxyChanged,
   NavigationChanged(Page),
   ThemeChanged(ThemeMode),

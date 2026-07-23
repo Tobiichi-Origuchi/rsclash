@@ -150,6 +150,15 @@ impl RuntimeStore {
     Ok(true)
   }
 
+  pub async fn validate_config(
+    &self,
+    config: &MihomoConfig,
+    validator: &dyn RuntimeValidator,
+  ) -> Result<()> {
+    let _prepared = self.prepare(config, validator).await?;
+    Ok(())
+  }
+
   async fn prepare(
     &self,
     config: &MihomoConfig,
