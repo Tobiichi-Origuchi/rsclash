@@ -4,8 +4,8 @@
 )]
 
 use rsclash_config::{
-  ApplicationLayer, BoaScriptExecutor, EnhancementInput, EnhancementPipeline, ListenerPolicy,
-  ManualLayer, MihomoConfig, ScriptLayer, SequenceEdit, SequenceLayers, TargetPlatform,
+  ApplicationLayer, EnhancementInput, EnhancementPipeline, ListenerPolicy, ManualLayer,
+  MihomoConfig, SequenceEdit, SequenceLayers, TargetPlatform,
 };
 use serde_yaml_ng::Mapping;
 
@@ -37,30 +37,21 @@ fn runtime_is_semantically_equivalent_to_cvr_golden() {
       dns_settings: Some(mapping(include_str!(
         "fixtures/golden/cvr-6219452/dns.yaml"
       ))),
-      builtin_scripts: Vec::new(),
+      native_transforms: Vec::new(),
     },
     global: ManualLayer {
       merge: Some(mapping(include_str!(
         "fixtures/golden/cvr-6219452/global-merge.yaml"
       ))),
-      script: Some(script(
-        "global-script",
-        include_str!("fixtures/golden/cvr-6219452/global-script.js"),
-      )),
     },
     profile: ManualLayer {
       merge: Some(mapping(include_str!(
         "fixtures/golden/cvr-6219452/profile-merge.yaml"
       ))),
-      script: Some(script(
-        "profile-script",
-        include_str!("fixtures/golden/cvr-6219452/profile-script.js"),
-      )),
     },
-    profile_name: "Golden Profile".to_string(),
   };
 
-  let runtime = EnhancementPipeline::new(&BoaScriptExecutor::default()).enhance(input);
+  let runtime = EnhancementPipeline::enhance(input);
   let actual = runtime.config.expect("runtime should contain config");
   let expected = MihomoConfig::parse(include_str!(
     "fixtures/golden/cvr-6219452/expected-cvr.yaml"
@@ -72,8 +63,6 @@ fn runtime_is_semantically_equivalent_to_cvr_golden() {
     serde_json::to_value(expected.mapping()).expect("expected config should convert to JSON"),
     "rsclash runtime diverged from CVR commit {CVR_REFERENCE_COMMIT} fixture at {FIXTURE_ROOT}"
   );
-  assert_eq!(runtime.script_logs["global-script"][0].level, "info");
-  assert_eq!(runtime.script_logs["profile-script"][0].level, "warn");
 }
 
 fn mapping(source: &str) -> Mapping {
@@ -82,11 +71,4 @@ fn mapping(source: &str) -> Mapping {
 
 fn sequence(source: &str) -> SequenceEdit {
   serde_yaml_ng::from_str(source).expect("fixture sequence should parse")
-}
-
-fn script(id: &str, source: &str) -> ScriptLayer {
-  ScriptLayer {
-    id: id.to_string(),
-    source: source.to_string(),
-  }
 }

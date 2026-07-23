@@ -2,11 +2,11 @@ use std::{collections::BTreeSet, net::IpAddr};
 
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::{MihomoConfig, Result, RuntimeConfig, ScriptLog};
+use crate::{MihomoConfig, RuntimeConfig};
 
 use super::{
-  SequenceEdit, apply_deep_merge, apply_sequence_edit, cleanup_proxy_groups, lowercase_mapping,
-  sort_top_level,
+  NativeTransform, SequenceEdit, apply_deep_merge, apply_sequence_edit, cleanup_proxy_groups,
+  lowercase_mapping, sort_top_level,
 };
 
 const CONTROL_PLANE_FIELDS: &[&str] = &[
@@ -78,27 +78,6 @@ pub struct ListenerPolicy {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct ScriptLayer {
-  pub id: String,
-  pub source: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ScriptOutput {
-  pub config: Mapping,
-  pub logs: Vec<ScriptLog>,
-}
-
-pub trait ScriptExecutor: Send + Sync {
-  fn execute(
-    &self,
-    script: &ScriptLayer,
-    config: &Mapping,
-    profile_name: &str,
-  ) -> Result<ScriptOutput>;
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SequenceLayers {
   pub rules: SequenceEdit,
   pub proxies: SequenceEdit,
@@ -108,7 +87,6 @@ pub struct SequenceLayers {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ManualLayer {
   pub merge: Option<Mapping>,
-  pub script: Option<ScriptLayer>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -118,7 +96,7 @@ pub struct ApplicationLayer {
   pub platform: TargetPlatform,
   pub enable_tun: bool,
   pub dns_settings: Option<Mapping>,
-  pub builtin_scripts: Vec<ScriptLayer>,
+  pub native_transforms: Vec<NativeTransform>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -128,28 +106,19 @@ pub struct EnhancementInput {
   pub application: ApplicationLayer,
   pub global: ManualLayer,
   pub profile: ManualLayer,
-  pub profile_name: String,
 }
 
-pub struct EnhancementPipeline<'a> {
-  scripts: &'a dyn ScriptExecutor,
-}
+pub struct EnhancementPipeline;
 
-impl<'a> EnhancementPipeline<'a> {
+impl EnhancementPipeline {
   #[must_use]
-  pub const fn new(scripts: &'a dyn ScriptExecutor) -> Self {
-    Self { scripts }
-  }
-
-  #[must_use]
-  pub fn enhance(&self, input: EnhancementInput) -> RuntimeConfig {
+  pub fn enhance(input: EnhancementInput) -> RuntimeConfig {
     let EnhancementInput {
       current,
       sequence,
       application,
       global,
       profile,
-      profile_name,
     } = input;
     let mut config = current.into_mapping();
 
@@ -159,16 +128,8 @@ impl<'a> EnhancementPipeline<'a> {
     let mut source_keys = top_level_keys(&config);
 
     apply_application_defaults(&mut config, &application);
-    let mut script_logs = std::collections::BTreeMap::new();
-    for script in &application.builtin_scripts {
-      self.run_script(
-        &mut config,
-        script,
-        &profile_name,
-        &mut source_keys,
-        &mut script_logs,
-        false,
-      );
+    for transform in &application.native_transforms {
+      transform.apply(&mut config);
     }
     apply_tun(&mut config, application.enable_tun);
     if let Some(settings) = &application.dns_settings {
@@ -181,20 +142,8 @@ impl<'a> EnhancementPipeline<'a> {
       .as_ref()
       .and_then(|_| snapshot_dns_ipv6(&config));
 
-    self.apply_manual_layer(
-      &mut config,
-      &global,
-      &profile_name,
-      &mut source_keys,
-      &mut script_logs,
-    );
-    self.apply_manual_layer(
-      &mut config,
-      &profile,
-      &profile_name,
-      &mut source_keys,
-      &mut script_logs,
-    );
+    apply_manual_layer(&mut config, &global, &mut source_keys);
+    apply_manual_layer(&mut config, &profile, &mut source_keys);
 
     restore_control_plane(&mut config, &control_plane);
     restore_dns_ipv6(&mut config, dns_ipv6);
@@ -205,54 +154,18 @@ impl<'a> EnhancementPipeline<'a> {
     RuntimeConfig {
       config: Some(MihomoConfig::new(config)),
       source_keys,
-      script_logs,
     }
   }
+}
 
-  fn apply_manual_layer(
-    &self,
-    config: &mut Mapping,
-    layer: &ManualLayer,
-    profile_name: &str,
-    source_keys: &mut BTreeSet<String>,
-    logs: &mut std::collections::BTreeMap<String, Vec<ScriptLog>>,
-  ) {
-    if let Some(patch) = &layer.merge {
-      source_keys.extend(top_level_keys(&lowercase_mapping(patch)));
-      apply_deep_merge(config, patch);
-    }
-    if let Some(script) = &layer.script {
-      self.run_script(config, script, profile_name, source_keys, logs, true);
-    }
-  }
-
-  fn run_script(
-    &self,
-    config: &mut Mapping,
-    script: &ScriptLayer,
-    profile_name: &str,
-    source_keys: &mut BTreeSet<String>,
-    logs: &mut std::collections::BTreeMap<String, Vec<ScriptLog>>,
-    track_changes: bool,
-  ) {
-    match self.scripts.execute(script, config, profile_name) {
-      Ok(output) => {
-        if track_changes {
-          source_keys.extend(changed_keys(config, &output.config));
-        }
-        *config = output.config;
-        logs.insert(script.id.clone(), output.logs);
-      },
-      Err(error) => {
-        logs.insert(
-          script.id.clone(),
-          vec![ScriptLog {
-            level: "exception".to_string(),
-            message: error.to_string(),
-          }],
-        );
-      },
-    }
+fn apply_manual_layer(
+  config: &mut Mapping,
+  layer: &ManualLayer,
+  source_keys: &mut BTreeSet<String>,
+) {
+  if let Some(patch) = &layer.merge {
+    source_keys.extend(top_level_keys(&lowercase_mapping(patch)));
+    apply_deep_merge(config, patch);
   }
 }
 
@@ -261,17 +174,6 @@ fn top_level_keys(config: &Mapping) -> BTreeSet<String> {
     .keys()
     .filter_map(Value::as_str)
     .map(str::to_ascii_lowercase)
-    .collect()
-}
-
-fn changed_keys(before: &Mapping, after: &Mapping) -> BTreeSet<String> {
-  after
-    .iter()
-    .filter_map(|(key, value)| {
-      (before.get(key) != Some(value))
-        .then(|| key.as_str().map(str::to_ascii_lowercase))
-        .flatten()
-    })
     .collect()
 }
 
@@ -453,7 +355,7 @@ fn is_ipv4_shorthand_loopback(address: &str) -> bool {
   let Ok(parts) = address
     .split('.')
     .map(str::parse::<u32>)
-    .collect::<std::result::Result<Vec<_>, _>>()
+    .collect::<Result<Vec<_>, _>>()
   else {
     return false;
   };
@@ -472,44 +374,12 @@ fn is_ipv4_shorthand_loopback(address: &str) -> bool {
 mod tests {
   use serde_yaml_ng::{Mapping, Value};
 
-  use crate::{Error, MihomoConfig, Result, ScriptLog};
+  use crate::MihomoConfig;
 
   use super::{
     ApplicationLayer, EnhancementInput, EnhancementPipeline, ListenerPolicy, ManualLayer,
-    ScriptExecutor, ScriptLayer, ScriptOutput, SequenceEdit, SequenceLayers, TargetPlatform,
-    apply_tun,
+    SequenceEdit, SequenceLayers, TargetPlatform, apply_tun,
   };
-
-  struct TestScripts;
-
-  impl ScriptExecutor for TestScripts {
-    fn execute(
-      &self,
-      script: &ScriptLayer,
-      config: &Mapping,
-      _profile_name: &str,
-    ) -> Result<ScriptOutput> {
-      if script.source == "fail" {
-        return Err(Error::ScriptExecution("expected failure".to_string()));
-      }
-      let mut output = config.clone();
-      output.insert("winner".into(), Value::String(script.source.clone()));
-      output.insert("mixed-port".into(), Value::Number(9999.into()));
-      output
-        .entry("dns".into())
-        .or_insert_with(|| Value::Mapping(Mapping::new()));
-      if let Some(dns) = output.get_mut("dns").and_then(Value::as_mapping_mut) {
-        dns.insert("ipv6".into(), Value::Bool(false));
-      }
-      Ok(ScriptOutput {
-        config: output,
-        logs: vec![ScriptLog {
-          level: "info".to_string(),
-          message: script.id.clone(),
-        }],
-      })
-    }
-  }
 
   fn mapping(source: &str) -> Mapping {
     serde_yaml_ng::from_str(source).expect("test YAML should parse")
@@ -555,26 +425,17 @@ external-controller: 127.0.0.1:9090
         dns_settings: Some(mapping(
           "dns: {enable: true, ipv6: true, enhanced-mode: fake-ip}",
         )),
-        builtin_scripts: Vec::new(),
+        native_transforms: Vec::new(),
       },
       global: ManualLayer {
         merge: Some(mapping("winner: global-merge\nmixed-port: 9000")),
-        script: Some(ScriptLayer {
-          id: "global-script".to_string(),
-          source: "global-script".to_string(),
-        }),
       },
       profile: ManualLayer {
         merge: Some(mapping("winner: profile-merge\nmixed-port: 9001")),
-        script: Some(ScriptLayer {
-          id: "profile-script".to_string(),
-          source: "profile-script".to_string(),
-        }),
       },
-      profile_name: "Test".to_string(),
     };
 
-    let runtime = EnhancementPipeline::new(&TestScripts).enhance(input);
+    let runtime = EnhancementPipeline::enhance(input);
     let config = runtime
       .config
       .as_ref()
@@ -585,7 +446,7 @@ external-controller: 127.0.0.1:9090
     assert_eq!(config.get("mixed-port").and_then(Value::as_u64), Some(7890));
     assert_eq!(
       config.get("winner").and_then(Value::as_str),
-      Some("profile-script")
+      Some("profile-merge")
     );
     assert_eq!(
       config.get("bind-address").and_then(Value::as_str),
@@ -631,8 +492,6 @@ external-controller: 127.0.0.1:9090
       vec!["node"]
     );
     assert!(runtime.source_keys.contains("winner"));
-    assert!(runtime.script_logs.contains_key("global-script"));
-    assert!(runtime.script_logs.contains_key("profile-script"));
   }
 
   #[test]
@@ -650,37 +509,11 @@ external-controller: 127.0.0.1:9090
       ..EnhancementInput::default()
     };
 
-    let runtime = EnhancementPipeline::new(&TestScripts).enhance(input);
+    let runtime = EnhancementPipeline::enhance(input);
     let config = runtime.config.expect("runtime should contain config");
     for field in ["socks-port", "port", "redir-port", "tproxy-port"] {
       assert!(!config.mapping().contains_key(field));
     }
-  }
-
-  #[test]
-  fn failed_script_keeps_previous_config_and_records_exception() {
-    let input = EnhancementInput {
-      current: MihomoConfig::new(mapping("mode: rule")),
-      global: ManualLayer {
-        script: Some(ScriptLayer {
-          id: "failure".to_string(),
-          source: "fail".to_string(),
-        }),
-        ..ManualLayer::default()
-      },
-      ..EnhancementInput::default()
-    };
-
-    let runtime = EnhancementPipeline::new(&TestScripts).enhance(input);
-    assert_eq!(
-      runtime
-        .config
-        .as_ref()
-        .and_then(|config| config.get("mode"))
-        .and_then(Value::as_str),
-      Some("rule")
-    );
-    assert_eq!(runtime.script_logs["failure"][0].level, "exception");
   }
 
   #[test]

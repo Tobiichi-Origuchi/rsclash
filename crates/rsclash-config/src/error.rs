@@ -12,8 +12,6 @@ pub enum Error {
   EncodeYaml(#[source] serde_yaml_ng::Error),
   #[error("invalid configuration: {0}")]
   InvalidConfiguration(String),
-  #[error("script execution failed: {0}")]
-  ScriptExecution(String),
   #[error("Mihomo configuration validation failed: {0}")]
   RuntimeValidation(String),
   #[error("runtime activation failed: {0}")]

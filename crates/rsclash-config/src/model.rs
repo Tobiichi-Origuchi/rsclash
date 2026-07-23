@@ -392,13 +392,6 @@ impl ProfileOptions {
 pub struct RuntimeConfig {
   pub config: Option<MihomoConfig>,
   pub source_keys: BTreeSet<String>,
-  pub script_logs: BTreeMap<String, Vec<ScriptLog>>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ScriptLog {
-  pub level: String,
-  pub message: String,
 }
 
 #[cfg(test)]

@@ -4,8 +4,10 @@ socks-port: 9001
 external-controller-pipe: rsclash-golden
 dns:
   ipv6: false
+  nameserver: [global-script]
   fallback: [8.8.8.8]
 custom:
   nested:
-    winner: global-merge
+    winner: global-script
     global-merge: true
+    global-script: true

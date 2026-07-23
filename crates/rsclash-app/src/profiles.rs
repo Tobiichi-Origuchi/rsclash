@@ -10,8 +10,8 @@ use std::{
 
 use reqwest::{Client, Url, redirect::Policy};
 use rsclash_config::{
-  ApplicationLayer, BoaScriptExecutor, EnhancementInput, EnhancementPipeline, ListenerPolicy,
-  MihomoConfig, ProfileItem, ProfileKind, ProfileStore, RuntimeActivator, RuntimeDeployer,
+  ApplicationLayer, EnhancementInput, EnhancementPipeline, ListenerPolicy, MihomoConfig,
+  NativeTransform, ProfileItem, ProfileKind, ProfileStore, RuntimeActivator, RuntimeDeployer,
   RuntimeStore, RuntimeValidator, TargetPlatform, extract_control_plane,
 };
 use rsclash_domain::{ProfileSourceKind, ProfileSummary, ProfilesSnapshot};
@@ -324,16 +324,16 @@ fn prepare_activation(store: &ProfileStore, uid: &str) -> Result<PreparedActivat
     .and_then(|tun| tun.get("enable"))
     .and_then(Value::as_bool)
     .unwrap_or(false);
-  let runtime = EnhancementPipeline::new(&BoaScriptExecutor::default()).enhance(EnhancementInput {
+  let runtime = EnhancementPipeline::enhance(EnhancementInput {
     current,
     application: ApplicationLayer {
       defaults,
       listeners,
       platform: TargetPlatform::current(),
       enable_tun,
+      native_transforms: NativeTransform::compatibility_defaults().to_vec(),
       ..ApplicationLayer::default()
     },
-    profile_name: item.name.clone().unwrap_or_else(|| uid.to_string()),
     ..EnhancementInput::default()
   });
   let next_runtime = runtime
