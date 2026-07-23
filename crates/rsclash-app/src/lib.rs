@@ -4,6 +4,7 @@ mod change;
 mod mihomo;
 mod profiles;
 mod runtime;
+mod system_proxy;
 
 use std::{fmt, future::pending, sync::Arc, time::Duration};
 
@@ -12,7 +13,7 @@ use rsclash_domain::{
   AppEvent, AppSnapshot, AppStatus, CommandError, CommandOutput, CommandResult, CoreChannel,
   CoreState, ErrorView, UiCommand,
 };
-use rsclash_platform::{RecoveryReason, SystemStateRecovery};
+use rsclash_platform::{RecoveryReason, SystemProxyService, SystemStateRecovery};
 use thiserror::Error;
 use tokio::{
   runtime::Handle,
@@ -29,9 +30,11 @@ pub use change::{
 pub use mihomo::MihomoAccess;
 pub use profiles::ProfileAccess;
 pub use runtime::CoreRuntimeActivator;
+pub use system_proxy::SystemProxyAccess;
 
 use mihomo::{MihomoBridgeCommand, MihomoBridgeEvent, run_mihomo_worker};
 use profiles::{ProfileBridgeCommand, ProfileBridgeEvent, run_profile_worker};
+use system_proxy::{SystemProxyBridgeCommand, SystemProxyBridgeEvent, run_system_proxy_worker};
 
 const COMMAND_CAPACITY: usize = 64;
 const EVENT_CAPACITY: usize = 64;
@@ -201,17 +204,18 @@ pub struct BackendHandle {
   core_worker: Option<JoinHandle<()>>,
   mihomo_worker: Option<JoinHandle<()>>,
   profile_worker: Option<JoinHandle<()>>,
+  system_proxy_worker: Option<JoinHandle<()>>,
   core_runtime: Option<CoreRuntime>,
   system_recovery: Option<Arc<dyn SystemStateRecovery>>,
 }
 
 impl BackendHandle {
   pub fn spawn(runtime: &Handle, wake: WakeHandle) -> Self {
-    Self::spawn_inner(runtime, wake, None, None, None, None)
+    Self::spawn_inner(runtime, wake, None, None, None, None, None)
   }
 
   pub fn spawn_with_core(runtime: &Handle, wake: WakeHandle, core_runtime: CoreRuntime) -> Self {
-    Self::spawn_inner(runtime, wake, Some(core_runtime), None, None, None)
+    Self::spawn_inner(runtime, wake, Some(core_runtime), None, None, None, None)
   }
 
   pub fn spawn_with_core_and_mihomo(
@@ -227,6 +231,7 @@ impl BackendHandle {
       None,
       Some(mihomo_access),
       None,
+      None,
     )
   }
 
@@ -241,6 +246,7 @@ impl BackendHandle {
       wake,
       Some(core_runtime),
       Some(system_recovery),
+      None,
       None,
       None,
     )
@@ -260,6 +266,7 @@ impl BackendHandle {
       Some(system_recovery),
       Some(mihomo_access),
       None,
+      None,
     )
   }
 
@@ -278,6 +285,28 @@ impl BackendHandle {
       Some(system_recovery),
       Some(mihomo_access),
       Some(profile_access),
+      None,
+    )
+  }
+
+  pub fn spawn_with_system_proxy_integrations(
+    runtime: &Handle,
+    wake: WakeHandle,
+    core_runtime: CoreRuntime,
+    system_proxy: Arc<SystemProxyService>,
+    mihomo_access: MihomoAccess,
+    profile_access: ProfileAccess,
+  ) -> Self {
+    let system_recovery: Arc<dyn SystemStateRecovery> =
+      Arc::<SystemProxyService>::clone(&system_proxy);
+    Self::spawn_inner(
+      runtime,
+      wake,
+      Some(core_runtime),
+      Some(system_recovery),
+      Some(mihomo_access),
+      Some(profile_access),
+      Some(SystemProxyAccess::new(system_proxy)),
     )
   }
 
@@ -288,6 +317,7 @@ impl BackendHandle {
     system_recovery: Option<Arc<dyn SystemStateRecovery>>,
     mihomo_access: Option<MihomoAccess>,
     profile_access: Option<ProfileAccess>,
+    system_proxy_access: Option<SystemProxyAccess>,
   ) -> Self {
     let core = core_runtime.as_ref().map(CoreRuntime::handle);
     let profile_core = core.clone();
@@ -339,6 +369,16 @@ impl BackendHandle {
         },
         _ => (None, None, None),
       };
+    let (system_proxy_command_tx, system_proxy_event_rx, system_proxy_worker) =
+      match system_proxy_access {
+        Some(access) => {
+          let (command_tx, command_rx) = mpsc::channel(CORE_EVENT_CAPACITY);
+          let (event_tx, event_rx) = mpsc::channel(CORE_EVENT_CAPACITY);
+          let worker = runtime.spawn(run_system_proxy_worker(access, command_rx, event_tx));
+          (Some(command_tx), Some(event_rx), Some(worker))
+        },
+        None => (None, None, None),
+      };
 
     let coordinator = Coordinator {
       snapshot: (*initial_snapshot).clone(),
@@ -352,6 +392,8 @@ impl BackendHandle {
       mihomo_event_rx,
       profile_command_tx,
       profile_event_rx,
+      system_proxy_command_tx,
+      system_proxy_event_rx,
     };
     let coordinator = runtime.spawn(coordinator.run());
 
@@ -367,6 +409,7 @@ impl BackendHandle {
       core_worker,
       mihomo_worker,
       profile_worker,
+      system_proxy_worker,
       core_runtime,
       system_recovery,
     }
@@ -411,6 +454,10 @@ impl BackendHandle {
       profile_worker.abort();
       let _ = profile_worker.await;
     }
+    if let Some(system_proxy_worker) = self.system_proxy_worker.take() {
+      system_proxy_worker.abort();
+      let _ = system_proxy_worker.await;
+    }
 
     let recovery_result = if let Some(system_recovery) = self.system_recovery.take() {
       system_recovery
@@ -454,6 +501,9 @@ impl Drop for BackendHandle {
     if let Some(profile_worker) = self.profile_worker.take() {
       profile_worker.abort();
     }
+    if let Some(system_proxy_worker) = self.system_proxy_worker.take() {
+      system_proxy_worker.abort();
+    }
     let _ = self.system_recovery.take();
     let _ = self.core_runtime.take();
   }
@@ -484,6 +534,8 @@ struct Coordinator {
   mihomo_event_rx: Option<mpsc::Receiver<MihomoBridgeEvent>>,
   profile_command_tx: Option<mpsc::Sender<ProfileBridgeCommand>>,
   profile_event_rx: Option<mpsc::Receiver<ProfileBridgeEvent>>,
+  system_proxy_command_tx: Option<mpsc::Sender<SystemProxyBridgeCommand>>,
+  system_proxy_event_rx: Option<mpsc::Receiver<SystemProxyBridgeEvent>>,
 }
 
 impl Coordinator {
@@ -499,6 +551,7 @@ impl Coordinator {
         &mut self.core_event_rx,
         &mut self.mihomo_event_rx,
         &mut self.profile_event_rx,
+        &mut self.system_proxy_event_rx,
       )
       .await
       {
@@ -525,6 +578,10 @@ impl Coordinator {
         CoordinatorInput::Profile(profile_event) => match profile_event {
           Some(event) => self.handle_profile_event(event),
           None => self.profile_event_rx = None,
+        },
+        CoordinatorInput::SystemProxy(system_proxy_event) => match system_proxy_event {
+          Some(event) => self.handle_system_proxy_event(event),
+          None => self.system_proxy_event_rx = None,
         },
       }
     }
@@ -558,6 +615,10 @@ impl Coordinator {
       UiCommand::ActivateProfile { uid } => {
         self.dispatch_profile(ProfileBridgeCommand::Activate { uid })
       },
+      UiCommand::RefreshSystemProxy => {
+        self.dispatch_system_proxy(SystemProxyBridgeCommand::Refresh)
+      },
+      UiCommand::SetSystemProxy(enabled) => self.set_system_proxy(enabled),
       UiCommand::Navigate(page) => {
         self.snapshot.page = page;
         self.publish_snapshot();
@@ -672,6 +733,61 @@ impl Coordinator {
     }
   }
 
+  fn dispatch_system_proxy(&self, command: SystemProxyBridgeCommand) -> (CommandResult, bool) {
+    let Some(command_tx) = &self.system_proxy_command_tx else {
+      return (
+        Err(CommandError::InvalidState(
+          "the system proxy backend is not configured".to_string(),
+        )),
+        false,
+      );
+    };
+    match command_tx.try_send(command) {
+      Ok(()) => (Ok(CommandOutput::Accepted), false),
+      Err(mpsc::error::TrySendError::Full(_)) => (
+        Err(CommandError::InvalidState(
+          "the system proxy command queue is full".to_string(),
+        )),
+        false,
+      ),
+      Err(mpsc::error::TrySendError::Closed(_)) => (
+        Err(CommandError::InvalidState(
+          "the system proxy bridge is closed".to_string(),
+        )),
+        false,
+      ),
+    }
+  }
+
+  fn set_system_proxy(&self, enabled: bool) -> (CommandResult, bool) {
+    if !enabled {
+      return self.dispatch_system_proxy(SystemProxyBridgeCommand::SetEnabled {
+        enabled: false,
+        port: 0,
+      });
+    }
+    if !matches!(self.snapshot.core, CoreState::Running { .. }) {
+      return (
+        Err(CommandError::InvalidState(
+          "Mihomo must be running before enabling the system proxy".to_string(),
+        )),
+        false,
+      );
+    }
+    let Some(port) = self.snapshot.mihomo.mixed_port else {
+      return (
+        Err(CommandError::InvalidState(
+          "Mihomo did not report a valid mixed proxy port".to_string(),
+        )),
+        false,
+      );
+    };
+    self.dispatch_system_proxy(SystemProxyBridgeCommand::SetEnabled {
+      enabled: true,
+      port,
+    })
+  }
+
   fn handle_core_event(&mut self, event: CoreBridgeEvent) {
     match event {
       CoreBridgeEvent::State(state) => {
@@ -689,6 +805,15 @@ impl Coordinator {
             title: "Mihomo controller state update failed".to_string(),
             detail: error.to_string(),
             retryable: true,
+          });
+        }
+        if !matches!(state, CoreState::Running { .. })
+          && self.snapshot.system_proxy.enabled
+          && let Some(command_tx) = &self.system_proxy_command_tx
+        {
+          let _ = command_tx.try_send(SystemProxyBridgeCommand::SetEnabled {
+            enabled: false,
+            port: 0,
           });
         }
         self.snapshot.core = state.clone();
@@ -747,6 +872,24 @@ impl Coordinator {
     }
   }
 
+  fn handle_system_proxy_event(&mut self, event: SystemProxyBridgeEvent) {
+    match event {
+      SystemProxyBridgeEvent::Snapshot(snapshot) => {
+        self.snapshot.system_proxy = snapshot;
+        self.publish_snapshot();
+        self.emit(AppEvent::SystemProxyChanged);
+      },
+      SystemProxyBridgeEvent::CommandFailed(message) => {
+        self.snapshot.last_error = Some(ErrorView {
+          title: "System proxy operation failed".to_string(),
+          detail: message,
+          retryable: true,
+        });
+        self.publish_snapshot();
+      },
+    }
+  }
+
   fn set_window_visible(&mut self, visible: bool) {
     if self.snapshot.window_visible != visible {
       self.snapshot.window_visible = visible;
@@ -774,6 +917,7 @@ enum CoordinatorInput {
   Core(Option<CoreBridgeEvent>),
   Mihomo(Option<MihomoBridgeEvent>),
   Profile(Option<ProfileBridgeEvent>),
+  SystemProxy(Option<SystemProxyBridgeEvent>),
 }
 
 async fn receive_coordinator_input(
@@ -781,6 +925,7 @@ async fn receive_coordinator_input(
   core_event_rx: &mut Option<mpsc::Receiver<CoreBridgeEvent>>,
   mihomo_event_rx: &mut Option<mpsc::Receiver<MihomoBridgeEvent>>,
   profile_event_rx: &mut Option<mpsc::Receiver<ProfileBridgeEvent>>,
+  system_proxy_event_rx: &mut Option<mpsc::Receiver<SystemProxyBridgeEvent>>,
 ) -> CoordinatorInput {
   tokio::select! {
     biased;
@@ -788,6 +933,9 @@ async fn receive_coordinator_input(
     event = receive_core_event(core_event_rx) => CoordinatorInput::Core(event),
     event = receive_mihomo_event(mihomo_event_rx) => CoordinatorInput::Mihomo(event),
     event = receive_profile_event(profile_event_rx) => CoordinatorInput::Profile(event),
+    event = receive_system_proxy_event(system_proxy_event_rx) => {
+      CoordinatorInput::SystemProxy(event)
+    },
   }
 }
 
@@ -853,6 +1001,16 @@ async fn receive_profile_event(
     receiver.recv().await
   } else {
     pending::<Option<ProfileBridgeEvent>>().await
+  }
+}
+
+async fn receive_system_proxy_event(
+  receiver: &mut Option<mpsc::Receiver<SystemProxyBridgeEvent>>,
+) -> Option<SystemProxyBridgeEvent> {
+  if let Some(receiver) = receiver {
+    receiver.recv().await
+  } else {
+    pending::<Option<SystemProxyBridgeEvent>>().await
   }
 }
 

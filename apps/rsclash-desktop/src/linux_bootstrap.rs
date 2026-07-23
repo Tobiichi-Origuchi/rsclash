@@ -7,8 +7,8 @@ use rsclash_core::{
 };
 use rsclash_mihomo::{ControllerConfig, ControllerEndpoint, MihomoApi, MihomoClient};
 use rsclash_platform::{
-  RecoveryManager, RecoveryOutcome, RecoveryReason, SystemStateRecovery as _,
-  UnavailableRecoveryBackend,
+  LinuxSystemProxyBackend, RecoveryOutcome, RecoveryReason, SystemProxyBackend, SystemProxyService,
+  SystemStateRecovery as _,
 };
 use rsclash_service::{
   DEFAULT_CONTROLLER_SOCKET, DEFAULT_SERVICE_SOCKET, LinuxServiceController, ServiceClient,
@@ -52,13 +52,13 @@ pub(crate) struct LinuxBootstrap {
   pub core_runtime: CoreRuntime,
   pub mihomo_access: MihomoAccess,
   pub profile_access: ProfileAccess,
-  pub system_recovery: Arc<RecoveryManager>,
+  pub system_proxy: Arc<SystemProxyService>,
 }
 
 impl LinuxBootstrap {
   pub(crate) async fn audit_startup(&self) -> rsclash_platform::Result<RecoveryOutcome> {
     self
-      .system_recovery
+      .system_proxy
       .restore_pending(RecoveryReason::StartupAudit)
       .await
   }
@@ -105,17 +105,16 @@ fn create_core_runtime_for_layout(
     &store.paths().root,
   ));
   let profile_access = ProfileAccess::new(store.clone(), validator)?;
-  let system_recovery = Arc::new(RecoveryManager::new(
+  let system_proxy_backend: Arc<dyn SystemProxyBackend> = Arc::new(LinuxSystemProxyBackend::new());
+  let system_proxy = Arc::new(SystemProxyService::new(
     store.paths().root.join("system-recovery.json"),
-    Arc::new(UnavailableRecoveryBackend::new(
-      "Linux system proxy and TUN recovery are not implemented yet",
-    )),
+    system_proxy_backend,
   ));
   Ok(LinuxBootstrap {
     core_runtime: CoreRuntime::spawn(runtime, controller),
     mihomo_access,
     profile_access,
-    system_recovery,
+    system_proxy,
   })
 }
 
@@ -224,7 +223,7 @@ mod tests {
       &tokio::runtime::Handle::current(),
       WakeHandle::default(),
       bootstrap.core_runtime,
-      bootstrap.system_recovery,
+      bootstrap.system_proxy,
       bootstrap.mihomo_access,
       bootstrap.profile_access,
     );

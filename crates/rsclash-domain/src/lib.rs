@@ -173,12 +173,23 @@ pub struct ProxyGroupSnapshot {
 pub struct MihomoSnapshot {
   pub connection: MihomoConnection,
   pub version: Option<String>,
+  pub mixed_port: Option<u16>,
   pub mode: ProxyMode,
   pub traffic: TrafficSnapshot,
   pub memory_bytes: u64,
   pub connection_count: u64,
   pub groups: Vec<ProxyGroupSnapshot>,
   pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SystemProxyView {
+  pub available: bool,
+  pub enabled: bool,
+  pub applied: bool,
+  pub busy: bool,
+  pub backend: Option<String>,
+  pub detail: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -232,6 +243,7 @@ pub struct AppSnapshot {
   pub core: CoreState,
   pub mihomo: MihomoSnapshot,
   pub profiles: ProfilesSnapshot,
+  pub system_proxy: SystemProxyView,
   pub last_error: Option<ErrorView>,
 }
 
@@ -246,6 +258,7 @@ impl Default for AppSnapshot {
       core: CoreState::Stopped,
       mihomo: MihomoSnapshot::default(),
       profiles: ProfilesSnapshot::default(),
+      system_proxy: SystemProxyView::default(),
       last_error: None,
     }
   }
@@ -272,6 +285,8 @@ pub enum UiCommand {
   ImportLocalProfile { name: String, path: String },
   ImportRemoteProfile { name: String, url: String },
   ActivateProfile { uid: String },
+  RefreshSystemProxy,
+  SetSystemProxy(bool),
   Navigate(Page),
   SetTheme(ThemeMode),
   SetWindowVisible(bool),
@@ -293,6 +308,7 @@ pub enum AppEvent {
   CoreStateChanged(CoreState),
   MihomoStateChanged,
   ProfilesChanged,
+  SystemProxyChanged,
   NavigationChanged(Page),
   ThemeChanged(ThemeMode),
   WindowVisibilityChanged(bool),

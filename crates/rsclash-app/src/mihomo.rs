@@ -160,6 +160,7 @@ impl MihomoWorker {
     let result = match (version, config, groups, proxies) {
       (Ok(version), Ok(config), Ok(groups), Ok(proxies)) => {
         self.state.version = Some(version.version);
+        self.state.mixed_port = (config.mixed_port > 0).then_some(config.mixed_port);
         self.state.mode = ProxyMode::from(config.mode.as_str());
         self.state.groups = groups
           .proxies

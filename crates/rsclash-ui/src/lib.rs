@@ -228,6 +228,10 @@ impl RsClashUi {
   fn home(&mut self, ui: &mut Ui) {
     let core = self.snapshot.core.clone();
     let mihomo = self.snapshot.mihomo.clone();
+    let system_proxy = self.snapshot.system_proxy.clone();
+    let can_enable_system_proxy = system_proxy.available
+      && mihomo.connection == MihomoConnection::Connected
+      && mihomo.mixed_port.is_some();
     ui.horizontal(|ui| {
       ui.vertical(|ui| {
         ui.label(RichText::new("网络概览").size(24.0).strong());
@@ -236,6 +240,7 @@ impl RsClashUi {
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if ui.button("刷新").clicked() {
           self.command(UiCommand::RefreshMihomo);
+          self.command(UiCommand::RefreshSystemProxy);
         }
         mihomo_connection_pill(ui, mihomo.connection);
       });
@@ -306,6 +311,73 @@ impl RsClashUi {
           RichText::new(format!("控制器暂时不可用：{error}"))
             .small()
             .color(ui.visuals().warn_fg_color),
+        );
+      }
+    });
+
+    ui.add_space(12.0);
+    card(ui, "系统代理", |ui| {
+      ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+          ui.label(
+            RichText::new(if system_proxy.enabled {
+              "已接管系统代理"
+            } else {
+              "未接管系统代理"
+            })
+            .size(18.0)
+            .strong(),
+          );
+          let backend = system_proxy
+            .backend
+            .as_deref()
+            .unwrap_or("正在检测 Linux 后端");
+          ui.label(RichText::new(backend).small().weak());
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+          if system_proxy.busy {
+            ui.spinner();
+          }
+          if ui
+            .add_enabled(
+              !system_proxy.busy && (system_proxy.enabled || can_enable_system_proxy),
+              egui::Button::new(if system_proxy.enabled {
+                "关闭系统代理"
+              } else {
+                "启用系统代理"
+              }),
+            )
+            .clicked()
+          {
+            self.command(UiCommand::SetSystemProxy(!system_proxy.enabled));
+          }
+        });
+      });
+      if !system_proxy.available {
+        ui.add_space(8.0);
+        ui.label(
+          RichText::new(
+            system_proxy
+              .detail
+              .as_deref()
+              .unwrap_or("当前桌面环境不支持系统代理控制"),
+          )
+          .small()
+          .color(ui.visuals().warn_fg_color),
+        );
+      } else if system_proxy.enabled && !system_proxy.applied {
+        ui.add_space(8.0);
+        ui.label(
+          RichText::new("系统设置已在外部发生变化；关闭时仍会恢复启用前的状态。")
+            .small()
+            .color(ui.visuals().warn_fg_color),
+        );
+      } else if !can_enable_system_proxy && !system_proxy.enabled {
+        ui.add_space(8.0);
+        ui.label(
+          RichText::new("启动 Mihomo 后即可启用系统代理。")
+            .small()
+            .weak(),
         );
       }
     });
