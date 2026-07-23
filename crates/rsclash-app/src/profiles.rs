@@ -11,10 +11,10 @@ use std::{
 
 use reqwest::{Client, Proxy, Url, header::HeaderMap, redirect::Policy};
 use rsclash_config::{
-  ApplicationLayer, EnhancementInput, EnhancementPipeline, ListenerPolicy, MihomoConfig,
-  NativeTransform, ProfileItem, ProfileKind, ProfileOptions, ProfileStore, RuntimeActivator,
-  RuntimeDeployer, RuntimeStore, RuntimeValidator, SubscriptionInfo, TargetPlatform,
-  extract_control_plane,
+  ApplicationLayer, EnhancementInput, EnhancementPipeline, ListenerPolicy, ManualLayer,
+  MihomoConfig, NativeTransform, ProfileCatalog, ProfileItem, ProfileKind, ProfileOptions,
+  ProfileStore, RuntimeActivator, RuntimeDeployer, RuntimeStore, RuntimeValidator, SequenceEdit,
+  SequenceLayers, SubscriptionInfo, TargetPlatform, extract_control_plane,
 };
 use rsclash_domain::{
   ProfileDownloadProxy, ProfileSourceKind, ProfileSummary, ProfilesSnapshot, RemoteProfileOptions,
@@ -1111,8 +1111,10 @@ fn prepare_activation(store: &ProfileStore, uid: &str) -> Result<PreparedActivat
     .and_then(|tun| tun.get("enable"))
     .and_then(Value::as_bool)
     .unwrap_or(false);
+  let enhancements = load_profile_enhancements(store, &catalog, item)?;
   let runtime = EnhancementPipeline::enhance(EnhancementInput {
     current,
+    sequence: enhancements.sequence,
     application: ApplicationLayer {
       defaults,
       listeners,
@@ -1121,7 +1123,8 @@ fn prepare_activation(store: &ProfileStore, uid: &str) -> Result<PreparedActivat
       native_transforms: NativeTransform::compatibility_defaults().to_vec(),
       ..ApplicationLayer::default()
     },
-    ..EnhancementInput::default()
+    global: enhancements.global,
+    profile: enhancements.profile,
   });
   let next_runtime = runtime
     .config
@@ -1132,6 +1135,112 @@ fn prepare_activation(store: &ProfileStore, uid: &str) -> Result<PreparedActivat
     previous_runtime,
     next_runtime,
   })
+}
+
+struct ProfileEnhancements {
+  sequence: SequenceLayers,
+  global: ManualLayer,
+  profile: ManualLayer,
+}
+
+fn load_profile_enhancements(
+  store: &ProfileStore,
+  catalog: &ProfileCatalog,
+  source: &ProfileItem,
+) -> Result<ProfileEnhancements, String> {
+  let options = source.option.as_ref();
+  let sequence = SequenceLayers {
+    rules: read_sequence_edit(
+      store,
+      catalog,
+      options.and_then(|options| options.rules.as_deref()),
+      ProfileKind::Rules,
+    )?,
+    proxies: read_sequence_edit(
+      store,
+      catalog,
+      options.and_then(|options| options.proxies.as_deref()),
+      ProfileKind::Proxies,
+    )?,
+    groups: read_sequence_edit(
+      store,
+      catalog,
+      options.and_then(|options| options.groups.as_deref()),
+      ProfileKind::Groups,
+    )?,
+  };
+  let profile = ManualLayer {
+    merge: read_merge(
+      store,
+      catalog,
+      options.and_then(|options| options.merge.as_deref()),
+    )?,
+  };
+  let global = ManualLayer {
+    merge: catalog
+      .get("Merge")
+      .filter(|item| item.kind == Some(ProfileKind::Merge))
+      .map(|_| read_merge(store, catalog, Some("Merge")))
+      .transpose()?
+      .flatten(),
+  };
+  Ok(ProfileEnhancements {
+    sequence,
+    global,
+    profile,
+  })
+}
+
+fn read_sequence_edit(
+  store: &ProfileStore,
+  catalog: &ProfileCatalog,
+  uid: Option<&str>,
+  expected_kind: ProfileKind,
+) -> Result<SequenceEdit, String> {
+  let Some(source) = read_enhancement_profile(store, catalog, uid, expected_kind)? else {
+    return Ok(SequenceEdit::default());
+  };
+  serde_yaml_ng::from_str(&source).map_err(|error| format!("parse sequence profile YAML: {error}"))
+}
+
+fn read_merge(
+  store: &ProfileStore,
+  catalog: &ProfileCatalog,
+  uid: Option<&str>,
+) -> Result<Option<serde_yaml_ng::Mapping>, String> {
+  let Some(source) = read_enhancement_profile(store, catalog, uid, ProfileKind::Merge)? else {
+    return Ok(None);
+  };
+  serde_yaml_ng::from_str(&source)
+    .map(Some)
+    .map_err(|error| format!("parse merge profile YAML: {error}"))
+}
+
+fn read_enhancement_profile(
+  store: &ProfileStore,
+  catalog: &ProfileCatalog,
+  uid: Option<&str>,
+  expected_kind: ProfileKind,
+) -> Result<Option<String>, String> {
+  let Some(uid) = uid else {
+    return Ok(None);
+  };
+  let item = catalog
+    .get(uid)
+    .ok_or_else(|| format!("referenced {expected_kind} profile {uid} does not exist"))?;
+  if item.kind.as_ref() != Some(&expected_kind) {
+    return Err(format!(
+      "referenced profile {uid} has type {}, expected {expected_kind}",
+      item
+        .kind
+        .as_ref()
+        .map_or_else(|| "unknown".to_string(), ToString::to_string)
+    ));
+  }
+  store
+    .read_profile(item.require_file().map_err(|error| error.to_string())?)
+    .map(Some)
+    .map_err(|error| error.to_string())
 }
 
 fn set_current_profile(store: &ProfileStore, uid: &str) -> rsclash_config::Result<()> {
@@ -1270,6 +1379,65 @@ mod tests {
       .uid
       .clone()
       .expect("the imported profile should have a UID");
+    let mut transaction = store
+      .begin()
+      .expect("the enhancement transaction should begin");
+    for (uid, kind, content) in [
+      (
+        "merge-test",
+        rsclash_config::ProfileKind::Merge,
+        "custom-field: applied\n",
+      ),
+      (
+        "rules-test",
+        rsclash_config::ProfileKind::Rules,
+        "prepend: ['DOMAIN,example.com,DIRECT']\nappend: []\ndelete: []\n",
+      ),
+      (
+        "proxies-test",
+        rsclash_config::ProfileKind::Proxies,
+        "prepend: []\nappend:\n- name: Node B\n  type: direct\ndelete: []\n",
+      ),
+      (
+        "groups-test",
+        rsclash_config::ProfileKind::Groups,
+        "prepend: []\nappend:\n- name: Group B\n  type: select\n  proxies: [Node B]\ndelete: []\n",
+      ),
+    ] {
+      transaction
+        .add_profile(
+          rsclash_config::ProfileItem {
+            uid: Some(uid.to_string()),
+            kind: Some(kind),
+            file: Some(format!("{uid}.yaml")),
+            ..rsclash_config::ProfileItem::default()
+          },
+          content,
+        )
+        .expect("the enhancement profile should stage");
+    }
+    transaction
+      .edit_catalog(|catalog| {
+        catalog
+          .items_mut()
+          .iter_mut()
+          .find(|item| item.uid.as_deref() == Some(uid.as_str()))
+          .expect("the source profile should exist")
+          .option = Some(rsclash_config::ProfileOptions {
+          merge: Some("merge-test".to_string()),
+          rules: Some("rules-test".to_string()),
+          proxies: Some("proxies-test".to_string()),
+          groups: Some("groups-test".to_string()),
+          ..rsclash_config::ProfileOptions::default()
+        });
+      })
+      .expect("the source profile should reference enhancements");
+    transaction
+      .validate()
+      .expect("the enhancement transaction should validate");
+    transaction
+      .commit()
+      .expect("the enhancement transaction should commit");
     let prepared = prepare_activation(&store, &uid).expect("activation should prepare");
 
     assert_eq!(
@@ -1295,10 +1463,33 @@ mod tests {
     assert_eq!(
       prepared
         .next_runtime
+        .get("custom-field")
+        .and_then(Value::as_str),
+      Some("applied")
+    );
+    assert_eq!(
+      prepared
+        .next_runtime
         .get("proxies")
         .and_then(Value::as_sequence)
         .map(Vec::len),
-      Some(1)
+      Some(2)
+    );
+    assert_eq!(
+      prepared
+        .next_runtime
+        .get("proxy-groups")
+        .and_then(Value::as_sequence)
+        .map(Vec::len),
+      Some(2)
+    );
+    assert_eq!(
+      prepared
+        .next_runtime
+        .get("rules")
+        .and_then(Value::as_sequence)
+        .map(Vec::len),
+      Some(2)
     );
 
     set_current_profile(&store, &uid).expect("the profile should become current");
