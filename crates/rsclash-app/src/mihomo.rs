@@ -11,6 +11,8 @@ use tokio::{
   time::{Instant, MissedTickBehavior, interval},
 };
 
+use crate::profiles::{ProfileRuntimeSync, StoredProxySelection};
+
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 const METADATA_POLL_TICKS: u8 = 5;
 
@@ -45,11 +47,18 @@ pub(crate) enum MihomoBridgeCommand {
   CoreState(CoreState),
   Refresh,
   SelectProxy { group: String, proxy: String },
+  SynchronizeProfile(ProfileRuntimeSync),
+  CloseConnectionsForProxy { proxy: String },
   SetMode(ProxyMode),
 }
 
 pub(crate) enum MihomoBridgeEvent {
   Snapshot(MihomoSnapshot),
+  ProxySelected {
+    group: String,
+    proxy: String,
+    previous: Option<String>,
+  },
   CommandFailed(String),
 }
 
@@ -65,6 +74,7 @@ struct MihomoWorker {
   state: MihomoSnapshot,
   traffic_sample: Option<TrafficSample>,
   metadata_ticks: u8,
+  pending_profile_sync: Option<ProfileRuntimeSync>,
   event_tx: mpsc::Sender<MihomoBridgeEvent>,
 }
 
@@ -76,6 +86,7 @@ impl MihomoWorker {
       state: MihomoSnapshot::default(),
       traffic_sample: None,
       metadata_ticks: 0,
+      pending_profile_sync: None,
       event_tx,
     }
   }
@@ -112,6 +123,9 @@ impl MihomoWorker {
           self.metadata_ticks = 0;
           self.publish().await;
           self.refresh_all().await;
+          if let Some(sync) = self.pending_profile_sync.take() {
+            self.synchronize_profile(sync).await;
+          }
         }
       },
       MihomoBridgeCommand::CoreState(_) => {
@@ -125,6 +139,16 @@ impl MihomoWorker {
       MihomoBridgeCommand::Refresh => self.refresh_all().await,
       MihomoBridgeCommand::SelectProxy { group, proxy } => {
         self.select_proxy(group, proxy).await;
+      },
+      MihomoBridgeCommand::SynchronizeProfile(sync) => {
+        if self.active.is_some() {
+          self.synchronize_profile(sync).await;
+        } else {
+          self.pending_profile_sync = Some(sync);
+        }
+      },
+      MihomoBridgeCommand::CloseConnectionsForProxy { proxy } => {
+        self.close_connections_for_proxy(&proxy).await;
       },
       MihomoBridgeCommand::SetMode(mode) => self.set_mode(mode).await,
     }
@@ -272,16 +296,104 @@ impl MihomoWorker {
         .await;
       return;
     };
+    let previous = self
+      .state
+      .groups
+      .iter()
+      .find(|item| item.name == group)
+      .and_then(|item| item.selected.clone())
+      .filter(|previous| previous != &proxy);
     match client.select_proxy(&group, &proxy).await {
       Ok(()) => {
         if let Some(candidate) = self.state.groups.iter_mut().find(|item| item.name == group) {
-          candidate.selected = Some(proxy);
+          candidate.selected = Some(proxy.clone());
         }
         self.state.connection = MihomoConnection::Connected;
         self.state.last_error = None;
         self.publish().await;
+        let _ = self
+          .event_tx
+          .send(MihomoBridgeEvent::ProxySelected {
+            group,
+            proxy,
+            previous,
+          })
+          .await;
       },
       Err(error) => self.command_failed(error.to_string()).await,
+    }
+  }
+
+  async fn synchronize_profile(&mut self, sync: ProfileRuntimeSync) {
+    let Some((_, client)) = self.active.clone() else {
+      self.pending_profile_sync = Some(sync);
+      return;
+    };
+    let mut failures = Vec::new();
+    match client.groups().await {
+      Ok(groups) => {
+        for selection in sync.selections {
+          let Some(group) = groups
+            .proxies
+            .iter()
+            .find(|group| group.name == selection.group)
+          else {
+            continue;
+          };
+          if group.now.as_deref() == Some(selection.proxy.as_str())
+            || !selection_is_available(group.all.as_deref(), &selection)
+          {
+            continue;
+          }
+          if let Err(error) = client
+            .select_proxy(&selection.group, &selection.proxy)
+            .await
+          {
+            failures.push(format!(
+              "restore {} -> {}: {error}",
+              selection.group, selection.proxy
+            ));
+          }
+        }
+      },
+      Err(error) => failures.push(format!("load proxy groups for profile restore: {error}")),
+    }
+    if sync.close_connections
+      && let Err(error) = client.close_all_connections().await
+    {
+      failures.push(format!("close connections after profile change: {error}"));
+    }
+    self.refresh_all().await;
+    if !failures.is_empty() {
+      self.command_failed(failures.join("; ")).await;
+    }
+  }
+
+  async fn close_connections_for_proxy(&mut self, proxy: &str) {
+    let Some((_, client)) = self.active.clone() else {
+      return;
+    };
+    let connections = match client.connections().await {
+      Ok(connections) => connections.connections.unwrap_or_default(),
+      Err(error) => {
+        self
+          .command_failed(format!("load connections for cleanup: {error}"))
+          .await;
+        return;
+      },
+    };
+    let mut failures = Vec::new();
+    for connection in connections
+      .into_iter()
+      .filter(|connection| connection.chains.iter().any(|node| node == proxy))
+    {
+      if let Err(error) = client.close_connection(&connection.id).await {
+        failures.push(format!("close connection {}: {error}", connection.id));
+      }
+    }
+    self.refresh_stats().await;
+    if !failures.is_empty() {
+      self.command_failed(failures.join("; ")).await;
     }
   }
 
@@ -342,10 +454,139 @@ impl MihomoWorker {
   }
 }
 
+fn selection_is_available(available: Option<&[String]>, selection: &StoredProxySelection) -> bool {
+  available.is_some_and(|available| {
+    available
+      .iter()
+      .any(|candidate| candidate == &selection.proxy)
+  })
+}
+
 pub(crate) async fn run_mihomo_worker(
   access: MihomoAccess,
   command_rx: mpsc::Receiver<MihomoBridgeCommand>,
   event_tx: mpsc::Sender<MihomoBridgeEvent>,
 ) {
   MihomoWorker::new(access, event_tx).run(command_rx).await;
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
+mod tests {
+  use std::sync::Arc;
+
+  use rsclash_domain::CoreRunMode;
+  use rsclash_mihomo::{
+    FakeMihomoApi, FakeMihomoState, MihomoApi, MihomoCall,
+    models::{Connection, Connections, Groups, Proxy},
+  };
+  use tokio::sync::mpsc;
+
+  use super::{MihomoAccess, MihomoWorker, ProfileRuntimeSync, StoredProxySelection};
+
+  #[tokio::test]
+  async fn profile_sync_restores_available_nodes_before_closing_connections() {
+    let fake = FakeMihomoApi::new(FakeMihomoState {
+      groups: Groups {
+        proxies: vec![Proxy {
+          name: "Primary".to_string(),
+          kind: "Selector".to_string(),
+          all: Some(vec!["Node A".to_string(), "Node B".to_string()]),
+          now: Some("Node A".to_string()),
+          ..Proxy::default()
+        }],
+        ..Groups::default()
+      },
+      connections: Connections {
+        connections: Some(vec![Connection {
+          id: "connection-a".to_string(),
+          chains: vec!["Node A".to_string()],
+          ..Connection::default()
+        }]),
+        ..Connections::default()
+      },
+      ..FakeMihomoState::default()
+    });
+    let api: Arc<dyn MihomoApi> = Arc::new(fake.clone());
+    let (event_tx, _event_rx) = mpsc::channel(8);
+    let mut worker = MihomoWorker::new(MihomoAccess::same(Arc::clone(&api)), event_tx);
+    worker.active = Some((CoreRunMode::Sidecar, api));
+
+    worker
+      .synchronize_profile(ProfileRuntimeSync {
+        selections: vec![
+          StoredProxySelection {
+            group: "Primary".to_string(),
+            proxy: "Node B".to_string(),
+          },
+          StoredProxySelection {
+            group: "Missing".to_string(),
+            proxy: "Node C".to_string(),
+          },
+        ],
+        close_connections: true,
+      })
+      .await;
+
+    let calls = fake.calls().expect("the fake calls should be available");
+    let select_index = calls
+      .iter()
+      .position(|call| matches!(call, MihomoCall::SelectProxy { group, proxy } if group == "Primary" && proxy == "Node B"))
+      .expect("the saved selection should be restored");
+    let close_index = calls
+      .iter()
+      .position(|call| matches!(call, MihomoCall::CloseAllConnections))
+      .expect("profile switching should close connections");
+    assert!(select_index < close_index);
+    assert!(
+      !calls
+        .iter()
+        .any(|call| matches!(call, MihomoCall::SelectProxy { group, .. } if group == "Missing"))
+    );
+  }
+
+  #[tokio::test]
+  async fn proxy_change_closes_only_connections_using_the_previous_node() {
+    let fake = FakeMihomoApi::new(FakeMihomoState {
+      connections: Connections {
+        connections: Some(vec![
+          Connection {
+            id: "old-node".to_string(),
+            chains: vec!["Node A".to_string()],
+            ..Connection::default()
+          },
+          Connection {
+            id: "other-node".to_string(),
+            chains: vec!["Node B".to_string()],
+            ..Connection::default()
+          },
+        ]),
+        ..Connections::default()
+      },
+      ..FakeMihomoState::default()
+    });
+    let api: Arc<dyn MihomoApi> = Arc::new(fake.clone());
+    let (event_tx, _event_rx) = mpsc::channel(8);
+    let mut worker = MihomoWorker::new(MihomoAccess::same(Arc::clone(&api)), event_tx);
+    worker.active = Some((CoreRunMode::Sidecar, api));
+
+    worker.close_connections_for_proxy("Node A").await;
+
+    let calls = fake.calls().expect("the fake calls should be available");
+    assert!(
+      calls
+        .iter()
+        .any(|call| matches!(call, MihomoCall::CloseConnection(id) if id == "old-node"))
+    );
+    assert!(
+      !calls
+        .iter()
+        .any(|call| matches!(call, MihomoCall::CloseConnection(id) if id == "other-node"))
+    );
+    assert!(
+      !calls
+        .iter()
+        .any(|call| matches!(call, MihomoCall::CloseAllConnections))
+    );
+  }
 }

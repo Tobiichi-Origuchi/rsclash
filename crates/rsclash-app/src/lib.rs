@@ -882,6 +882,19 @@ impl Coordinator {
         self.publish_snapshot();
         self.emit(AppEvent::MihomoStateChanged);
       },
+      MihomoBridgeEvent::ProxySelected {
+        group,
+        proxy,
+        previous,
+      } => {
+        if let Some(command_tx) = &self.profile_command_tx {
+          let _ = command_tx.try_send(ProfileBridgeCommand::PersistSelection {
+            group,
+            proxy,
+            previous,
+          });
+        }
+      },
       MihomoBridgeEvent::CommandFailed(message) => {
         self.snapshot.last_error = Some(ErrorView {
           title: "Mihomo controller command failed".to_string(),
@@ -905,9 +918,19 @@ impl Coordinator {
           let _ = command_tx.try_send(MihomoBridgeCommand::Refresh);
         }
       },
-      ProfileBridgeEvent::RuntimeChanged => {
+      ProfileBridgeEvent::RuntimeChanged(sync) => {
         if let Some(command_tx) = &self.mihomo_command_tx {
-          let _ = command_tx.try_send(MihomoBridgeCommand::Refresh);
+          let _ = command_tx.try_send(MihomoBridgeCommand::SynchronizeProfile(sync));
+        }
+      },
+      ProfileBridgeEvent::SelectionPersisted {
+        previous,
+        close_connections,
+      } => {
+        if close_connections
+          && let (Some(command_tx), Some(proxy)) = (&self.mihomo_command_tx, previous)
+        {
+          let _ = command_tx.try_send(MihomoBridgeCommand::CloseConnectionsForProxy { proxy });
         }
       },
       ProfileBridgeEvent::ContentLoaded { uid, content } => {
@@ -1074,11 +1097,15 @@ async fn receive_system_proxy_event(
 mod tests {
   use std::{
     collections::HashMap,
+    fs,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
   };
 
   use async_trait::async_trait;
+  use rsclash_config::{
+    ProfileItem, ProfileKind, Result as ConfigResult, RuntimeValidator, initialize_default_runtime,
+  };
   use rsclash_core::{ControllerError, CoreRuntime, LifecycleController, RunningCore};
   use rsclash_domain::{
     AppEvent, AppStatus, CommandOutput, CoreChannel, CoreRunMode, CoreState, MihomoConnection,
@@ -1094,7 +1121,7 @@ mod tests {
   use serde_json::json;
   use tokio::{sync::broadcast, time::timeout};
 
-  use super::{AppEventReceiver, BackendHandle, MihomoAccess, WakeHandle};
+  use super::{AppEventReceiver, BackendHandle, MihomoAccess, ProfileAccess, WakeHandle};
 
   #[derive(Clone, Copy, Debug, Eq, PartialEq)]
   enum CoreCall {
@@ -1137,6 +1164,15 @@ mod tests {
 
   struct OrderedRecovery {
     order: Arc<Mutex<Vec<&'static str>>>,
+  }
+
+  struct AcceptValidator;
+
+  #[async_trait]
+  impl RuntimeValidator for AcceptValidator {
+    async fn validate(&self, _staging_path: &std::path::Path) -> ConfigResult<()> {
+      Ok(())
+    }
   }
 
   #[async_trait]
@@ -1355,6 +1391,146 @@ mod tests {
     );
     assert!(calls.iter().any(|call| matches!(call, MihomoCall::SelectProxy { group, proxy } if group == "GLOBAL" && proxy == "Node A")));
     assert!(backend.shutdown().await.is_ok());
+  }
+
+  #[tokio::test]
+  async fn proxy_selection_is_persisted_and_cleans_up_the_previous_node() {
+    let root = std::env::temp_dir().join(format!(
+      "rsclash-app-selection-{}-{}",
+      std::process::id(),
+      SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+    ));
+    let store = initialize_default_runtime(&root).expect("the default runtime should initialize");
+    let uid = "selection-profile";
+    let mut transaction = store.begin().expect("the profile transaction should begin");
+    transaction
+      .add_profile(
+        ProfileItem {
+          uid: Some(uid.to_string()),
+          kind: Some(ProfileKind::Local),
+          name: Some("Selection profile".to_string()),
+          file: Some(format!("{uid}.yaml")),
+          ..ProfileItem::default()
+        },
+        "mode: rule\nproxies: []\nproxy-groups: []\nrules: []\n",
+      )
+      .expect("the source profile should stage");
+    transaction
+      .edit_catalog(|catalog| catalog.current = Some(uid.to_string()))
+      .expect("the current profile should stage");
+    transaction
+      .validate()
+      .expect("the profile transaction should validate");
+    transaction
+      .commit()
+      .expect("the profile transaction should commit");
+    let node_a = Proxy {
+      name: "Node A".to_string(),
+      alive: true,
+      ..Proxy::default()
+    };
+    let node_b = Proxy {
+      name: "Node B".to_string(),
+      alive: true,
+      ..Proxy::default()
+    };
+    let group = Proxy {
+      name: "GLOBAL".to_string(),
+      kind: "Selector".to_string(),
+      all: Some(vec![node_a.name.clone(), node_b.name.clone()]),
+      now: Some(node_a.name.clone()),
+      ..Proxy::default()
+    };
+    let fake = FakeMihomoApi::new(FakeMihomoState {
+      groups: Groups {
+        proxies: vec![group],
+        ..Groups::default()
+      },
+      proxies: Proxies {
+        proxies: HashMap::from([(node_a.name.clone(), node_a), (node_b.name.clone(), node_b)]),
+        ..Proxies::default()
+      },
+      connections: Connections {
+        connections: Some(vec![rsclash_mihomo::models::Connection {
+          id: "old-node-connection".to_string(),
+          chains: vec!["Node A".to_string()],
+          ..rsclash_mihomo::models::Connection::default()
+        }]),
+        ..Connections::default()
+      },
+      ..FakeMihomoState::default()
+    });
+    let core = CoreRuntime::spawn(
+      &tokio::runtime::Handle::current(),
+      BridgeController {
+        calls: Arc::new(Mutex::new(Vec::new())),
+      },
+    );
+    let recovery: Arc<dyn SystemStateRecovery> = Arc::new(OrderedRecovery {
+      order: Arc::new(Mutex::new(Vec::new())),
+    });
+    let profile_access = ProfileAccess::new(store.clone(), Arc::new(AcceptValidator))
+      .expect("profile access should build");
+    let backend = BackendHandle::spawn_with_core_integrations(
+      &tokio::runtime::Handle::current(),
+      WakeHandle::default(),
+      core,
+      recovery,
+      MihomoAccess::same(Arc::new(fake.clone())),
+      profile_access,
+    );
+    let mut client = backend.client();
+    client
+      .request(UiCommand::StartCore(CoreChannel::Stable))
+      .await
+      .expect("core start should be accepted");
+    wait_for_snapshot(&mut client, |snapshot| {
+      snapshot.mihomo.connection == MihomoConnection::Connected
+        && snapshot.mihomo.current_proxy() == Some("Node A")
+    })
+    .await;
+    client
+      .request(UiCommand::SelectProxy {
+        group: "GLOBAL".to_string(),
+        proxy: "Node B".to_string(),
+      })
+      .await
+      .expect("proxy selection should be accepted");
+
+    timeout(Duration::from_secs(1), async {
+      loop {
+        let persisted = store
+          .load_catalog()
+          .expect("the profile catalog should load")
+          .get(uid)
+          .and_then(|item| item.selected.as_deref())
+          .is_some_and(|selected| {
+            selected.iter().any(|selection| {
+              selection.name.as_deref() == Some("GLOBAL")
+                && selection.now.as_deref() == Some("Node B")
+            })
+          });
+        let closed = fake
+          .calls()
+          .expect("the fake calls should be available")
+          .iter()
+          .any(
+            |call| matches!(call, MihomoCall::CloseConnection(id) if id == "old-node-connection"),
+          );
+        if persisted && closed {
+          break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+      }
+    })
+    .await
+    .expect("selection persistence and cleanup should complete");
+
+    assert!(backend.shutdown().await.is_ok());
+    fs::remove_dir_all(root).expect("the test directory should be removed");
   }
 
   #[tokio::test]

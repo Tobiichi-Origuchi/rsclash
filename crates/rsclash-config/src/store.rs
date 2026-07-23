@@ -8,7 +8,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Error, ProfileCatalog, Result, from_yaml, to_yaml, transaction::ProfileTransaction};
+use crate::{
+  Error, ProfileCatalog, Result, VergeConfig, from_yaml, to_yaml, transaction::ProfileTransaction,
+};
 
 const CATALOG_HEADER: &str = "# Profiles Config for rsclash\n";
 const JOURNAL_PREFIX: &str = ".rsclash-rollback-";
@@ -67,6 +69,25 @@ impl ProfileStore {
       return Ok(ProfileCatalog::default());
     }
     let source = read_file(&self.paths.profiles_catalog)?;
+    from_yaml(&source)
+  }
+
+  pub fn load_verge_config(&self) -> Result<VergeConfig> {
+    match fs::symlink_metadata(&self.paths.verge_config) {
+      Ok(_) => {},
+      Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+        return Ok(VergeConfig::default());
+      },
+      Err(source) => {
+        return Err(Error::io(
+          "inspect application config",
+          &self.paths.verge_config,
+          source,
+        ));
+      },
+    }
+    reject_symlink(&self.paths.verge_config)?;
+    let source = read_file(&self.paths.verge_config)?;
     from_yaml(&source)
   }
 
@@ -432,6 +453,32 @@ mod tests {
   };
 
   use super::{ProfileStore, RollbackJournal, atomic_write};
+
+  #[test]
+  fn application_config_loads_as_optional_typed_data() {
+    let directory = TestDirectory::new();
+    let store = ProfileStore::open(&directory.path).expect("store should open");
+    assert!(
+      store
+        .load_verge_config()
+        .expect("missing application config should use defaults")
+        .auto_close_connection
+        .is_none()
+    );
+
+    atomic_write(
+      &store.paths().verge_config,
+      b"auto_close_connection: false\n",
+    )
+    .expect("application config should write");
+    assert_eq!(
+      store
+        .load_verge_config()
+        .expect("application config should load")
+        .auto_close_connection,
+      Some(false)
+    );
+  }
 
   #[test]
   fn opening_store_recovers_an_unfinished_file_transaction() {

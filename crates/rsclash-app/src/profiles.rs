@@ -13,8 +13,9 @@ use reqwest::{Client, Proxy, Url, header::HeaderMap, redirect::Policy};
 use rsclash_config::{
   ApplicationLayer, EnhancementInput, EnhancementPipeline, ListenerPolicy, ManualLayer,
   MihomoConfig, NativeTransform, ProfileCatalog, ProfileItem, ProfileKind, ProfileOptions,
-  ProfileStore, RuntimeActivator, RuntimeDeployer, RuntimeStore, RuntimeValidator, SequenceEdit,
-  SequenceLayers, SubscriptionInfo, TargetPlatform, extract_control_plane,
+  ProfileSelection, ProfileStore, RuntimeActivator, RuntimeDeployer, RuntimeStore,
+  RuntimeValidator, SequenceEdit, SequenceLayers, SubscriptionInfo, TargetPlatform,
+  extract_control_plane,
 };
 use rsclash_domain::{
   ProfileDownloadProxy, ProfileEnhancementRefs, ProfileSourceKind, ProfileSummary,
@@ -72,7 +73,14 @@ impl ProfileAccess {
 pub(crate) enum ProfileBridgeCommand {
   Refresh,
   Import(ProfileImportCommand),
-  Activate { uid: String },
+  Activate {
+    uid: String,
+  },
+  PersistSelection {
+    group: String,
+    proxy: String,
+    previous: Option<String>,
+  },
   Mutate(ProfileMutationCommand),
   Update(ProfileUpdateCommand),
   Content(ProfileContentCommand),
@@ -132,7 +140,11 @@ pub(crate) enum ProfileContentCommand {
 
 pub(crate) enum ProfileBridgeEvent {
   Snapshot(ProfilesSnapshot),
-  RuntimeChanged,
+  RuntimeChanged(ProfileRuntimeSync),
+  SelectionPersisted {
+    previous: Option<String>,
+    close_connections: bool,
+  },
   ContentLoaded {
     uid: String,
     content: SensitiveString,
@@ -141,6 +153,18 @@ pub(crate) enum ProfileBridgeEvent {
     uid: String,
   },
   CommandFailed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredProxySelection {
+  pub group: String,
+  pub proxy: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProfileRuntimeSync {
+  pub selections: Vec<StoredProxySelection>,
+  pub close_connections: bool,
 }
 
 struct ProfileWorker {
@@ -166,6 +190,7 @@ impl ProfileWorker {
 
   async fn run(mut self, mut command_rx: mpsc::Receiver<ProfileBridgeCommand>) {
     self.refresh().await;
+    self.synchronize_current_profile().await;
     self.update_automatic_profiles().await;
     let mut auto_update = interval(AUTO_UPDATE_POLL_INTERVAL);
     auto_update.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -198,6 +223,11 @@ impl ProfileWorker {
         let result = self.activate(uid).await;
         self.finish_operation(result).await;
       },
+      ProfileBridgeCommand::PersistSelection {
+        group,
+        proxy,
+        previous,
+      } => self.persist_selection(group, proxy, previous).await,
       ProfileBridgeCommand::Mutate(command) => {
         self.set_busy(true).await;
         let result = self.mutate(command).await;
@@ -235,6 +265,44 @@ impl ProfileWorker {
         }
         self.finish_operation(result.map(|_| ())).await;
       },
+    }
+  }
+
+  async fn persist_selection(&self, group: String, proxy: String, previous: Option<String>) {
+    let store = self.access.store.clone();
+    let result = spawn_blocking(move || persist_profile_selection(&store, &group, &proxy))
+      .await
+      .map_err(|error| format!("profile selection task failed: {error}"))
+      .and_then(|result| result);
+    match result {
+      Ok(close_connections) => {
+        let _ = self
+          .event_tx
+          .send(ProfileBridgeEvent::SelectionPersisted {
+            previous,
+            close_connections,
+          })
+          .await;
+      },
+      Err(error) => self.fail(error).await,
+    }
+  }
+
+  async fn synchronize_current_profile(&self) {
+    let store = self.access.store.clone();
+    let result = spawn_blocking(move || current_profile_runtime_sync(&store))
+      .await
+      .map_err(|error| format!("profile selection sync task failed: {error}"))
+      .and_then(|result| result);
+    match result {
+      Ok(Some(sync)) => {
+        let _ = self
+          .event_tx
+          .send(ProfileBridgeEvent::RuntimeChanged(sync))
+          .await;
+      },
+      Ok(None) => {},
+      Err(error) => self.fail(error).await,
     }
   }
 
@@ -472,7 +540,6 @@ impl ProfileWorker {
         )),
       };
     }
-    let _ = self.event_tx.send(ProfileBridgeEvent::RuntimeChanged).await;
     Ok(())
   }
 
@@ -534,7 +601,6 @@ impl ProfileWorker {
       spawn_blocking(move || replace_editable_profile(&store, &save_uid, content.into_bytes()))
         .await
         .map_err(|error| format!("profile save task failed: {error}"))??;
-    let active_changed = prepared.active_uid.is_some();
     let validation = if let Some(active_uid) = prepared.active_uid {
       self.activate(active_uid).await
     } else if let Some(validation_uid) = prepared.validation_uid {
@@ -559,9 +625,6 @@ impl ProfileWorker {
         )),
       };
     }
-    if active_changed {
-      let _ = self.event_tx.send(ProfileBridgeEvent::RuntimeChanged).await;
-    }
     Ok(())
   }
 
@@ -583,6 +646,11 @@ impl ProfileWorker {
     let prepared = spawn_blocking(move || prepare_activation(&store, &uid))
       .await
       .map_err(|error| format!("profile preparation task failed: {error}"))??;
+    let store = self.access.store.clone();
+    let sync_uid = prepared.uid.clone();
+    let sync = spawn_blocking(move || profile_runtime_sync(&store, &sync_uid, true))
+      .await
+      .map_err(|error| format!("profile selection sync task failed: {error}"))??;
     let runtime_store =
       RuntimeStore::open(&prepared.runtime_path).map_err(|error| error.to_string())?;
     let deployer = RuntimeDeployer::new(
@@ -609,6 +677,10 @@ impl ProfileWorker {
         )),
       };
     }
+    let _ = self
+      .event_tx
+      .send(ProfileBridgeEvent::RuntimeChanged(sync))
+      .await;
     Ok(())
   }
 
@@ -1674,6 +1746,107 @@ fn set_current_profile(store: &ProfileStore, uid: &str) -> rsclash_config::Resul
   Ok(())
 }
 
+fn persist_profile_selection(
+  store: &ProfileStore,
+  group: &str,
+  proxy: &str,
+) -> Result<bool, String> {
+  if group.trim().is_empty() || proxy.trim().is_empty() {
+    return Err("proxy group and node names must not be empty".to_string());
+  }
+  let close_connections = close_connections_after_proxy_change(store)?;
+  let mut transaction = store.begin().map_err(|error| error.to_string())?;
+  let current = transaction
+    .catalog()
+    .current
+    .clone()
+    .ok_or_else(|| "no active profile is available for proxy selection".to_string())?;
+  let item = transaction
+    .catalog()
+    .get(&current)
+    .ok_or_else(|| format!("active profile {current} does not exist"))?;
+  if !item.is_source() {
+    return Err(format!("active profile {current} is not a source profile"));
+  }
+  let group = group.to_string();
+  let proxy = proxy.to_string();
+  transaction
+    .edit_catalog(|catalog| {
+      if let Some(item) = catalog
+        .items_mut()
+        .iter_mut()
+        .find(|item| item.uid.as_deref() == Some(current.as_str()))
+      {
+        let selections = item.selected.get_or_insert_with(Vec::new);
+        selections.retain(|selection| selection.name.as_deref() != Some(group.as_str()));
+        selections.push(ProfileSelection {
+          name: Some(group),
+          now: Some(proxy),
+          ..ProfileSelection::default()
+        });
+      }
+    })
+    .map_err(|error| error.to_string())?;
+  transaction.validate().map_err(|error| error.to_string())?;
+  transaction.commit().map_err(|error| error.to_string())?;
+  Ok(close_connections)
+}
+
+fn current_profile_runtime_sync(
+  store: &ProfileStore,
+) -> Result<Option<ProfileRuntimeSync>, String> {
+  let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+  let Some(uid) = catalog.current else {
+    return Ok(None);
+  };
+  profile_runtime_sync(store, &uid, false).map(Some)
+}
+
+fn profile_runtime_sync(
+  store: &ProfileStore,
+  uid: &str,
+  apply_close_policy: bool,
+) -> Result<ProfileRuntimeSync, String> {
+  let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+  let item = catalog
+    .get(uid)
+    .ok_or_else(|| format!("profile {uid} does not exist"))?;
+  if !item.is_source() {
+    return Err(format!("profile {uid} is not a source profile"));
+  }
+  Ok(ProfileRuntimeSync {
+    selections: normalized_selections(item.selected.as_deref().unwrap_or_default()),
+    close_connections: apply_close_policy && close_connections_after_proxy_change(store)?,
+  })
+}
+
+fn normalized_selections(selections: &[ProfileSelection]) -> Vec<StoredProxySelection> {
+  let mut seen = BTreeSet::new();
+  let mut normalized = selections
+    .iter()
+    .rev()
+    .filter_map(|selection| {
+      let group = selection.name.as_deref()?;
+      let proxy = selection.now.as_deref()?;
+      (!group.trim().is_empty() && !proxy.trim().is_empty() && seen.insert(group.to_string())).then(
+        || StoredProxySelection {
+          group: group.to_string(),
+          proxy: proxy.to_string(),
+        },
+      )
+    })
+    .collect::<Vec<_>>();
+  normalized.reverse();
+  normalized
+}
+
+fn close_connections_after_proxy_change(store: &ProfileStore) -> Result<bool, String> {
+  store
+    .load_verge_config()
+    .map(|config| config.auto_close_connection.unwrap_or(true))
+    .map_err(|error| error.to_string())
+}
+
 fn load_snapshot(store: &ProfileStore) -> Result<ProfilesSnapshot, String> {
   let catalog = store.load_catalog().map_err(|error| error.to_string())?;
   let items = catalog
@@ -1784,8 +1957,9 @@ mod tests {
 
   use super::{
     DownloadedProfile, ProfileAccess, ProfileWorker, delete_profiles, due_remote_profile_uids,
-    duplicate_profile, import_content, import_local, load_snapshot, prepare_activation,
-    rename_profile, reorder_profile, set_current_profile, set_remote_options,
+    duplicate_profile, import_content, import_local, load_snapshot, persist_profile_selection,
+    prepare_activation, profile_runtime_sync, rename_profile, reorder_profile, set_current_profile,
+    set_remote_options,
   };
 
   static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -2007,6 +2181,72 @@ mod tests {
         .expect("the profiles directory should be readable")
         .count(),
       0
+    );
+  }
+
+  #[test]
+  fn current_profile_persists_and_restores_proxy_selections() {
+    let directory = TestDirectory::new();
+    let store =
+      initialize_default_runtime(&directory.root).expect("the default runtime should initialize");
+    import_content(
+      &store,
+      "Selections",
+      rsclash_config::ProfileKind::Local,
+      None,
+      None,
+      DownloadedProfile::from_content(
+        b"mode: rule\nproxies: []\nproxy-groups: []\nrules: []\n".to_vec(),
+      ),
+    )
+    .expect("the profile should import");
+    let uid = store
+      .load_catalog()
+      .expect("the catalog should load")
+      .items()
+      .iter()
+      .find(|item| item.is_source())
+      .and_then(|item| item.uid.clone())
+      .expect("the source profile should have a UID");
+    set_current_profile(&store, &uid).expect("the profile should become current");
+
+    assert!(
+      persist_profile_selection(&store, "Primary", "Node A")
+        .expect("the first selection should persist")
+    );
+    assert!(
+      persist_profile_selection(&store, "Fallback", "Node B")
+        .expect("the second selection should persist")
+    );
+    assert!(
+      persist_profile_selection(&store, "Primary", "Node C")
+        .expect("the replacement selection should persist")
+    );
+    let sync = profile_runtime_sync(&store, &uid, true).expect("the runtime selection should load");
+    assert!(sync.close_connections);
+    assert_eq!(
+      sync.selections,
+      vec![
+        super::StoredProxySelection {
+          group: "Fallback".to_string(),
+          proxy: "Node B".to_string(),
+        },
+        super::StoredProxySelection {
+          group: "Primary".to_string(),
+          proxy: "Node C".to_string(),
+        },
+      ]
+    );
+
+    fs::write(
+      &store.paths().verge_config,
+      "auto_close_connection: false\n",
+    )
+    .expect("the application setting should be written");
+    assert!(
+      !profile_runtime_sync(&store, &uid, true)
+        .expect("the disabled cleanup policy should load")
+        .close_connections
     );
   }
 
