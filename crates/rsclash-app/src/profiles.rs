@@ -17,8 +17,8 @@ use rsclash_config::{
   SequenceLayers, SubscriptionInfo, TargetPlatform, extract_control_plane,
 };
 use rsclash_domain::{
-  ProfileDownloadProxy, ProfileSourceKind, ProfileSummary, ProfilesSnapshot, RemoteProfileOptions,
-  SensitiveString, SubscriptionUsage,
+  ProfileDownloadProxy, ProfileEnhancementRefs, ProfileSourceKind, ProfileSummary,
+  ProfilesSnapshot, RemoteProfileOptions, SensitiveString, SubscriptionUsage,
 };
 use rsclash_platform::SystemProxyBackend;
 use serde_yaml_ng::Value;
@@ -32,6 +32,8 @@ const MAX_PROFILE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROFILE_NAME_CHARS: usize = 128;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTO_UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const MERGE_PROFILE_TEMPLATE: &str = "profile:\n  store-selected: true\n";
+const SEQUENCE_PROFILE_TEMPLATE: &str = "prepend: []\nappend: []\ndelete: []\n";
 
 #[derive(Clone)]
 pub struct ProfileAccess {
@@ -708,6 +710,19 @@ fn import_content(
   validate_profile_name(name)?;
   validate_source_content(&download.content)?;
   let uid = unique_profile_uid();
+  let source_kind = matches!(&kind, ProfileKind::Local | ProfileKind::Remote);
+  let mut configured = options.as_ref().map(remote_options_to_config);
+  let enhancements = if source_kind {
+    let (linked, refs) = new_profile_enhancements(name);
+    let options = configured.get_or_insert_with(ProfileOptions::default);
+    options.merge = refs.merge;
+    options.rules = refs.rules;
+    options.proxies = refs.proxies;
+    options.groups = refs.groups;
+    linked
+  } else {
+    Vec::new()
+  };
   let item = ProfileItem {
     uid: Some(uid.clone()),
     kind: Some(kind),
@@ -715,7 +730,7 @@ fn import_content(
     file: Some(format!("{uid}.yaml")),
     url,
     extra: download.usage,
-    option: options.as_ref().map(remote_options_to_config),
+    option: configured,
     home: download.home_page,
     updated: Some(unix_seconds()),
     ..ProfileItem::default()
@@ -724,9 +739,48 @@ fn import_content(
   transaction
     .add_profile(item, download.content)
     .map_err(|error| error.to_string())?;
+  for (item, content) in enhancements {
+    transaction
+      .add_profile(item, content)
+      .map_err(|error| error.to_string())?;
+  }
   transaction.validate().map_err(|error| error.to_string())?;
   transaction.commit().map_err(|error| error.to_string())?;
   Ok(())
+}
+
+fn new_profile_enhancements(
+  source_name: &str,
+) -> (Vec<(ProfileItem, &'static str)>, ProfileEnhancementRefs) {
+  let mut linked = Vec::with_capacity(4);
+  let mut refs = ProfileEnhancementRefs::default();
+  for (kind, label, content) in [
+    (ProfileKind::Merge, "Merge", MERGE_PROFILE_TEMPLATE),
+    (ProfileKind::Rules, "Rules", SEQUENCE_PROFILE_TEMPLATE),
+    (ProfileKind::Proxies, "Proxies", SEQUENCE_PROFILE_TEMPLATE),
+    (ProfileKind::Groups, "Groups", SEQUENCE_PROFILE_TEMPLATE),
+  ] {
+    let uid = unique_profile_uid();
+    match &kind {
+      ProfileKind::Merge => refs.merge = Some(uid.clone()),
+      ProfileKind::Rules => refs.rules = Some(uid.clone()),
+      ProfileKind::Proxies => refs.proxies = Some(uid.clone()),
+      ProfileKind::Groups => refs.groups = Some(uid.clone()),
+      _ => {},
+    }
+    linked.push((
+      ProfileItem {
+        uid: Some(uid.clone()),
+        kind: Some(kind),
+        name: Some(format!("{source_name} · {label}")),
+        file: Some(format!("{uid}.yaml")),
+        updated: Some(unix_seconds()),
+        ..ProfileItem::default()
+      },
+      content,
+    ));
+  }
+  (linked, refs)
 }
 
 struct RemoteProfile {
@@ -857,6 +911,85 @@ fn duplicate_profile(store: &ProfileStore, uid: &str) -> Result<(), String> {
   ) {
     return Err(format!("profile {uid} cannot be duplicated"));
   }
+  let copy_name = format!(
+    "{} (copy)",
+    source.name.as_deref().unwrap_or("Unnamed profile")
+  );
+  let (mut copy, content) = duplicate_profile_item(store, &source, &copy_name)?;
+  copy.selected = None;
+  let mut linked = Vec::new();
+  if source.is_source() {
+    let options = copy.option.get_or_insert_with(ProfileOptions::default);
+    options.script = None;
+    for (kind, label, source_uid) in [
+      (
+        ProfileKind::Merge,
+        "Merge",
+        options.merge.as_deref().map(str::to_string),
+      ),
+      (
+        ProfileKind::Rules,
+        "Rules",
+        options.rules.as_deref().map(str::to_string),
+      ),
+      (
+        ProfileKind::Proxies,
+        "Proxies",
+        options.proxies.as_deref().map(str::to_string),
+      ),
+      (
+        ProfileKind::Groups,
+        "Groups",
+        options.groups.as_deref().map(str::to_string),
+      ),
+    ] {
+      let Some(source_uid) = source_uid else {
+        continue;
+      };
+      let source_item = catalog
+        .get(&source_uid)
+        .ok_or_else(|| format!("referenced {kind} profile {source_uid} does not exist"))?;
+      if source_item.kind.as_ref() != Some(&kind) {
+        return Err(format!(
+          "referenced profile {source_uid} has the wrong enhancement type"
+        ));
+      }
+      let (item, content) =
+        duplicate_profile_item(store, source_item, &format!("{copy_name} · {label}"))?;
+      let copied_uid = item
+        .uid
+        .clone()
+        .ok_or_else(|| "copied enhancement profile has no UID".to_string())?;
+      match kind {
+        ProfileKind::Merge => options.merge = Some(copied_uid),
+        ProfileKind::Rules => options.rules = Some(copied_uid),
+        ProfileKind::Proxies => options.proxies = Some(copied_uid),
+        ProfileKind::Groups => options.groups = Some(copied_uid),
+        _ => {},
+      }
+      linked.push((item, content));
+    }
+  }
+
+  let mut transaction = store.begin().map_err(|error| error.to_string())?;
+  transaction
+    .add_profile(copy, content)
+    .map_err(|error| error.to_string())?;
+  for (item, content) in linked {
+    transaction
+      .add_profile(item, content)
+      .map_err(|error| error.to_string())?;
+  }
+  transaction.validate().map_err(|error| error.to_string())?;
+  transaction.commit().map_err(|error| error.to_string())?;
+  Ok(())
+}
+
+fn duplicate_profile_item(
+  store: &ProfileStore,
+  source: &ProfileItem,
+  name: &str,
+) -> Result<(ProfileItem, Vec<u8>), String> {
   let source_file = source
     .require_file()
     .map_err(|error| error.to_string())?
@@ -871,44 +1004,55 @@ fn duplicate_profile(store: &ProfileStore, uid: &str) -> Result<(), String> {
     .and_then(|extension| extension.to_str())
     .filter(|extension| !extension.is_empty())
     .unwrap_or("yaml");
-  let mut copy = source;
+  let mut copy = source.clone();
   copy.uid = Some(new_uid.clone());
   copy.file = Some(format!("{new_uid}.{extension}"));
-  copy.name = Some(format!(
-    "{} (copy)",
-    copy.name.as_deref().unwrap_or("Unnamed profile")
-  ));
-  copy.selected = None;
+  copy.name = Some(name.to_string());
   copy.updated = Some(unix_seconds());
   copy.file_data = None;
-
-  let mut transaction = store.begin().map_err(|error| error.to_string())?;
-  transaction
-    .add_profile(copy, content)
-    .map_err(|error| error.to_string())?;
-  transaction.validate().map_err(|error| error.to_string())?;
-  transaction.commit().map_err(|error| error.to_string())?;
-  Ok(())
+  Ok((copy, content))
 }
 
 fn delete_profiles(store: &ProfileStore, uids: &[String]) -> Result<(), String> {
   let unique = uids
     .iter()
-    .map(String::as_str)
     .filter(|uid| !uid.is_empty())
+    .cloned()
     .collect::<BTreeSet<_>>();
   if unique.is_empty() {
     return Err("select at least one profile to delete".to_string());
   }
   let mut transaction = store.begin().map_err(|error| error.to_string())?;
   for uid in &unique {
-    if transaction.catalog().get(uid).is_none() {
+    if transaction.catalog().get(uid.as_str()).is_none() {
       return Err(format!("profile {uid} does not exist"));
     }
   }
-  for uid in unique {
+  let linked = unique
+    .iter()
+    .filter_map(|uid| transaction.catalog().get(uid))
+    .flat_map(profile_enhancement_uids)
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+  let retained_links = transaction
+    .catalog()
+    .items()
+    .iter()
+    .filter(|item| item.uid.as_ref().is_none_or(|uid| !unique.contains(uid)))
+    .flat_map(profile_enhancement_uids)
+    .map(str::to_string)
+    .collect::<BTreeSet<_>>();
+  let delete_uids = unique
+    .into_iter()
+    .chain(
+      linked
+        .into_iter()
+        .filter(|uid| !retained_links.contains(uid.as_str())),
+    )
+    .collect::<BTreeSet<_>>();
+  for uid in delete_uids {
     transaction
-      .remove_profile(uid)
+      .remove_profile(&uid)
       .map_err(|error| error.to_string())?;
   }
   transaction.validate().map_err(|error| error.to_string())?;
@@ -916,24 +1060,56 @@ fn delete_profiles(store: &ProfileStore, uids: &[String]) -> Result<(), String> 
   Ok(())
 }
 
+fn profile_enhancement_uids(item: &ProfileItem) -> impl Iterator<Item = &str> {
+  item
+    .option
+    .as_ref()
+    .into_iter()
+    .flat_map(|options| {
+      [
+        options.merge.as_deref(),
+        options.script.as_deref(),
+        options.rules.as_deref(),
+        options.proxies.as_deref(),
+        options.groups.as_deref(),
+      ]
+    })
+    .flatten()
+}
+
 fn reorder_profile(store: &ProfileStore, uid: &str, new_index: usize) -> Result<(), String> {
   let mut transaction = store.begin().map_err(|error| error.to_string())?;
-  let item_count = transaction.catalog().items().len();
+  let mut sources = transaction
+    .catalog()
+    .items()
+    .iter()
+    .filter(|item| item.is_source())
+    .cloned()
+    .collect::<Vec<_>>();
+  let item_count = sources.len();
   if new_index >= item_count {
     return Err(format!(
       "profile index {new_index} is outside the {item_count}-item catalog"
     ));
   }
-  let old_index = transaction
-    .catalog()
-    .items()
+  let old_index = sources
     .iter()
     .position(|item| item.uid.as_deref() == Some(uid))
-    .ok_or_else(|| format!("profile {uid} does not exist"))?;
+    .ok_or_else(|| format!("source profile {uid} does not exist"))?;
+  let item = sources.remove(old_index);
+  sources.insert(new_index, item);
   transaction
     .edit_catalog(|catalog| {
-      let item = catalog.items_mut().remove(old_index);
-      catalog.items_mut().insert(new_index, item);
+      let mut reordered = sources.into_iter();
+      for item in catalog
+        .items_mut()
+        .iter_mut()
+        .filter(|item| item.is_source())
+      {
+        if let Some(source) = reordered.next() {
+          *item = source;
+        }
+      }
     })
     .map_err(|error| error.to_string())?;
   transaction.validate().map_err(|error| error.to_string())?;
@@ -1504,16 +1680,16 @@ fn load_snapshot(store: &ProfileStore) -> Result<ProfilesSnapshot, String> {
     .items()
     .iter()
     .filter_map(|item| {
+      if !item.is_source() {
+        return None;
+      }
       let uid = item.uid.as_ref()?.clone();
       let source = match item.kind.as_ref() {
         Some(ProfileKind::Local) => ProfileSourceKind::Local,
         Some(ProfileKind::Remote) => ProfileSourceKind::Remote,
-        Some(ProfileKind::Merge) => ProfileSourceKind::Merge,
-        Some(ProfileKind::Rules) => ProfileSourceKind::Rules,
-        Some(ProfileKind::Proxies) => ProfileSourceKind::Proxies,
-        Some(ProfileKind::Groups) => ProfileSourceKind::Groups,
         _ => ProfileSourceKind::Other,
       };
+      let options = item.option.as_ref();
       Some(ProfileSummary {
         active: catalog.current.as_deref() == Some(uid.as_str()),
         name: item.name.clone().unwrap_or_else(|| uid.clone()),
@@ -1530,6 +1706,12 @@ fn load_snapshot(store: &ProfileStore) -> Result<ProfilesSnapshot, String> {
         }),
         remote_options: (item.kind == Some(ProfileKind::Remote))
           .then(|| remote_options_from_config(item.option.as_ref())),
+        enhancements: ProfileEnhancementRefs {
+          merge: options.and_then(|options| options.merge.clone()),
+          rules: options.and_then(|options| options.rules.clone()),
+          proxies: options.and_then(|options| options.proxies.clone()),
+          groups: options.and_then(|options| options.groups.clone()),
+        },
       })
     })
     .collect();
@@ -1622,63 +1804,57 @@ mod tests {
 
     import_local(&store, "Local test", &source).expect("the local profile should import");
     let catalog = store.load_catalog().expect("the catalog should load");
-    let uid = catalog.items()[0]
+    let source_item = catalog
+      .items()
+      .iter()
+      .find(|item| item.is_source())
+      .expect("the imported source profile should exist");
+    let uid = source_item
       .uid
       .clone()
       .expect("the imported profile should have a UID");
-    let mut transaction = store
-      .begin()
-      .expect("the enhancement transaction should begin");
-    for (uid, kind, content) in [
+    let options = source_item
+      .option
+      .as_ref()
+      .expect("the source profile should own enhancement references");
+    let enhancements = [
       (
-        "merge-test",
-        rsclash_config::ProfileKind::Merge,
+        options
+          .merge
+          .clone()
+          .expect("the merge profile should exist"),
         "custom-field: applied\n",
       ),
       (
-        "rules-test",
-        rsclash_config::ProfileKind::Rules,
+        options
+          .rules
+          .clone()
+          .expect("the rules profile should exist"),
         "prepend: ['DOMAIN,example.com,DIRECT']\nappend: []\ndelete: []\n",
       ),
       (
-        "proxies-test",
-        rsclash_config::ProfileKind::Proxies,
+        options
+          .proxies
+          .clone()
+          .expect("the proxies profile should exist"),
         "prepend: []\nappend:\n- name: Node B\n  type: direct\ndelete: []\n",
       ),
       (
-        "groups-test",
-        rsclash_config::ProfileKind::Groups,
+        options
+          .groups
+          .clone()
+          .expect("the groups profile should exist"),
         "prepend: []\nappend:\n- name: Group B\n  type: select\n  proxies: [Node B]\ndelete: []\n",
       ),
-    ] {
+    ];
+    let mut transaction = store
+      .begin()
+      .expect("the enhancement transaction should begin");
+    for (enhancement_uid, content) in enhancements {
       transaction
-        .add_profile(
-          rsclash_config::ProfileItem {
-            uid: Some(uid.to_string()),
-            kind: Some(kind),
-            file: Some(format!("{uid}.yaml")),
-            ..rsclash_config::ProfileItem::default()
-          },
-          content,
-        )
+        .stage_profile(&enhancement_uid, content)
         .expect("the enhancement profile should stage");
     }
-    transaction
-      .edit_catalog(|catalog| {
-        catalog
-          .items_mut()
-          .iter_mut()
-          .find(|item| item.uid.as_deref() == Some(uid.as_str()))
-          .expect("the source profile should exist")
-          .option = Some(rsclash_config::ProfileOptions {
-          merge: Some("merge-test".to_string()),
-          rules: Some("rules-test".to_string()),
-          proxies: Some("proxies-test".to_string()),
-          groups: Some("groups-test".to_string()),
-          ..rsclash_config::ProfileOptions::default()
-        });
-      })
-      .expect("the source profile should reference enhancements");
     transaction
       .validate()
       .expect("the enhancement transaction should validate");
@@ -1776,7 +1952,7 @@ mod tests {
     rename_profile(&store, &original_uid, "Renamed").expect("the profile should rename");
     duplicate_profile(&store, &original_uid).expect("the profile should duplicate");
     let catalog = store.load_catalog().expect("the catalog should load");
-    assert_eq!(catalog.items().len(), 2);
+    assert_eq!(catalog.items().len(), 10);
     assert_eq!(
       catalog
         .get(&original_uid)
@@ -1786,6 +1962,7 @@ mod tests {
     let copy = catalog
       .items()
       .iter()
+      .filter(|item| item.is_source())
       .find(|item| item.uid.as_deref() != Some(original_uid.as_str()))
       .expect("the copy should exist");
     let copy_uid = copy.uid.clone().expect("the copy should have a UID");
@@ -1797,15 +1974,26 @@ mod tests {
         .as_bytes(),
       content
     );
+    let original_refs = catalog
+      .get(&original_uid)
+      .and_then(|item| item.option.as_ref())
+      .expect("the original should reference enhancements");
+    let copy_refs = copy
+      .option
+      .as_ref()
+      .expect("the copy should reference enhancements");
+    assert_ne!(copy_refs.merge, original_refs.merge);
+    assert_ne!(copy_refs.rules, original_refs.rules);
+    assert_ne!(copy_refs.proxies, original_refs.proxies);
+    assert_ne!(copy_refs.groups, original_refs.groups);
 
     reorder_profile(&store, &copy_uid, 0).expect("the copy should move to the beginning");
     assert_eq!(
-      store
-        .load_catalog()
-        .expect("the catalog should load")
-        .items()[0]
-        .uid
-        .as_deref(),
+      load_snapshot(&store)
+        .expect("the profile snapshot should load")
+        .items
+        .first()
+        .map(|profile| profile.uid.as_str()),
       Some(copy_uid.as_str())
     );
     set_current_profile(&store, &original_uid).expect("the original should become current");

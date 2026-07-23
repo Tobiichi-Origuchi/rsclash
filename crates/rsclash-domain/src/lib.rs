@@ -245,6 +245,14 @@ pub struct SubscriptionUsage {
   pub expire: u64,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProfileEnhancementRefs {
+  pub merge: Option<String>,
+  pub rules: Option<String>,
+  pub proxies: Option<String>,
+  pub groups: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProfileSummary {
   pub uid: String,
@@ -255,6 +263,7 @@ pub struct ProfileSummary {
   pub home_page: Option<String>,
   pub usage: Option<SubscriptionUsage>,
   pub remote_options: Option<RemoteProfileOptions>,
+  pub enhancements: ProfileEnhancementRefs,
   pub active: bool,
 }
 

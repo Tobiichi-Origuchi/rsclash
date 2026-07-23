@@ -55,6 +55,7 @@ pub struct RsClashUi {
   editing_profile_options: Option<String>,
   profile_options_edits: BTreeMap<String, RemoteProfileOptions>,
   profile_editor: Option<ProfileEditor>,
+  pending_profile_editor_name: Option<(String, String)>,
   pending_editor_close: bool,
 }
 
@@ -86,6 +87,7 @@ impl RsClashUi {
       editing_profile_options: None,
       profile_options_edits: BTreeMap::new(),
       profile_editor: None,
+      pending_profile_editor_name: None,
       pending_editor_close: false,
     }
   }
@@ -100,12 +102,20 @@ impl RsClashUi {
       match event {
         AppEvent::ProfileContentLoaded { uid, content } => {
           let name = self
-            .snapshot
-            .profiles
-            .items
-            .iter()
-            .find(|profile| profile.uid == uid)
-            .map_or_else(|| uid.clone(), |profile| profile.name.clone());
+            .pending_profile_editor_name
+            .take()
+            .filter(|(pending_uid, _)| pending_uid == &uid)
+            .map(|(_, name)| name)
+            .or_else(|| {
+              self
+                .snapshot
+                .profiles
+                .items
+                .iter()
+                .find(|profile| profile.uid == uid)
+                .map(|profile| profile.name.clone())
+            })
+            .unwrap_or_else(|| uid.clone());
           self.profile_editor = Some(ProfileEditor {
             uid,
             name,
@@ -885,9 +895,37 @@ impl RsClashUi {
             )
             .clicked()
           {
-            self.command(UiCommand::LoadProfileContent {
-              uid: profile.uid.clone(),
-            });
+            self.open_profile_editor(profile.uid.clone(), profile.name.clone());
+          }
+          for (label, title, uid) in [
+            (
+              "扩展配置",
+              "合并配置",
+              profile.enhancements.merge.as_deref(),
+            ),
+            (
+              "编辑规则",
+              "规则扩展",
+              profile.enhancements.rules.as_deref(),
+            ),
+            (
+              "编辑代理",
+              "代理扩展",
+              profile.enhancements.proxies.as_deref(),
+            ),
+            (
+              "编辑代理组",
+              "代理组扩展",
+              profile.enhancements.groups.as_deref(),
+            ),
+          ] {
+            if let Some(uid) = uid
+              && ui
+                .add_enabled(!profiles.busy, egui::Button::new(label))
+                .clicked()
+            {
+              self.open_profile_editor(uid.to_string(), format!("{} · {title}", profile.name));
+            }
           }
           if ui
             .add_enabled(
@@ -1181,6 +1219,11 @@ impl RsClashUi {
     if let Err(error) = self.client.try_command(command) {
       self.local_error = Some(client_error_message(&error));
     }
+  }
+
+  fn open_profile_editor(&mut self, uid: String, name: String) {
+    self.pending_profile_editor_name = Some((uid.clone(), name));
+    self.command(UiCommand::LoadProfileContent { uid });
   }
 }
 
