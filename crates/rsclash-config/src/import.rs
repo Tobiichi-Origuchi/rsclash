@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Mapping;
 
 use crate::{
-  Error, MihomoConfig, ProfileCatalog, ProfileStore, Result, VergeConfig,
+  Error, MihomoConfig, ProfileCatalog, ProfileKind, ProfileStore, Result, VergeConfig,
   store::{
     RollbackJournal, atomic_write, create_private_directory, read_bytes_if_exists, remove_file,
   },
@@ -31,6 +31,8 @@ pub enum CvrImportOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CvrImportReport {
   pub copied_files: usize,
+  pub skipped_script_profiles: usize,
+  pub removed_script_references: usize,
   pub backup_directory: PathBuf,
 }
 
@@ -93,6 +95,8 @@ impl CvrImporter {
     }
     Ok(CvrImportOutcome::Imported(CvrImportReport {
       copied_files: writes.len().saturating_sub(1),
+      skipped_script_profiles: bundle.skipped_script_profiles,
+      removed_script_references: bundle.removed_script_references,
       backup_directory,
     }))
   }
@@ -111,6 +115,8 @@ struct ImportBundle {
   catalog: Vec<u8>,
   dns: Option<Vec<u8>>,
   profiles: BTreeMap<String, Vec<u8>>,
+  skipped_script_profiles: usize,
+  removed_script_references: usize,
 }
 
 impl ImportBundle {
@@ -130,6 +136,8 @@ impl ImportBundle {
     validate_yaml::<MihomoConfig>(&clash, CVR_CLASH_CONFIG)?;
     validate_yaml::<VergeConfig>(&verge, CVR_VERGE_CONFIG)?;
     let parsed_catalog = validate_yaml::<ProfileCatalog>(&catalog, CVR_PROFILES_CATALOG)?;
+    let (parsed_catalog, sanitization) = remove_script_profiles(parsed_catalog);
+    let catalog = to_yaml(&parsed_catalog)?.into_bytes();
 
     let profiles_root = source_root.join(CVR_PROFILES_DIRECTORY);
     let metadata = fs::symlink_metadata(&profiles_root)
@@ -173,6 +181,8 @@ impl ImportBundle {
       catalog,
       dns,
       profiles,
+      skipped_script_profiles: sanitization.profiles,
+      removed_script_references: sanitization.references,
     })
   }
 
@@ -208,7 +218,7 @@ fn validate_profile_name(file_name: &str) -> Result<()> {
     && !file_name.starts_with('.')
     && matches!(
       path.extension().and_then(|extension| extension.to_str()),
-      Some("yaml" | "yml" | "js")
+      Some("yaml" | "yml")
     );
   if valid {
     Ok(())
@@ -218,15 +228,6 @@ fn validate_profile_name(file_name: &str) -> Result<()> {
 }
 
 fn validate_import_profile(path: &Path, content: &[u8], source_profile: bool) -> Result<()> {
-  if path.extension().and_then(|extension| extension.to_str()) == Some("js") {
-    if content.is_empty() {
-      return Err(Error::InvalidConfiguration(format!(
-        "CVR script profile {} is empty",
-        path.display()
-      )));
-    }
-    return Ok(());
-  }
   let mapping: Mapping = serde_yaml_ng::from_slice(content).map_err(Error::DecodeYaml)?;
   if source_profile && mapping.is_empty() {
     return Err(Error::InvalidConfiguration(format!(
@@ -235,6 +236,51 @@ fn validate_import_profile(path: &Path, content: &[u8], source_profile: bool) ->
     )));
   }
   Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ScriptSanitization {
+  profiles: usize,
+  references: usize,
+}
+
+fn remove_script_profiles(mut catalog: ProfileCatalog) -> (ProfileCatalog, ScriptSanitization) {
+  let script_uids = catalog
+    .items()
+    .iter()
+    .filter(|item| item.kind.as_ref() == Some(&ProfileKind::Script))
+    .filter_map(|item| item.uid.clone())
+    .collect::<BTreeSet<_>>();
+  let original_len = catalog.items().len();
+  catalog
+    .items_mut()
+    .retain(|item| item.kind.as_ref() != Some(&ProfileKind::Script));
+  let remaining_len = catalog.items().len();
+
+  let mut references = 0;
+  for item in catalog.items_mut() {
+    let Some(options) = &mut item.option else {
+      continue;
+    };
+    if options.script.take().is_some() {
+      references += 1;
+    }
+  }
+  if catalog
+    .current
+    .as_ref()
+    .is_some_and(|uid| script_uids.contains(uid))
+  {
+    catalog.current = None;
+  }
+
+  (
+    catalog,
+    ScriptSanitization {
+      profiles: original_len.saturating_sub(remaining_len),
+      references,
+    },
+  )
 }
 
 fn read_regular_source_file(path: &Path) -> Result<Vec<u8>> {
@@ -438,6 +484,8 @@ fn make_backup_read_only(path: &Path) -> Result<()> {
 mod tests {
   use std::{fs, path::PathBuf};
 
+  use crate::ProfileCatalog;
+
   use super::{CvrImportOutcome, CvrImporter};
 
   #[test]
@@ -455,6 +503,8 @@ mod tests {
       panic!("first import should copy files");
     };
     assert_eq!(report.copied_files, 5);
+    assert_eq!(report.skipped_script_profiles, 0);
+    assert_eq!(report.removed_script_references, 0);
     assert_eq!(
       fs::read_to_string(target.path.join("verge.yaml")).expect("imported verge should read"),
       "theme_mode: dark\n"
@@ -475,6 +525,57 @@ mod tests {
         .import()
         .expect("second import should be handled"),
       CvrImportOutcome::AlreadyImported
+    );
+  }
+
+  #[test]
+  fn imports_sources_without_cvr_scripts_or_script_references() {
+    let source = TestDirectory::new("cvr-script-source");
+    let target = TestDirectory::new("cvr-script-target");
+    write_valid_source(&source.path);
+    fs::write(
+      source.path.join("profiles.yaml"),
+      r"
+current: local
+items:
+- uid: local
+  type: local
+  file: local.yaml
+  option:
+    script: script
+- uid: script
+  type: script
+  file: script.js
+",
+    )
+    .expect("catalog with script should write");
+    fs::write(
+      source.path.join("profiles/script.js"),
+      "function main(config) { return config; }\n",
+    )
+    .expect("script should write");
+
+    let outcome = CvrImporter::new(&source.path, &target.path)
+      .import()
+      .expect("import should succeed");
+    let CvrImportOutcome::Imported(report) = outcome else {
+      panic!("first import should copy files");
+    };
+
+    assert_eq!(report.copied_files, 5);
+    assert_eq!(report.skipped_script_profiles, 1);
+    assert_eq!(report.removed_script_references, 1);
+    assert!(!target.path.join("profiles/script.js").exists());
+    let catalog: ProfileCatalog = serde_yaml_ng::from_str(
+      &fs::read_to_string(target.path.join("profiles.yaml")).expect("imported catalog should read"),
+    )
+    .expect("imported catalog should parse");
+    assert_eq!(catalog.items().len(), 1);
+    assert!(
+      catalog.items()[0]
+        .option
+        .as_ref()
+        .is_some_and(|options| options.script.is_none())
     );
   }
 
