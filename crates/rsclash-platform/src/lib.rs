@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+#[cfg(target_os = "linux")]
+mod linux_proxy;
+#[cfg(target_os = "linux")]
+pub use linux_proxy::LinuxSystemProxyBackend;
+
 const RECOVERY_VERSION: u8 = 1;
 const TEMP_PREFIX: &str = ".rsclash-recovery-";
 
@@ -34,10 +39,13 @@ pub enum RecoveryOutcome {
 #[serde(default)]
 pub struct SystemProxySnapshot {
   pub enabled: bool,
+  pub backend: Option<String>,
+  pub mode: Option<String>,
   pub http_proxy: Option<String>,
   pub https_proxy: Option<String>,
   pub socks_proxy: Option<String>,
   pub bypass: Vec<String>,
+  pub auto_config_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -74,6 +82,8 @@ pub enum Error {
   Unsupported(String),
   #[error("invalid recovery journal: {0}")]
   InvalidJournal(String),
+  #[error("platform operation failed: {0}")]
+  Platform(String),
   #[error("failed to {action} {path}: {source}")]
   Io {
     action: &'static str,
@@ -88,6 +98,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[async_trait]
 pub trait SystemRecoveryBackend: Send + Sync + 'static {
   async fn restore(&self, pending: &PendingSystemRecovery) -> Result<()>;
+}
+
+#[async_trait]
+pub trait SystemProxyBackend: SystemRecoveryBackend {
+  fn name(&self) -> &'static str;
+  async fn current(&self) -> Result<SystemProxySnapshot>;
+  async fn apply(&self, snapshot: &SystemProxySnapshot) -> Result<()>;
 }
 
 #[async_trait]
@@ -119,6 +136,124 @@ pub struct RecoveryManager {
   store: RecoveryStore,
   backend: Arc<dyn SystemRecoveryBackend>,
   gate: Mutex<()>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemProxyStatus {
+  pub backend: String,
+  pub enabled_by_app: bool,
+  pub applied: bool,
+}
+
+pub struct SystemProxyService {
+  recovery: RecoveryManager,
+  backend: Arc<dyn SystemProxyBackend>,
+  target: Mutex<Option<SystemProxySnapshot>>,
+  gate: Mutex<()>,
+}
+
+impl SystemProxyService {
+  pub fn new(recovery_path: impl Into<PathBuf>, backend: Arc<dyn SystemProxyBackend>) -> Self {
+    let recovery_backend: Arc<dyn SystemRecoveryBackend> =
+      Arc::<dyn SystemProxyBackend>::clone(&backend);
+    Self {
+      recovery: RecoveryManager::new(recovery_path, recovery_backend),
+      backend,
+      target: Mutex::new(None),
+      gate: Mutex::new(()),
+    }
+  }
+
+  pub async fn status(&self) -> Result<SystemProxyStatus> {
+    let current = self.backend.current().await?;
+    let target = self.target.lock().await;
+    Ok(SystemProxyStatus {
+      backend: self.backend.name().to_string(),
+      enabled_by_app: target.is_some(),
+      applied: target.as_ref().is_some_and(|target| target == &current),
+    })
+  }
+
+  pub async fn enable(&self, host: &str, port: u16, bypass: Vec<String>) -> Result<()> {
+    if host.is_empty() || port == 0 {
+      return Err(Error::Platform(
+        "system proxy host and port must be valid".to_string(),
+      ));
+    }
+    let _guard = self.gate.lock().await;
+    if self.recovery.pending().await?.is_some() {
+      return Err(Error::InvalidJournal(
+        "pending system state must be restored before enabling the proxy".to_string(),
+      ));
+    }
+    let original = self.backend.current().await?;
+    let endpoint = format_endpoint(host, port);
+    let target = SystemProxySnapshot {
+      enabled: true,
+      backend: Some(self.backend.name().to_string()),
+      mode: Some("manual".to_string()),
+      http_proxy: Some(endpoint.clone()),
+      https_proxy: Some(endpoint.clone()),
+      socks_proxy: Some(endpoint),
+      bypass,
+      auto_config_url: None,
+    };
+    self
+      .recovery
+      .mark_pending(&PendingSystemRecovery {
+        system_proxy: Some(original.clone()),
+        ..PendingSystemRecovery::default()
+      })
+      .await?;
+    if let Err(apply_error) = self.backend.apply(&target).await {
+      return match self.backend.apply(&original).await {
+        Ok(()) => {
+          self
+            .recovery
+            .mark_pending(&PendingSystemRecovery::default())
+            .await?;
+          Err(apply_error)
+        },
+        Err(restore_error) => Err(Error::Platform(format!(
+          "{apply_error}; restoring the previous system proxy also failed: {restore_error}"
+        ))),
+      };
+    }
+    *self.target.lock().await = Some(target);
+    Ok(())
+  }
+
+  pub async fn disable(&self) -> Result<RecoveryOutcome> {
+    let _guard = self.gate.lock().await;
+    let outcome = self
+      .recovery
+      .restore_pending(RecoveryReason::CleanShutdown)
+      .await?;
+    *self.target.lock().await = None;
+    Ok(outcome)
+  }
+
+  pub async fn pending(&self) -> Result<Option<PendingSystemRecovery>> {
+    self.recovery.pending().await
+  }
+}
+
+#[async_trait]
+impl SystemStateRecovery for SystemProxyService {
+  async fn restore_pending(&self, reason: RecoveryReason) -> Result<RecoveryOutcome> {
+    let _guard = self.gate.lock().await;
+    let outcome = self.recovery.restore_pending(reason).await?;
+    *self.target.lock().await = None;
+    Ok(outcome)
+  }
+}
+
+fn format_endpoint(host: &str, port: u16) -> String {
+  if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+    format!("[{host}]:{port}")
+  } else {
+    format!("{host}:{port}")
+  }
 }
 
 impl RecoveryManager {
@@ -304,7 +439,7 @@ mod tests {
     fs,
     path::PathBuf,
     sync::{
-      Arc,
+      Arc, Mutex,
       atomic::{AtomicBool, AtomicUsize, Ordering},
     },
   };
@@ -313,13 +448,57 @@ mod tests {
 
   use super::{
     Error, PendingSystemRecovery, RecoveryManager, RecoveryOutcome, RecoveryReason, Result,
-    SystemRecoveryBackend, SystemStateRecovery as _, UnavailableRecoveryBackend,
+    SystemProxyBackend, SystemProxyService, SystemProxySnapshot, SystemRecoveryBackend,
+    SystemStateRecovery as _, UnavailableRecoveryBackend,
   };
 
   #[derive(Default)]
   struct FakeBackend {
     calls: AtomicUsize,
     fail: AtomicBool,
+  }
+
+  struct FakeProxyBackend {
+    current: Mutex<SystemProxySnapshot>,
+    fail_manual: AtomicBool,
+  }
+
+  impl FakeProxyBackend {
+    fn new(current: SystemProxySnapshot) -> Self {
+      Self {
+        current: Mutex::new(current),
+        fail_manual: AtomicBool::new(false),
+      }
+    }
+  }
+
+  #[async_trait]
+  impl SystemRecoveryBackend for FakeProxyBackend {
+    async fn restore(&self, pending: &PendingSystemRecovery) -> Result<()> {
+      if let Some(snapshot) = &pending.system_proxy {
+        self.apply(snapshot).await?;
+      }
+      Ok(())
+    }
+  }
+
+  #[async_trait]
+  impl SystemProxyBackend for FakeProxyBackend {
+    fn name(&self) -> &'static str {
+      "fake"
+    }
+
+    async fn current(&self) -> Result<SystemProxySnapshot> {
+      Ok(self.current.lock().expect("proxy lock should open").clone())
+    }
+
+    async fn apply(&self, snapshot: &SystemProxySnapshot) -> Result<()> {
+      if self.fail_manual.load(Ordering::SeqCst) && snapshot.mode.as_deref() == Some("manual") {
+        return Err(Error::Platform("planned apply failure".to_string()));
+      }
+      *self.current.lock().expect("proxy lock should open") = snapshot.clone();
+      Ok(())
+    }
   }
 
   #[async_trait]
@@ -406,6 +585,69 @@ mod tests {
         .is_err()
     );
     assert!(matches!(manager.pending().await, Ok(Some(_))));
+  }
+
+  #[tokio::test]
+  async fn system_proxy_service_restores_the_exact_previous_state() {
+    let directory = TestDirectory::new();
+    let original = SystemProxySnapshot {
+      enabled: false,
+      backend: Some("fake".to_string()),
+      mode: Some("auto".to_string()),
+      auto_config_url: Some("https://example.test/proxy.pac".to_string()),
+      bypass: vec!["localhost".to_string()],
+      ..SystemProxySnapshot::default()
+    };
+    let backend = Arc::new(FakeProxyBackend::new(original.clone()));
+    let service = SystemProxyService::new(
+      directory.path.join("recovery.json"),
+      Arc::<FakeProxyBackend>::clone(&backend),
+    );
+
+    service
+      .enable("127.0.0.1", 17_897, vec!["localhost".to_string()])
+      .await
+      .expect("system proxy should enable");
+    assert!(service.status().await.expect("status should read").applied);
+    assert!(matches!(service.pending().await, Ok(Some(_))));
+
+    assert_eq!(
+      service.disable().await.ok(),
+      Some(RecoveryOutcome::Restored)
+    );
+    assert_eq!(
+      backend.current().await.expect("proxy should read"),
+      original
+    );
+    assert!(matches!(service.pending().await, Ok(None)));
+  }
+
+  #[tokio::test]
+  async fn failed_enable_compensates_and_clears_the_journal() {
+    let directory = TestDirectory::new();
+    let original = SystemProxySnapshot {
+      backend: Some("fake".to_string()),
+      mode: Some("none".to_string()),
+      ..SystemProxySnapshot::default()
+    };
+    let backend = Arc::new(FakeProxyBackend::new(original.clone()));
+    backend.fail_manual.store(true, Ordering::SeqCst);
+    let service = SystemProxyService::new(
+      directory.path.join("recovery.json"),
+      Arc::<FakeProxyBackend>::clone(&backend),
+    );
+
+    assert!(
+      service
+        .enable("127.0.0.1", 17_897, Vec::new())
+        .await
+        .is_err()
+    );
+    assert_eq!(
+      backend.current().await.expect("proxy should read"),
+      original
+    );
+    assert!(matches!(service.pending().await, Ok(None)));
   }
 
   struct TestDirectory {
