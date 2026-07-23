@@ -161,6 +161,11 @@ impl MihomoWorker {
       (Ok(version), Ok(config), Ok(groups), Ok(proxies)) => {
         self.state.version = Some(version.version);
         self.state.mixed_port = (config.mixed_port > 0).then_some(config.mixed_port);
+        self.state.tun_enabled = config
+          .tun
+          .get("enable")
+          .and_then(serde_json::Value::as_bool)
+          .unwrap_or(false);
         self.state.mode = ProxyMode::from(config.mode.as_str());
         self.state.groups = groups
           .proxies

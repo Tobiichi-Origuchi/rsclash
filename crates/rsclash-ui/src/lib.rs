@@ -381,6 +381,29 @@ impl RsClashUi {
         );
       }
     });
+
+    ui.add_space(12.0);
+    card(ui, "TUN 能力", |ui| {
+      let (status, detail, available) = tun_capability(&core, mihomo.tun_enabled);
+      ui.label(
+        RichText::new(status)
+          .size(18.0)
+          .strong()
+          .color(if available {
+            Color32::from_rgb(38, 162, 105)
+          } else {
+            ui.visuals().warn_fg_color
+          }),
+      );
+      ui.label(RichText::new(detail).small().weak());
+      if available && !mihomo.tun_enabled {
+        ui.label(
+          RichText::new("P6 仅显示权限状态；TUN 配置开关将在设置事务接入后开放。")
+            .small()
+            .weak(),
+        );
+      }
+    });
   }
 
   fn proxies(&mut self, ui: &mut Ui) {
@@ -735,6 +758,35 @@ fn proxy_mode_label(mode: &ProxyMode) -> &str {
   }
 }
 
+const fn tun_capability(core: &CoreState, enabled: bool) -> (&'static str, &'static str, bool) {
+  if enabled {
+    return ("TUN 已启用", "Mihomo 当前配置已启用 TUN。", true);
+  }
+  match core {
+    CoreState::Running {
+      mode: CoreRunMode::Service,
+      ..
+    } => (
+      "TUN 权限可用",
+      "核心由受限特权 service 运行，可创建 rsclash TUN 设备。",
+      true,
+    ),
+    CoreState::Running {
+      mode: CoreRunMode::Sidecar,
+      ..
+    } => (
+      "TUN 权限不可用",
+      "当前使用普通用户 sidecar；安装并使用特权 service 后才能安全启用 TUN。",
+      false,
+    ),
+    _ => (
+      "等待核心启动",
+      "核心启动后将根据实际运行后端检测 TUN 权限。",
+      false,
+    ),
+  }
+}
+
 fn stat_pair(ui: &mut Ui, first_label: &str, first: &str, second_label: &str, second: &str) {
   ui.columns(2, |columns| {
     columns[0].label(RichText::new(first).size(19.0).strong());
@@ -799,9 +851,9 @@ fn client_error_message(error: &ClientError) -> String {
 
 #[cfg(test)]
 mod tests {
-  use rsclash_domain::Page;
+  use rsclash_domain::{CoreChannel, CoreRunMode, CoreState, Page};
 
-  use super::format_bytes;
+  use super::{format_bytes, tun_capability};
 
   #[test]
   fn every_page_has_a_non_empty_native_label() {
@@ -817,5 +869,23 @@ mod tests {
     assert_eq!(format_bytes(0), "0 B");
     assert_eq!(format_bytes(1_024), "1.0 KiB");
     assert_eq!(format_bytes(5 * 1_024 * 1_024), "5.0 MiB");
+  }
+
+  #[test]
+  fn tun_capability_reflects_the_actual_core_backend() {
+    let service = CoreState::Running {
+      mode: CoreRunMode::Service,
+      channel: CoreChannel::Stable,
+      version: None,
+    };
+    let sidecar = CoreState::Running {
+      mode: CoreRunMode::Sidecar,
+      channel: CoreChannel::Stable,
+      version: None,
+    };
+
+    assert!(tun_capability(&service, false).2);
+    assert!(!tun_capability(&sidecar, false).2);
+    assert!(tun_capability(&sidecar, true).2);
   }
 }

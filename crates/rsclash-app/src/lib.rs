@@ -1036,6 +1036,7 @@ mod tests {
   use rsclash_platform::{
     RecoveryOutcome, RecoveryReason, Result as RecoveryResult, SystemStateRecovery,
   };
+  use serde_json::json;
   use tokio::{sync::broadcast, time::timeout};
 
   use super::{AppEventReceiver, BackendHandle, MihomoAccess, WakeHandle};
@@ -1217,7 +1218,9 @@ mod tests {
         ..VersionInfo::default()
       },
       base_config: BaseConfig {
+        mixed_port: 17_897,
         mode: "rule".to_string(),
+        tun: json!({ "enable": true }),
         ..BaseConfig::default()
       },
       groups: Groups {
@@ -1262,6 +1265,8 @@ mod tests {
     })
     .await;
     assert_eq!(client.current_snapshot().mihomo.memory_bytes, 4_096);
+    assert_eq!(client.current_snapshot().mihomo.mixed_port, Some(17_897));
+    assert!(client.current_snapshot().mihomo.tun_enabled);
     assert_eq!(
       client.current_snapshot().mihomo.current_proxy(),
       Some("Node A")

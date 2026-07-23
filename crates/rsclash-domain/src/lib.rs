@@ -174,6 +174,7 @@ pub struct MihomoSnapshot {
   pub connection: MihomoConnection,
   pub version: Option<String>,
   pub mixed_port: Option<u16>,
+  pub tun_enabled: bool,
   pub mode: ProxyMode,
   pub traffic: TrafficSnapshot,
   pub memory_bytes: u64,
