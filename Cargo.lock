@@ -2705,6 +2705,7 @@ dependencies = [
  "egui",
  "rsclash-app",
  "rsclash-domain",
+ "serde_yaml_ng",
 ]
 
 [[package]]

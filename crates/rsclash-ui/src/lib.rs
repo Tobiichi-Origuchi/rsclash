@@ -26,6 +26,48 @@ struct ProfileEditor {
   highlighter: YamlHighlightCache,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SequenceEditorKind {
+  Rules,
+  Proxies,
+  Groups,
+}
+
+impl SequenceEditorKind {
+  const fn label(self) -> &'static str {
+    match self {
+      Self::Rules => "规则",
+      Self::Proxies => "代理",
+      Self::Groups => "代理组",
+    }
+  }
+
+  fn default_item(self) -> String {
+    match self {
+      Self::Rules => "DOMAIN-SUFFIX,example.com,DIRECT".to_string(),
+      Self::Proxies => "name: New proxy\ntype: direct".to_string(),
+      Self::Groups => "name: New group\ntype: select\nproxies: []".to_string(),
+    }
+  }
+}
+
+struct SequenceEditor {
+  uid: String,
+  name: String,
+  kind: SequenceEditorKind,
+  prepend: Vec<String>,
+  append: Vec<String>,
+  delete: Vec<String>,
+  dirty: bool,
+  error: Option<String>,
+}
+
+struct PendingSequenceEditor {
+  uid: String,
+  name: String,
+  kind: SequenceEditorKind,
+}
+
 #[derive(Default)]
 struct YamlHighlightCache {
   source_hash: u64,
@@ -60,6 +102,8 @@ pub struct RsClashUi {
   profile_options_edits: BTreeMap<String, RemoteProfileOptions>,
   profile_editor: Option<ProfileEditor>,
   pending_profile_editor_name: Option<(String, String)>,
+  sequence_editor: Option<SequenceEditor>,
+  pending_sequence_editor: Option<PendingSequenceEditor>,
   pending_editor_close: bool,
 }
 
@@ -95,6 +139,8 @@ impl RsClashUi {
       profile_options_edits: BTreeMap::new(),
       profile_editor: None,
       pending_profile_editor_name: None,
+      sequence_editor: None,
+      pending_sequence_editor: None,
       pending_editor_close: false,
     }
   }
@@ -108,6 +154,23 @@ impl RsClashUi {
     while let Some(event) = self.events.try_recv() {
       match event {
         AppEvent::ProfileContentLoaded { uid, content } => {
+          if let Some(pending) = self
+            .pending_sequence_editor
+            .take()
+            .filter(|pending| pending.uid == uid)
+          {
+            match parse_sequence_editor(pending.uid, pending.name, pending.kind, content.expose()) {
+              Ok(editor) => {
+                self.profile_editor = None;
+                self.sequence_editor = Some(editor);
+                self.pending_editor_close = false;
+              },
+              Err(error) => {
+                self.local_error = Some(error);
+              },
+            }
+            continue;
+          }
           let name = self
             .pending_profile_editor_name
             .take()
@@ -130,6 +193,7 @@ impl RsClashUi {
             dirty: false,
             highlighter: YamlHighlightCache::default(),
           });
+          self.sequence_editor = None;
           self.pending_editor_close = false;
         },
         AppEvent::ProfileContentSaved { uid } => {
@@ -139,6 +203,14 @@ impl RsClashUi {
             .filter(|editor| editor.uid == uid)
           {
             editor.dirty = false;
+          }
+          if let Some(editor) = self
+            .sequence_editor
+            .as_mut()
+            .filter(|editor| editor.uid == uid)
+          {
+            editor.dirty = false;
+            editor.error = None;
           }
         },
         AppEvent::ProfileQrReady(qr) => {
@@ -634,6 +706,10 @@ impl RsClashUi {
       self.profile_yaml_editor(ui, profiles.busy);
       ui.add_space(16.0);
     }
+    if self.sequence_editor.is_some() {
+      self.profile_sequence_editor(ui, profiles.busy);
+      ui.add_space(16.0);
+    }
     if self.profile_qr.is_some() {
       self.profile_qr_viewer(ui);
       ui.add_space(16.0);
@@ -966,26 +1042,28 @@ impl RsClashUi {
           {
             self.open_profile_editor(profile.uid.clone(), profile.name.clone());
           }
-          for (label, title, uid) in [
-            (
-              "扩展配置",
-              "合并配置",
-              profile.enhancements.merge.as_deref(),
-            ),
+          if let Some(uid) = profile.enhancements.merge.as_deref()
+            && ui
+              .add_enabled(!profiles.busy, egui::Button::new("扩展配置"))
+              .clicked()
+          {
+            self.open_profile_editor(uid.to_string(), format!("{} · 合并配置", profile.name));
+          }
+          for (label, uid, kind) in [
             (
               "编辑规则",
-              "规则扩展",
               profile.enhancements.rules.as_deref(),
+              SequenceEditorKind::Rules,
             ),
             (
               "编辑代理",
-              "代理扩展",
               profile.enhancements.proxies.as_deref(),
+              SequenceEditorKind::Proxies,
             ),
             (
               "编辑代理组",
-              "代理组扩展",
               profile.enhancements.groups.as_deref(),
+              SequenceEditorKind::Groups,
             ),
           ] {
             if let Some(uid) = uid
@@ -993,7 +1071,11 @@ impl RsClashUi {
                 .add_enabled(!profiles.busy, egui::Button::new(label))
                 .clicked()
             {
-              self.open_profile_editor(uid.to_string(), format!("{} · {title}", profile.name));
+              self.open_sequence_editor(
+                uid.to_string(),
+                format!("{} · {}", profile.name, kind.label()),
+                kind,
+              );
             }
           }
           if ui
@@ -1150,6 +1232,116 @@ impl RsClashUi {
     }
     if close {
       self.profile_editor = None;
+      self.pending_editor_close = false;
+    } else if cancel_close {
+      self.pending_editor_close = false;
+    }
+  }
+
+  fn profile_sequence_editor(&mut self, ui: &mut Ui, busy: bool) {
+    let mut save = None;
+    let mut close = false;
+    let mut cancel_close = false;
+    if let Some(editor) = self.sequence_editor.as_mut() {
+      card(
+        ui,
+        &format!("{}可视化编辑器 · {}", editor.kind.label(), editor.name),
+        |ui| {
+          ui.label(
+            RichText::new(
+              "按“前置 → 原配置 → 后置”的顺序生成；删除项会在合并时按规则文本或名称匹配。",
+            )
+            .small()
+            .weak(),
+          );
+          ui.add_space(6.0);
+          let mut changed = false;
+          changed |= sequence_lane_editor(
+            ui,
+            "前置项目",
+            "这些项目会放在订阅原有项目之前。",
+            &mut editor.prepend,
+            editor.kind,
+            false,
+            busy,
+          );
+          ui.add_space(8.0);
+          changed |= sequence_lane_editor(
+            ui,
+            "后置项目",
+            "这些项目会放在订阅原有项目之后。",
+            &mut editor.append,
+            editor.kind,
+            false,
+            busy,
+          );
+          ui.add_space(8.0);
+          changed |= sequence_lane_editor(
+            ui,
+            "删除项目",
+            "规则填写完整规则文本；代理和代理组填写 name。",
+            &mut editor.delete,
+            editor.kind,
+            true,
+            busy,
+          );
+          if changed {
+            editor.dirty = true;
+            editor.error = None;
+            self.pending_editor_close = false;
+          }
+          if let Some(error) = editor.error.as_deref() {
+            ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
+          }
+          ui.add_space(6.0);
+          ui.horizontal(|ui| {
+            if ui
+              .add_enabled(!busy && editor.dirty, egui::Button::new("保存并校验"))
+              .clicked()
+            {
+              match serialize_sequence_editor(editor) {
+                Ok(content) => save = Some((editor.uid.clone(), content)),
+                Err(error) => editor.error = Some(error),
+              }
+            }
+            let close_label = if self.pending_editor_close && editor.dirty {
+              "确认放弃修改"
+            } else {
+              "关闭编辑器"
+            };
+            if ui
+              .add_enabled(!busy, egui::Button::new(close_label))
+              .clicked()
+            {
+              if editor.dirty && !self.pending_editor_close {
+                self.pending_editor_close = true;
+              } else {
+                close = true;
+              }
+            }
+            if self.pending_editor_close
+              && editor.dirty
+              && ui
+                .add_enabled(!busy, egui::Button::new("继续编辑"))
+                .clicked()
+            {
+              cancel_close = true;
+            }
+            if busy {
+              ui.spinner();
+            }
+          });
+        },
+      );
+    }
+    if let Some((uid, content)) = save {
+      self.command(UiCommand::SaveProfileContent {
+        uid,
+        content: SensitiveString::new(content),
+      });
+    }
+    if close {
+      self.sequence_editor = None;
       self.pending_editor_close = false;
     } else if cancel_close {
       self.pending_editor_close = false;
@@ -1337,7 +1529,18 @@ impl RsClashUi {
   }
 
   fn open_profile_editor(&mut self, uid: String, name: String) {
+    self.pending_sequence_editor = None;
     self.pending_profile_editor_name = Some((uid.clone(), name));
+    self.command(UiCommand::LoadProfileContent { uid });
+  }
+
+  fn open_sequence_editor(&mut self, uid: String, name: String, kind: SequenceEditorKind) {
+    self.pending_profile_editor_name = None;
+    self.pending_sequence_editor = Some(PendingSequenceEditor {
+      uid: uid.clone(),
+      name,
+      kind,
+    });
     self.command(UiCommand::LoadProfileContent { uid });
   }
 
@@ -1368,6 +1571,223 @@ impl RsClashUi {
       },
     }
   }
+}
+
+#[derive(Clone, Copy)]
+enum SequenceLaneAction {
+  Add,
+  MoveUp(usize),
+  MoveDown(usize),
+  Remove(usize),
+}
+
+fn sequence_lane_editor(
+  ui: &mut Ui,
+  title: &str,
+  description: &str,
+  items: &mut Vec<String>,
+  kind: SequenceEditorKind,
+  delete_lane: bool,
+  busy: bool,
+) -> bool {
+  let mut changed = false;
+  let mut action = None;
+  ui.group(|ui| {
+    ui.set_min_width(ui.available_width());
+    ui.horizontal(|ui| {
+      ui.vertical(|ui| {
+        ui.label(RichText::new(title).strong());
+        ui.label(RichText::new(description).small().weak());
+      });
+      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if ui.add_enabled(!busy, egui::Button::new("添加")).clicked() {
+          action = Some(SequenceLaneAction::Add);
+        }
+      });
+    });
+    if items.is_empty() {
+      ui.label(RichText::new("没有项目").small().weak());
+    }
+    let item_count = items.len();
+    for (index, item) in items.iter_mut().enumerate() {
+      ui.push_id((title, index), |ui| {
+        ui.separator();
+        ui.horizontal(|ui| {
+          ui.label(
+            RichText::new(format!("{} {}", kind.label(), index + 1))
+              .small()
+              .strong(),
+          );
+          if ui
+            .add_enabled(!busy && index > 0, egui::Button::new("↑"))
+            .on_hover_text("上移")
+            .clicked()
+          {
+            action = Some(SequenceLaneAction::MoveUp(index));
+          }
+          if ui
+            .add_enabled(!busy && index + 1 < item_count, egui::Button::new("↓"))
+            .on_hover_text("下移")
+            .clicked()
+          {
+            action = Some(SequenceLaneAction::MoveDown(index));
+          }
+          if ui.add_enabled(!busy, egui::Button::new("删除")).clicked() {
+            action = Some(SequenceLaneAction::Remove(index));
+          }
+        });
+        let response = if delete_lane || kind == SequenceEditorKind::Rules {
+          ui.add_enabled(
+            !busy,
+            egui::TextEdit::singleline(item).desired_width(f32::INFINITY),
+          )
+        } else {
+          ui.add_enabled(
+            !busy,
+            egui::TextEdit::multiline(item)
+              .code_editor()
+              .desired_rows(if kind == SequenceEditorKind::Groups {
+                5
+              } else {
+                4
+              })
+              .desired_width(f32::INFINITY),
+          )
+        };
+        changed |= response.changed();
+      });
+    }
+  });
+  match action {
+    Some(SequenceLaneAction::Add) => {
+      items.push(if delete_lane {
+        String::new()
+      } else {
+        kind.default_item()
+      });
+      true
+    },
+    Some(SequenceLaneAction::MoveUp(index)) => {
+      items.swap(index, index - 1);
+      true
+    },
+    Some(SequenceLaneAction::MoveDown(index)) => {
+      items.swap(index, index + 1);
+      true
+    },
+    Some(SequenceLaneAction::Remove(index)) => {
+      items.remove(index);
+      true
+    },
+    None => changed,
+  }
+}
+
+fn parse_sequence_editor(
+  uid: String,
+  name: String,
+  kind: SequenceEditorKind,
+  content: &str,
+) -> Result<SequenceEditor, String> {
+  let value = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(content)
+    .map_err(|error| format!("无法解析{}扩展：{error}", kind.label()))?;
+  let serde_yaml_ng::Value::Mapping(mapping) = value else {
+    return Err(format!("{}扩展的顶层必须是映射。", kind.label()));
+  };
+  Ok(SequenceEditor {
+    uid,
+    name,
+    kind,
+    prepend: parse_sequence_lane(&mapping, "prepend", kind, false)?,
+    append: parse_sequence_lane(&mapping, "append", kind, false)?,
+    delete: parse_sequence_lane(&mapping, "delete", kind, true)?,
+    dirty: false,
+    error: None,
+  })
+}
+
+fn parse_sequence_lane(
+  mapping: &serde_yaml_ng::Mapping,
+  key: &str,
+  kind: SequenceEditorKind,
+  delete_lane: bool,
+) -> Result<Vec<String>, String> {
+  let Some(value) = mapping.get(serde_yaml_ng::Value::String(key.to_string())) else {
+    return Ok(Vec::new());
+  };
+  let serde_yaml_ng::Value::Sequence(values) = value else {
+    return Err(format!("字段 {key} 必须是列表。"));
+  };
+  values
+    .iter()
+    .map(|value| {
+      if delete_lane || kind == SequenceEditorKind::Rules {
+        value
+          .as_str()
+          .map(str::to_string)
+          .ok_or_else(|| format!("字段 {key} 只能包含文本。"))
+      } else {
+        serde_yaml_ng::to_string(value)
+          .map(|yaml| yaml.trim().to_string())
+          .map_err(|error| format!("无法读取字段 {key}：{error}"))
+      }
+    })
+    .collect()
+}
+
+fn serialize_sequence_editor(editor: &SequenceEditor) -> Result<String, String> {
+  let mut mapping = serde_yaml_ng::Mapping::new();
+  for (key, items, delete_lane) in [
+    ("prepend", &editor.prepend, false),
+    ("append", &editor.append, false),
+    ("delete", &editor.delete, true),
+  ] {
+    let values = items
+      .iter()
+      .enumerate()
+      .map(|(index, item)| sequence_item_value(editor.kind, key, index, item, delete_lane))
+      .collect::<Result<Vec<_>, _>>()?;
+    mapping.insert(
+      serde_yaml_ng::Value::String(key.to_string()),
+      serde_yaml_ng::Value::Sequence(values),
+    );
+  }
+  serde_yaml_ng::to_string(&serde_yaml_ng::Value::Mapping(mapping))
+    .map_err(|error| format!("无法生成{}扩展：{error}", editor.kind.label()))
+}
+
+fn sequence_item_value(
+  kind: SequenceEditorKind,
+  lane: &str,
+  index: usize,
+  item: &str,
+  delete_lane: bool,
+) -> Result<serde_yaml_ng::Value, String> {
+  let item = item.trim();
+  if item.is_empty() {
+    return Err(format!("{lane} 的第 {} 项不能为空。", index + 1));
+  }
+  if delete_lane || kind == SequenceEditorKind::Rules {
+    return Ok(serde_yaml_ng::Value::String(item.to_string()));
+  }
+  let value = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(item)
+    .map_err(|error| format!("{lane} 的第 {} 项不是有效 YAML：{error}", index + 1))?;
+  let serde_yaml_ng::Value::Mapping(mapping) = &value else {
+    return Err(format!("{lane} 的第 {} 项必须是 YAML 映射。", index + 1));
+  };
+  for field in ["name", "type"] {
+    if mapping
+      .get(serde_yaml_ng::Value::String(field.to_string()))
+      .and_then(serde_yaml_ng::Value::as_str)
+      .is_none_or(str::is_empty)
+    {
+      return Err(format!(
+        "{lane} 的第 {} 项必须包含文本字段 {field}。",
+        index + 1
+      ));
+    }
+  }
+  Ok(value)
 }
 
 fn remote_profile_options_editor(ui: &mut Ui, options: &mut RemoteProfileOptions) {
@@ -1674,7 +2094,10 @@ fn client_error_message(error: &ClientError) -> String {
 mod tests {
   use rsclash_domain::{CoreChannel, CoreRunMode, CoreState, Page};
 
-  use super::{format_bytes, highlight_yaml, tun_capability, yaml_comment_start};
+  use super::{
+    SequenceEditorKind, format_bytes, highlight_yaml, parse_sequence_editor,
+    serialize_sequence_editor, tun_capability, yaml_comment_start,
+  };
 
   #[test]
   fn every_page_has_a_non_empty_native_label() {
@@ -1715,5 +2138,52 @@ mod tests {
     assert!(tun_capability(&service, false).2);
     assert!(!tun_capability(&sidecar, false).2);
     assert!(tun_capability(&sidecar, true).2);
+  }
+
+  #[test]
+  fn visual_proxy_editor_preserves_arbitrary_fields() -> Result<(), String> {
+    let source = r"
+prepend:
+  - name: Node A
+    type: ss
+    plugin-opts:
+      mode: websocket
+append: []
+delete:
+  - Old node
+";
+    let editor = parse_sequence_editor(
+      "proxy-uid".to_string(),
+      "Proxy extension".to_string(),
+      SequenceEditorKind::Proxies,
+      source,
+    )?;
+    let output = serialize_sequence_editor(&editor)?;
+    let source =
+      serde_yaml_ng::from_str::<serde_yaml_ng::Value>(source).map_err(|error| error.to_string())?;
+    let output = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&output)
+      .map_err(|error| error.to_string())?;
+
+    assert_eq!(output, source);
+    Ok(())
+  }
+
+  #[test]
+  fn visual_group_editor_rejects_items_without_required_fields() -> Result<(), String> {
+    let mut editor = parse_sequence_editor(
+      "group-uid".to_string(),
+      "Group extension".to_string(),
+      SequenceEditorKind::Groups,
+      "prepend: []\nappend: []\ndelete: []\n",
+    )?;
+    editor.append.push("type: select".to_string());
+
+    match serialize_sequence_editor(&editor) {
+      Ok(_) => Err("the missing name should fail".to_string()),
+      Err(error) => {
+        assert!(error.contains("name"));
+        Ok(())
+      },
+    }
   }
 }
