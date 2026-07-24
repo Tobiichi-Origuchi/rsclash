@@ -1223,43 +1223,69 @@ impl RsClashUi {
     let cards = normalized_home_cards(&self.snapshot.settings.value.home_cards);
     let viewport_width = ui.ctx().content_rect().width();
     let two_columns = geometry::home_grid_columns(geometry::breakpoint(viewport_width)) == 2;
-
-    if cards.iter().any(|card| card == "profile") || cards.iter().any(|card| card == "proxy") {
-      if two_columns {
+    let enabled = |key: &str| cards.iter().any(|card| card == key);
+    let paired_rows = [
+      ("profile", "proxy"),
+      ("network", "mode"),
+      ("test", "ip"),
+      ("clashinfo", "systeminfo"),
+    ];
+    for (left, right) in paired_rows {
+      let left_enabled = enabled(left);
+      let right_enabled = enabled(right);
+      if !left_enabled && !right_enabled {
+        if right == "mode" && enabled("traffic") {
+          self.home_traffic(ui, &mihomo);
+          ui.add_space(geometry::GRID_GAP);
+        }
+        continue;
+      }
+      if two_columns && left_enabled && right_enabled {
         ui.scope(|ui| {
           ui.spacing_mut().item_spacing.x = geometry::GRID_GAP;
           ui.columns(2, |columns| {
-            self.home_profile(&mut columns[0], &core);
-            self.home_current_proxy(&mut columns[1], &mihomo);
+            self.home_card(&mut columns[0], left, &core, &mihomo, &system_proxy);
+            self.home_card(&mut columns[1], right, &core, &mihomo, &system_proxy);
           });
         });
       } else {
-        self.home_profile(ui, &core);
-        ui.add_space(geometry::GRID_GAP);
-        self.home_current_proxy(ui, &mihomo);
+        if left_enabled {
+          self.home_card(ui, left, &core, &mihomo, &system_proxy);
+        }
+        if left_enabled && right_enabled {
+          ui.add_space(geometry::GRID_GAP);
+        }
+        if right_enabled {
+          self.home_card(ui, right, &core, &mihomo, &system_proxy);
+        }
       }
       ui.add_space(geometry::GRID_GAP);
-    }
-
-    if cards.iter().any(|card| card == "network") {
-      if two_columns {
-        ui.scope(|ui| {
-          ui.spacing_mut().item_spacing.x = geometry::GRID_GAP;
-          ui.columns(2, |columns| {
-            self.home_network(&mut columns[0], &core, &mihomo, &system_proxy);
-            self.home_proxy(&mut columns[1], &mihomo);
-          });
-        });
-      } else {
-        self.home_network(ui, &core, &mihomo, &system_proxy);
+      if right == "mode" && enabled("traffic") {
+        self.home_traffic(ui, &mihomo);
         ui.add_space(geometry::GRID_GAP);
-        self.home_proxy(ui, &mihomo);
       }
-      ui.add_space(geometry::GRID_GAP);
     }
+  }
 
-    if cards.iter().any(|card| card == "traffic") {
-      self.home_traffic(ui, &mihomo);
+  fn home_card(
+    &mut self,
+    ui: &mut Ui,
+    key: &str,
+    core: &CoreState,
+    mihomo: &MihomoSnapshot,
+    system_proxy: &SystemProxyView,
+  ) {
+    match key {
+      "profile" => self.home_profile(ui),
+      "proxy" => self.home_current_proxy(ui, mihomo),
+      "network" => self.home_network(ui, core, mihomo, system_proxy),
+      "mode" => self.home_proxy(ui, mihomo),
+      "test" => self.home_test(ui, mihomo),
+      "ip" => self.home_ip(ui, mihomo, system_proxy),
+      "clashinfo" => self.home_clash_info(ui, core, mihomo),
+      "systeminfo" => self.home_system_info(ui, mihomo),
+      "traffic" => {},
+      _ => {},
     }
   }
 
@@ -1268,7 +1294,7 @@ impl RsClashUi {
       return;
     }
     let mut open = self.home_settings_dialog;
-    let mut cards = self.snapshot.settings.value.home_cards.clone();
+    let mut cards = normalized_home_cards(&self.snapshot.settings.value.home_cards);
     let mut save = false;
     egui::Window::new("首页设置")
       .open(&mut open)
@@ -1277,8 +1303,13 @@ impl RsClashUi {
         for (key, label) in [
           ("profile", "当前配置"),
           ("proxy", "当前代理"),
-          ("network", "网络设置与代理模式"),
+          ("network", "网络设置"),
+          ("mode", "代理模式"),
           ("traffic", "流量统计"),
+          ("test", "延迟测试"),
+          ("ip", "IP 信息"),
+          ("clashinfo", "Mihomo 信息"),
+          ("systeminfo", "系统信息"),
         ] {
           setting_membership_checkbox(ui, &mut cards, key, label);
         }
@@ -1296,31 +1327,43 @@ impl RsClashUi {
     self.home_settings_dialog = open;
   }
 
-  fn home_profile(&mut self, ui: &mut Ui, core: &CoreState) {
-    enhanced_card(ui, "配置", "☷", |ui| {
-      if let Some(profile) = self.snapshot.profiles.current() {
-        ui.label(RichText::new(&profile.name).size(18.0).strong());
-        ui.label(
-          RichText::new(match profile.source {
-            ProfileSourceKind::Local => "本地配置",
-            ProfileSourceKind::Remote => "远程订阅",
-            ProfileSourceKind::Merge
-            | ProfileSourceKind::Rules
-            | ProfileSourceKind::Proxies
-            | ProfileSourceKind::Groups
-            | ProfileSourceKind::Other => "扩展配置",
-          })
-          .small()
-          .weak(),
-        );
+  fn home_profile(&self, ui: &mut Ui) {
+    let current = self.snapshot.profiles.current();
+    let title = current.map_or("订阅", |profile| profile.name.as_str());
+    enhanced_card(ui, title, "☷", |ui| {
+      if let Some(profile) = current {
+        stat_line(ui, "来源", &profile_origin(profile));
+        if let Some(updated) = profile.updated_at {
+          ui.separator();
+          stat_line(ui, "更新时间", &format_update_age(updated));
+        }
+        if let Some(usage) = profile.usage {
+          let used = usage.upload.saturating_add(usage.download);
+          ui.separator();
+          stat_line(
+            ui,
+            "已用流量",
+            &format!("{} / {}", format_bytes(used), format_bytes(usage.total)),
+          );
+          if usage.total > 0 {
+            let progress = (used as f32 / usage.total as f32).clamp(0.0, 1.0);
+            let (rect, _) =
+              ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
+            let tokens = theme::tokens(ui);
+            ui.painter().rect_filled(rect, 4.0, tokens.accent_soft);
+            ui.painter().rect_filled(
+              egui::Rect::from_min_max(
+                rect.min,
+                egui::pos2(rect.left() + rect.width() * progress, rect.bottom()),
+              ),
+              4.0,
+              tokens.accent,
+            );
+          }
+        }
       } else {
-        ui.label(RichText::new("未选择配置").size(18.0).strong());
         ui.label(RichText::new("请先导入并激活一个订阅").small().weak());
       }
-      ui.add_space(geometry::MUI_SPACING);
-      ui.separator();
-      ui.add_space(geometry::MUI_SPACING);
-      self.core_controls(ui, core);
     });
   }
 
@@ -1469,6 +1512,99 @@ impl RsClashUi {
           &mihomo.connection_count.to_string(),
         );
       });
+    });
+  }
+
+  fn home_test(&mut self, ui: &mut Ui, mihomo: &MihomoSnapshot) {
+    enhanced_card(ui, "延迟测试", "◷", |ui| {
+      ui.label(RichText::new("测试地址").small().weak());
+      ui.label(
+        RichText::new(&self.snapshot.settings.value.latency_test_url)
+          .size(14.0)
+          .strong(),
+      );
+      ui.add_space(geometry::MUI_SPACING);
+      ui.label(
+        RichText::new(format!(
+          "超时 {} ms",
+          self.snapshot.settings.value.latency_timeout_ms
+        ))
+        .small()
+        .weak(),
+      );
+      let selected = mihomo
+        .proxy_view
+        .records
+        .values()
+        .find(|record| {
+          mihomo
+            .current_proxy()
+            .is_some_and(|name| name == record.name)
+        })
+        .map(|record| record.record_id.clone());
+      if ui
+        .add_enabled(selected.is_some(), egui::Button::new("测试当前代理"))
+        .clicked()
+        && let Some(record_id) = selected
+      {
+        self.command(UiCommand::TestProxy { record_id });
+      }
+    });
+  }
+
+  fn home_ip(&self, ui: &mut Ui, mihomo: &MihomoSnapshot, system_proxy: &SystemProxyView) {
+    enhanced_card(ui, "IP 信息", "◎", |ui| {
+      stat_line(
+        ui,
+        "控制器",
+        if mihomo.connection == MihomoConnection::Connected {
+          "已连接"
+        } else {
+          "未连接"
+        },
+      );
+      ui.separator();
+      stat_line(
+        ui,
+        "混合端口",
+        &mihomo
+          .mixed_port
+          .map_or_else(|| "-".to_string(), |port| port.to_string()),
+      );
+      ui.separator();
+      stat_line(
+        ui,
+        "系统代理",
+        if system_proxy.enabled {
+          "已启用"
+        } else {
+          "未启用"
+        },
+      );
+    });
+  }
+
+  fn home_clash_info(&mut self, ui: &mut Ui, core: &CoreState, mihomo: &MihomoSnapshot) {
+    enhanced_card(ui, "Mihomo 信息", "▣", |ui| {
+      stat_line(ui, "核心版本", mihomo.version.as_deref().unwrap_or("-"));
+      ui.separator();
+      stat_line(ui, "规则数量", &mihomo.rules.len().to_string());
+      ui.separator();
+      stat_line(ui, "活动连接", &mihomo.connection_count.to_string());
+      ui.add_space(geometry::MUI_SPACING);
+      self.core_controls(ui, core);
+    });
+  }
+
+  fn home_system_info(&self, ui: &mut Ui, mihomo: &MihomoSnapshot) {
+    enhanced_card(ui, "系统信息", "▤", |ui| {
+      stat_line(ui, "平台", std::env::consts::OS);
+      ui.separator();
+      stat_line(ui, "界面", "Native egui");
+      ui.separator();
+      stat_line(ui, "架构", std::env::consts::ARCH);
+      ui.separator();
+      stat_line(ui, "核心内存", &format_bytes(mihomo.memory_bytes));
     });
   }
 
@@ -4700,11 +4836,44 @@ fn normalized_home_cards(cards: &[String]) -> Vec<String> {
   let mut seen = BTreeSet::new();
   let cards = cards
     .iter()
-    .filter(|card| matches!(card.as_str(), "profile" | "proxy" | "network" | "traffic"))
+    .filter(|card| {
+      matches!(
+        card.as_str(),
+        "profile"
+          | "proxy"
+          | "network"
+          | "mode"
+          | "traffic"
+          | "test"
+          | "ip"
+          | "clashinfo"
+          | "systeminfo"
+      )
+    })
     .filter(|card| seen.insert(card.as_str()))
     .cloned()
     .collect::<Vec<_>>();
-  if cards.is_empty() {
+  let legacy_defaults = ["profile", "proxy", "network", "traffic"];
+  if cards.len() == legacy_defaults.len()
+    && legacy_defaults
+      .iter()
+      .all(|key| cards.iter().any(|card| card == key))
+  {
+    [
+      "profile",
+      "proxy",
+      "network",
+      "mode",
+      "traffic",
+      "test",
+      "ip",
+      "clashinfo",
+      "systeminfo",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+  } else if cards.is_empty() {
     vec!["profile".to_string()]
   } else {
     cards
@@ -4713,7 +4882,17 @@ fn normalized_home_cards(cards: &[String]) -> Vec<String> {
 
 fn ordered_home_card_editor(ui: &mut Ui, cards: &mut Vec<String>) {
   let mut order = normalized_home_cards(cards);
-  for key in ["profile", "proxy", "network", "traffic"] {
+  for key in [
+    "profile",
+    "proxy",
+    "network",
+    "mode",
+    "traffic",
+    "test",
+    "ip",
+    "clashinfo",
+    "systeminfo",
+  ] {
     if !order.iter().any(|card| card == key) {
       order.push(key.to_string());
     }
@@ -4765,9 +4944,14 @@ enum HomeCardEdit {
 fn home_card_label(key: &str) -> &str {
   match key {
     "profile" => "核心与当前配置",
-    "proxy" => "出站模式",
+    "proxy" => "当前代理",
     "network" => "系统代理与 TUN",
+    "mode" => "出站模式",
     "traffic" => "流量与资源",
+    "test" => "延迟测试",
+    "ip" => "IP 信息",
+    "clashinfo" => "Mihomo 信息",
+    "systeminfo" => "系统信息",
     _ => key,
   }
 }
@@ -5775,6 +5959,15 @@ const fn tun_capability(core: &CoreState, enabled: bool) -> (&'static str, &'sta
   }
 }
 
+fn stat_line(ui: &mut Ui, label: &str, value: &str) {
+  ui.horizontal(|ui| {
+    ui.label(RichText::new(label).size(14.0).weak());
+    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+      ui.label(RichText::new(value).size(14.0).strong());
+    });
+  });
+}
+
 fn stat_pair(ui: &mut Ui, first_label: &str, first: &str, second_label: &str, second: &str) {
   ui.columns(2, |columns| {
     columns[0].label(RichText::new(first).size(19.0).strong());
@@ -6248,7 +6441,8 @@ mod tests {
 
   use super::{
     RuleDraft, SequenceEditorKind, build_rule_draft, format_bytes, highlight_yaml,
-    parse_sequence_editor, serialize_sequence_editor, tun_capability, yaml_comment_start,
+    normalized_home_cards, parse_sequence_editor, serialize_sequence_editor, tun_capability,
+    yaml_comment_start,
   };
 
   #[test]
@@ -6265,6 +6459,12 @@ mod tests {
     assert_eq!(format_bytes(0), "0 B");
     assert_eq!(format_bytes(1_024), "1.0 KiB");
     assert_eq!(format_bytes(5 * 1_024 * 1_024), "5.0 MiB");
+  }
+
+  #[test]
+  fn legacy_home_defaults_expand_to_the_cvr_card_set() {
+    let legacy = ["profile", "proxy", "network", "traffic"].map(str::to_string);
+    assert_eq!(normalized_home_cards(&legacy).len(), 9);
   }
 
   #[test]

@@ -148,9 +148,11 @@ pub(crate) const fn proxy_grid_columns(viewport_width: f32, configured: u8) -> u
 #[cfg(test)]
 mod tests {
   use super::{
-    Breakpoint, LINUX_CONTENT_TOP, NAV_COLLAPSED_WIDTH, NAV_WIDTH, PAGE_HEADER_HEIGHT,
-    TITLE_BAR_HEIGHT, breakpoint, home_grid_columns, profile_grid_columns, proxy_grid_columns,
-    settings_grid_columns, shell_layout, unlock_grid_columns,
+    Breakpoint, CONNECTION_ROW_HEIGHT, LINUX_CONTENT_TOP, LOG_ROW_HEIGHT, NAV_COLLAPSED_WIDTH,
+    NAV_WIDTH, PAGE_HEADER_HEIGHT, PROFILE_CARD_HEIGHT, PROFILE_CONTENT_OFFSET,
+    PROFILE_TOOLBAR_HEIGHT, RULE_ROW_HEIGHT, TITLE_BAR_HEIGHT, breakpoint, home_grid_columns,
+    profile_grid_columns, proxy_grid_columns, settings_grid_columns, shell_layout,
+    unlock_grid_columns,
   };
 
   #[test]
@@ -217,5 +219,20 @@ mod tests {
     let collapsed = shell_layout(egui::vec2(940.0, 700.0), true);
     assert_eq!(collapsed.nav_width, 72.0);
     assert_eq!(collapsed.content_width, 868.0);
+
+    let wide = shell_layout(egui::vec2(1_600.0, 900.0), false);
+    assert_eq!(wide.content_width, 1_400.0);
+    assert_eq!(wide.main_height, 864.0);
+    assert_eq!(wide.page_body_height, 801.0);
+  }
+
+  #[test]
+  fn full_page_rows_match_cvr_component_sizes() {
+    assert_eq!(PROFILE_CONTENT_OFFSET, 48.0);
+    assert_eq!(PROFILE_TOOLBAR_HEIGHT, 36.0);
+    assert_eq!(PROFILE_CARD_HEIGHT, 98.0);
+    assert_eq!(CONNECTION_ROW_HEIGHT, 56.0);
+    assert_eq!(RULE_ROW_HEIGHT, 40.0);
+    assert_eq!(LOG_ROW_HEIGHT, 50.0);
   }
 }

@@ -57,7 +57,17 @@ pub fn validate_application_settings(settings: &AppSettings) -> Result<()> {
   }
   validate_known_unique_values(
     &settings.home_cards,
-    &["profile", "proxy", "network", "traffic"],
+    &[
+      "profile",
+      "proxy",
+      "network",
+      "mode",
+      "traffic",
+      "test",
+      "ip",
+      "clashinfo",
+      "systeminfo",
+    ],
     "home cards",
   )?;
   validate_known_unique_values(

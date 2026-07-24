@@ -378,7 +378,12 @@ impl Default for AppSettings {
         "profile".to_string(),
         "proxy".to_string(),
         "network".to_string(),
+        "mode".to_string(),
         "traffic".to_string(),
+        "test".to_string(),
+        "ip".to_string(),
+        "clashinfo".to_string(),
+        "systeminfo".to_string(),
       ],
       connection_columns: vec![
         "destination".to_string(),
