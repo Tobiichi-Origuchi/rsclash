@@ -2,6 +2,8 @@ mod fonts;
 #[cfg(target_os = "linux")]
 mod linux_bootstrap;
 #[cfg(target_os = "linux")]
+mod logging;
+#[cfg(target_os = "linux")]
 mod single_instance;
 #[cfg(all(feature = "tray", target_os = "linux"))]
 mod tray;
@@ -14,11 +16,10 @@ use rsclash_domain::{RemoteProfileOptions, UiCommand};
 use rsclash_ui::RsClashUi;
 use tokio::runtime::{Builder, Runtime};
 use tracing::{error, info};
+#[cfg(not(target_os = "linux"))]
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn Error>> {
-  init_tracing();
-
   #[cfg(target_os = "linux")]
   let launch_request = single_instance::LaunchRequest::from_environment();
   #[cfg(target_os = "linux")]
@@ -27,6 +28,8 @@ fn main() -> Result<(), Box<dyn Error>> {
       single_instance::Instance::Primary(instance) => Some(instance),
       single_instance::Instance::Forwarded => return Ok(()),
     };
+
+  init_tracing();
 
   let runtime = Builder::new_multi_thread()
     .worker_threads(2)
@@ -106,8 +109,20 @@ fn create_backend(runtime: &Runtime, wake: WakeHandle) -> BackendHandle {
       return BackendHandle::spawn(runtime.handle(), wake);
     },
   };
-  if let Err(error) = runtime.block_on(bootstrap.audit_startup()) {
-    error!(%error, "failed to audit pending system state recovery");
+  match runtime.block_on(bootstrap.audit_startup()) {
+    Ok(rsclash_platform::RecoveryOutcome::Restored) => {
+      let _ = runtime.block_on(bootstrap.desktop.notify(
+        "rsclash 已恢复系统设置",
+        "检测到上次异常退出，系统代理已安全恢复。",
+      ));
+    },
+    Ok(rsclash_platform::RecoveryOutcome::ExternalChangePreserved) => {
+      info!("preserved a system proxy change made outside rsclash");
+    },
+    Ok(rsclash_platform::RecoveryOutcome::NothingPending) => {},
+    Err(error) => {
+      error!(%error, "failed to audit pending system state recovery");
+    },
   }
   let initial_settings = bootstrap.initial_settings.clone();
   let desktop = std::sync::Arc::clone(&bootstrap.desktop);
@@ -133,6 +148,10 @@ fn apply_initial_settings(
 ) {
   if let Err(error) = runtime.block_on(desktop.run_startup_script(&settings.startup_script)) {
     error!(%error, "startup script failed");
+    let _ = runtime.block_on(desktop.notify(
+      "rsclash 启动脚本失败",
+      "启动脚本没有成功完成，请在设置或应用日志中检查详细信息。",
+    ));
   }
   let client = backend.client();
   if let Err(error) = client.try_command(UiCommand::Navigate(settings.start_page)) {
@@ -256,10 +275,18 @@ impl Drop for DesktopApp {
 }
 
 fn init_tracing() {
-  let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("rsclash=info"));
-  let _ = tracing_subscriber::fmt()
-    .with_env_filter(filter)
-    .with_target(false)
-    .compact()
-    .try_init();
+  #[cfg(target_os = "linux")]
+  {
+    logging::init();
+  }
+  #[cfg(not(target_os = "linux"))]
+  {
+    let filter =
+      EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("rsclash=info"));
+    let _ = tracing_subscriber::fmt()
+      .with_env_filter(filter)
+      .with_target(false)
+      .compact()
+      .try_init();
+  }
 }

@@ -152,11 +152,17 @@ impl SettingsWorker {
     self.set_busy(true).await;
     match run_service_setup(&self.access.service, uninstall).await {
       Ok(()) => {
-        self.snapshot.last_applied = Some(if uninstall {
+        let message = if uninstall {
           "特权服务已卸载".to_string()
         } else {
           "特权服务已安装并启动".to_string()
-        });
+        };
+        self.snapshot.last_applied = Some(message.clone());
+        let _ = self
+          .access
+          .desktop
+          .notify("rsclash 特权服务", &message)
+          .await;
         self.refresh().await;
       },
       Err(error) => self.fail(error).await,
