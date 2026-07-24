@@ -1,6 +1,8 @@
 mod fonts;
 #[cfg(target_os = "linux")]
 mod linux_bootstrap;
+#[cfg(target_os = "linux")]
+mod single_instance;
 #[cfg(all(feature = "tray", target_os = "linux"))]
 mod tray;
 
@@ -18,6 +20,15 @@ use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn Error>> {
   init_tracing();
+
+  #[cfg(target_os = "linux")]
+  let launch_request = single_instance::LaunchRequest::from_environment();
+  #[cfg(target_os = "linux")]
+  let mut primary_instance =
+    match single_instance::PrimaryInstance::acquire(&launch_request).map_err(io_error)? {
+      single_instance::Instance::Primary(instance) => Some(instance),
+      single_instance::Instance::Forwarded => return Ok(()),
+    };
 
   let runtime = Builder::new_multi_thread()
     .worker_threads(2)
@@ -48,7 +59,16 @@ fn main() -> Result<(), Box<dyn Error>> {
       let wake = WakeHandle::new(move || repaint_context.request_repaint());
       let backend = create_backend(&runtime, wake);
       let client = backend.client();
+      #[cfg(target_os = "linux")]
+      dispatch_launch_request(&client, launch_request.clone());
+      #[cfg(not(target_os = "linux"))]
       queue_initial_imports(&client);
+      #[cfg(target_os = "linux")]
+      let instance = primary_instance
+        .take()
+        .map(|instance| instance.listen(client.clone(), dispatch_launch_request))
+        .transpose()
+        .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
 
       #[cfg(all(feature = "tray", target_os = "linux"))]
       let tray = match tray::TrayHandle::new(client.clone(), runtime.handle()) {
@@ -70,6 +90,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         backend: Some(backend),
         #[cfg(all(feature = "tray", target_os = "linux"))]
         tray,
+        #[cfg(target_os = "linux")]
+        _instance: instance,
       }))
     }),
   )?;
@@ -111,41 +133,65 @@ fn create_backend(runtime: &Runtime, wake: WakeHandle) -> BackendHandle {
   BackendHandle::spawn(runtime.handle(), wake)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn queue_initial_imports(client: &AppClient) {
   for argument in std::env::args_os().skip(1) {
-    let value = argument.to_string_lossy();
-    if value.starts_with("http://")
-      || value.starts_with("https://")
-      || value.starts_with("clash://")
-      || value.starts_with("clash-verge://")
-    {
-      if let Err(error) = client.try_command(UiCommand::ImportRemoteProfile {
-        name: String::new(),
-        url: value.into_owned(),
-        options: RemoteProfileOptions::default(),
-      }) {
-        error!(%error, "failed to queue command-line subscription import");
-      }
-      continue;
+    queue_import_argument(client, argument);
+  }
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_launch_request(client: &AppClient, request: single_instance::LaunchRequest) {
+  if request.show_window {
+    if let Err(error) = client.try_command(UiCommand::SetWindowVisible(true)) {
+      error!(%error, "failed to show the window for a launch request");
     }
-    let path = std::path::Path::new(value.as_ref());
-    if matches!(
-      path.extension().and_then(|extension| extension.to_str()),
-      Some("yaml" | "yml")
-    ) {
-      let name = path
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Imported profile")
-        .to_string();
-      if let Err(error) = client.try_command(UiCommand::ImportLocalProfile {
-        name,
-        path: value.into_owned(),
-      }) {
-        error!(%error, "failed to queue command-line profile import");
-      }
+  } else if let Err(error) = client.try_command(UiCommand::SetWindowVisible(false)) {
+    error!(%error, "failed to apply silent launch");
+  }
+  for argument in request.arguments {
+    queue_import_argument(client, argument);
+  }
+}
+
+fn queue_import_argument(client: &AppClient, argument: std::ffi::OsString) {
+  let value = argument.to_string_lossy();
+  if value.starts_with("http://")
+    || value.starts_with("https://")
+    || value.starts_with("clash://")
+    || value.starts_with("clash-verge://")
+  {
+    if let Err(error) = client.try_command(UiCommand::ImportRemoteProfile {
+      name: String::new(),
+      url: value.into_owned(),
+      options: RemoteProfileOptions::default(),
+    }) {
+      error!(%error, "failed to queue command-line subscription import");
+    }
+    return;
+  }
+  let path = std::path::Path::new(value.as_ref());
+  if matches!(
+    path.extension().and_then(|extension| extension.to_str()),
+    Some("yaml" | "yml")
+  ) {
+    let name = path
+      .file_stem()
+      .and_then(|name| name.to_str())
+      .unwrap_or("Imported profile")
+      .to_string();
+    if let Err(error) = client.try_command(UiCommand::ImportLocalProfile {
+      name,
+      path: value.into_owned(),
+    }) {
+      error!(%error, "failed to queue command-line profile import");
     }
   }
+}
+
+#[cfg(target_os = "linux")]
+fn io_error(error: String) -> std::io::Error {
+  std::io::Error::other(error)
 }
 
 struct DesktopApp {
@@ -154,6 +200,8 @@ struct DesktopApp {
   backend: Option<BackendHandle>,
   #[cfg(all(feature = "tray", target_os = "linux"))]
   tray: Option<tray::TrayHandle>,
+  #[cfg(target_os = "linux")]
+  _instance: Option<single_instance::InstanceHandle>,
 }
 
 impl eframe::App for DesktopApp {
