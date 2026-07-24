@@ -52,6 +52,7 @@ impl SettingsAccess {
 pub(crate) enum SettingsBridgeCommand {
   Refresh,
   Apply(Box<AppSettings>),
+  PersistSystemProxy(bool),
   InstallService,
   UninstallService,
   RegisterDeepLinks,
@@ -99,6 +100,9 @@ impl SettingsWorker {
     match command {
       SettingsBridgeCommand::Refresh => self.refresh().await,
       SettingsBridgeCommand::Apply(settings) => self.apply(*settings).await,
+      SettingsBridgeCommand::PersistSystemProxy(enabled) => {
+        self.persist_system_proxy(enabled).await;
+      },
       SettingsBridgeCommand::InstallService => self.change_service(false).await,
       SettingsBridgeCommand::UninstallService => self.change_service(true).await,
       SettingsBridgeCommand::RegisterDeepLinks => self.register_deep_links().await,
@@ -123,6 +127,24 @@ impl SettingsWorker {
         self.refresh().await;
       },
       Err(error) => self.fail(error).await,
+    }
+  }
+
+  async fn persist_system_proxy(&mut self, enabled: bool) {
+    let mut settings = match self.access.store.load_application_settings() {
+      Ok(settings) => settings,
+      Err(error) => {
+        self.fail(error.to_string()).await;
+        return;
+      },
+    };
+    settings.system_proxy_enabled = enabled;
+    match self.access.store.save_application_settings(&settings) {
+      Ok(()) => {
+        self.snapshot.value = settings;
+        self.publish().await;
+      },
+      Err(error) => self.fail(error.to_string()).await,
     }
   }
 

@@ -1083,6 +1083,7 @@ impl Coordinator {
     match event {
       MihomoBridgeEvent::Snapshot(snapshot) => {
         self.snapshot.mihomo = *snapshot;
+        self.ensure_desired_system_proxy();
         self.publish_snapshot();
         self.emit(AppEvent::MihomoStateChanged);
       },
@@ -1125,6 +1126,9 @@ impl Coordinator {
       ProfileBridgeEvent::RuntimeChanged(sync) => {
         if let Some(command_tx) = &self.mihomo_command_tx {
           let _ = command_tx.try_send(MihomoBridgeCommand::SynchronizeProfile(sync));
+          if self.snapshot.settings.value.auto_test {
+            let _ = command_tx.try_send(MihomoBridgeCommand::TestAllProxies);
+          }
         }
       },
       ProfileBridgeEvent::SelectionPersisted {
@@ -1169,6 +1173,9 @@ impl Coordinator {
         self.publish_snapshot();
         self.emit(AppEvent::SystemProxyChanged);
       },
+      SystemProxyBridgeEvent::EnabledChanged(enabled) => {
+        let _ = self.dispatch_settings(SettingsBridgeCommand::PersistSystemProxy(enabled));
+      },
       SystemProxyBridgeEvent::CommandFailed(message) => {
         self.snapshot.last_error = Some(ErrorView {
           title: "System proxy operation failed".to_string(),
@@ -1187,6 +1194,15 @@ impl Coordinator {
         let theme_changed = self.snapshot.theme != snapshot.value.theme;
         self.snapshot.theme = snapshot.value.theme;
         self.snapshot.settings = snapshot;
+        if let Some(command_tx) = &self.mihomo_command_tx {
+          let _ = command_tx.try_send(MihomoBridgeCommand::SetStreamFlushInterval(
+            self.snapshot.settings.value.refresh_interval_ms,
+          ));
+          let _ = command_tx.try_send(MihomoBridgeCommand::SetLogLevel(
+            self.snapshot.settings.value.mihomo_log_level,
+          ));
+        }
+        self.ensure_desired_system_proxy();
         self.publish_snapshot();
         self.emit(AppEvent::SettingsChanged);
         if theme_changed {
@@ -1210,6 +1226,23 @@ impl Coordinator {
       self.update_mihomo_presentation();
       self.publish_snapshot();
       self.emit(AppEvent::WindowVisibilityChanged(visible));
+    }
+  }
+
+  fn ensure_desired_system_proxy(&self) {
+    let settings = &self.snapshot.settings.value;
+    if !settings.system_proxy_enabled
+      || self.snapshot.system_proxy.enabled
+      || self.snapshot.system_proxy.busy
+      || !self.snapshot.system_proxy.available
+    {
+      return;
+    }
+    let ready = settings.pac_url.is_some()
+      || (self.snapshot.mihomo.connection == rsclash_domain::MihomoConnection::Connected
+        && self.snapshot.mihomo.mixed_port.is_some());
+    if ready {
+      let _ = self.set_system_proxy(true);
     }
   }
 

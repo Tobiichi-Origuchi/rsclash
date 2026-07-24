@@ -28,6 +28,7 @@ pub(crate) enum SystemProxyBridgeCommand {
 
 pub(crate) enum SystemProxyBridgeEvent {
   Snapshot(SystemProxyView),
+  EnabledChanged(bool),
   CommandFailed(String),
 }
 
@@ -66,7 +67,13 @@ impl SystemProxyWorker {
             self.access.service.disable().await.map(|_| ())
           };
           match result {
-            Ok(()) => self.refresh().await,
+            Ok(()) => {
+              self.refresh().await;
+              let _ = self
+                .event_tx
+                .send(SystemProxyBridgeEvent::EnabledChanged(enabled))
+                .await;
+            },
             Err(error) => {
               self.state.busy = false;
               self.state.detail = Some(error.to_string());
@@ -215,6 +222,7 @@ mod tests {
       {
         SystemProxyBridgeEvent::Snapshot(snapshot) if !snapshot.busy => return snapshot,
         SystemProxyBridgeEvent::Snapshot(_) => {},
+        SystemProxyBridgeEvent::EnabledChanged(_) => {},
         SystemProxyBridgeEvent::CommandFailed(message) => {
           panic!("the system proxy command should succeed: {message}");
         },

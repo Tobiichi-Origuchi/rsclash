@@ -247,6 +247,19 @@ impl RsClashUi {
     let snapshot = client.current_snapshot();
     theme::apply_preference(context, snapshot.theme);
     let settings_draft = snapshot.settings.value.clone();
+    let proxy_detailed = settings_draft.proxy_group_layout == ProxyGroupLayout::Cards;
+    let connection_show_process = settings_draft
+      .connection_columns
+      .iter()
+      .any(|column| column == "process");
+    let connection_show_rule = settings_draft
+      .connection_columns
+      .iter()
+      .any(|column| column == "rule");
+    let connection_show_chains = settings_draft
+      .connection_columns
+      .iter()
+      .any(|column| column == "chains");
 
     Self {
       events: client.subscribe_events(),
@@ -280,7 +293,7 @@ impl RsClashUi {
       proxy_search: String::new(),
       proxy_regex: false,
       proxy_whole_word: false,
-      proxy_detailed: false,
+      proxy_detailed,
       proxy_sort: ProxySort::default(),
       expanded_proxy_groups: BTreeSet::new(),
       locate_proxy: None,
@@ -292,9 +305,9 @@ impl RsClashUi {
       connection_search: String::new(),
       show_closed_connections: false,
       connection_sort: ConnectionSort::default(),
-      connection_show_process: true,
-      connection_show_rule: true,
-      connection_show_chains: true,
+      connection_show_process,
+      connection_show_rule,
+      connection_show_chains,
       selected_connection: None,
       log_search: String::new(),
       log_reverse: false,
@@ -400,6 +413,7 @@ impl RsClashUi {
           if !self.snapshot.settings.busy {
             self.settings_dirty = false;
             self.settings_draft = self.snapshot.settings.value.clone();
+            self.sync_presentation_settings();
           }
         },
         _ => {},
@@ -432,7 +446,7 @@ impl RsClashUi {
 
     let close_requested = context.input(|input| input.viewport().close_requested());
     if close_requested && self.snapshot.status != AppStatus::ShuttingDown {
-      if self.close_to_tray {
+      if self.tray_is_available() {
         context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         self.command(UiCommand::SetWindowVisible(false));
       } else {
@@ -443,6 +457,27 @@ impl RsClashUi {
     if self.snapshot.status == AppStatus::ShuttingDown {
       context.send_viewport_cmd(egui::ViewportCommand::Close);
     }
+  }
+
+  fn tray_is_available(&self) -> bool {
+    self.close_to_tray && self.snapshot.settings.value.show_tray
+  }
+
+  fn sync_presentation_settings(&mut self) {
+    let settings = &self.snapshot.settings.value;
+    self.proxy_detailed = settings.proxy_group_layout == ProxyGroupLayout::Cards;
+    self.connection_show_process = settings
+      .connection_columns
+      .iter()
+      .any(|column| column == "process");
+    self.connection_show_rule = settings
+      .connection_columns
+      .iter()
+      .any(|column| column == "rule");
+    self.connection_show_chains = settings
+      .connection_columns
+      .iter()
+      .any(|column| column == "chains");
   }
 
   pub fn ui(&mut self, root: &mut Ui) {
@@ -667,7 +702,7 @@ impl RsClashUi {
           });
           ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.menu_button("⋮", |ui| {
-              if self.close_to_tray && ui.button("隐藏到托盘").clicked() {
+              if self.tray_is_available() && ui.button("隐藏到托盘").clicked() {
                 self.command(UiCommand::SetWindowVisible(false));
                 ui.close();
               }

@@ -80,6 +80,7 @@ pub(crate) enum MihomoBridgeCommand {
   ClearLogs,
   SetLogsPaused(bool),
   SetLogLevel(StreamLogLevel),
+  SetStreamFlushInterval(u64),
   SynchronizeProfile(ProfileRuntimeSync),
   CloseConnectionsForProxy { proxy: String },
   SetMode(ProxyMode),
@@ -154,7 +155,12 @@ impl MihomoWorker {
           let Some(command) = command else {
             return;
           };
-          self.handle_command(command).await;
+          if let MihomoBridgeCommand::SetStreamFlushInterval(milliseconds) = command {
+            flush_interval = interval(Duration::from_millis(milliseconds.clamp(100, 60_000)));
+            flush_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+          } else {
+            self.handle_command(command).await;
+          }
         },
         _ = stats_interval.tick(), if self.active.is_some() => {
           self.poll().await;
@@ -244,6 +250,7 @@ impl MihomoWorker {
         self.logs_stream = None;
         self.configure_streams().await;
       },
+      MihomoBridgeCommand::SetStreamFlushInterval(_) => {},
       MihomoBridgeCommand::SynchronizeProfile(sync) => {
         if self.active.is_some() {
           self.synchronize_profile(sync).await;

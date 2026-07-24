@@ -5,7 +5,9 @@ use ksni::{
   menu::{CheckmarkItem, MenuItem, RadioGroup, RadioItem, StandardItem, SubMenu},
 };
 use rsclash_app::AppClient;
-use rsclash_domain::{MihomoConnection, ProxyMode, UiCommand};
+use rsclash_domain::{
+  AppSnapshot, CoreRunMode, CoreState, MihomoConnection, ProxyMode, TrayClickAction, UiCommand,
+};
 use tokio::runtime::Handle as RuntimeHandle;
 use tracing::{debug, warn};
 
@@ -13,20 +15,53 @@ const ICON_SIZE: i32 = 32;
 static APP_ICON: LazyLock<ksni::Icon> = LazyLock::new(app_icon);
 
 pub(crate) struct TrayHandle {
-  handle: Option<ksni::Handle<AppTray>>,
+  client: AppClient,
+  handle: Option<TrayVariant>,
+  action: TrayClickAction,
+  visible: bool,
 }
 
 impl TrayHandle {
   pub(crate) fn new(client: AppClient, runtime: &RuntimeHandle) -> Result<Self, ksni::Error> {
-    let handle = runtime.block_on(AppTray { client }.spawn())?;
+    let settings = &client.current_snapshot().settings.value;
+    let action = settings.tray_click;
+    let visible = settings.show_tray;
+    let handle = visible
+      .then(|| spawn(&client, action, runtime))
+      .transpose()?;
     Ok(Self {
-      handle: Some(handle),
+      client,
+      handle,
+      action,
+      visible,
     })
   }
 
+  pub(crate) fn sync(&mut self, runtime: &RuntimeHandle) {
+    let snapshot = self.client.current_snapshot();
+    let action = snapshot.settings.value.tray_click;
+    let visible = snapshot.settings.value.show_tray;
+    if action == self.action && visible == self.visible {
+      return;
+    }
+    self.stop(runtime);
+    self.action = action;
+    self.visible = visible;
+    if visible {
+      match spawn(&self.client, action, runtime) {
+        Ok(handle) => self.handle = Some(handle),
+        Err(error) => warn!(%error, "failed to apply the updated tray settings"),
+      }
+    }
+  }
+
   pub(crate) fn shutdown(&mut self, runtime: &RuntimeHandle) {
+    self.stop(runtime);
+  }
+
+  fn stop(&mut self, runtime: &RuntimeHandle) {
     if let Some(handle) = self.handle.take() {
-      runtime.block_on(handle.shutdown());
+      handle.shutdown(runtime);
     }
   }
 }
@@ -34,16 +69,65 @@ impl TrayHandle {
 impl Drop for TrayHandle {
   fn drop(&mut self) {
     if let Some(handle) = self.handle.take() {
-      drop(handle.shutdown());
+      handle.shutdown_detached();
     }
   }
 }
 
-struct AppTray {
-  client: AppClient,
+enum TrayVariant {
+  Toggle(ksni::Handle<AppTray<false>>),
+  Menu(ksni::Handle<AppTray<true>>),
 }
 
-impl AppTray {
+impl TrayVariant {
+  fn shutdown(self, runtime: &RuntimeHandle) {
+    match self {
+      Self::Toggle(handle) => runtime.block_on(handle.shutdown()),
+      Self::Menu(handle) => runtime.block_on(handle.shutdown()),
+    }
+  }
+
+  fn shutdown_detached(self) {
+    match self {
+      Self::Toggle(handle) => drop(handle.shutdown()),
+      Self::Menu(handle) => drop(handle.shutdown()),
+    }
+  }
+}
+
+fn spawn(
+  client: &AppClient,
+  action: TrayClickAction,
+  runtime: &RuntimeHandle,
+) -> Result<TrayVariant, ksni::Error> {
+  match action {
+    TrayClickAction::ShowMenu => runtime
+      .block_on(
+        AppTray::<true> {
+          client: client.clone(),
+          action,
+        }
+        .spawn(),
+      )
+      .map(TrayVariant::Menu),
+    TrayClickAction::ToggleWindow | TrayClickAction::Disabled => runtime
+      .block_on(
+        AppTray::<false> {
+          client: client.clone(),
+          action,
+        }
+        .spawn(),
+      )
+      .map(TrayVariant::Toggle),
+  }
+}
+
+struct AppTray<const MENU_ON_CLICK: bool> {
+  client: AppClient,
+  action: TrayClickAction,
+}
+
+impl<const MENU_ON_CLICK: bool> AppTray<MENU_ON_CLICK> {
   fn send(&self, command: UiCommand) {
     debug!(?command, "dispatching system tray command");
     if let Err(error) = self.client.try_command(command) {
@@ -52,7 +136,9 @@ impl AppTray {
   }
 }
 
-impl ksni::Tray for AppTray {
+impl<const MENU_ON_CLICK: bool> ksni::Tray for AppTray<MENU_ON_CLICK> {
+  const MENU_ON_ACTIVATE: bool = MENU_ON_CLICK;
+
   fn id(&self) -> String {
     "rsclash".to_owned()
   }
@@ -62,7 +148,9 @@ impl ksni::Tray for AppTray {
   }
 
   fn activate(&mut self, _x: i32, _y: i32) {
-    self.send(UiCommand::ToggleWindow);
+    if self.action == TrayClickAction::ToggleWindow {
+      self.send(UiCommand::ToggleWindow);
+    }
   }
 
   fn icon_pixmap(&self) -> Vec<ksni::Icon> {
@@ -87,7 +175,7 @@ impl ksni::Tray for AppTray {
         && (snapshot.settings.value.pac_url.is_some()
           || (mihomo_ready && snapshot.mihomo.mixed_port.is_some())));
     let current_mode = snapshot.mihomo.mode.clone();
-    vec![
+    let mut menu = vec![
       StandardItem {
         label: "显示或隐藏 rsclash".to_owned(),
         icon_name: "view-restore-symbolic".to_owned(),
@@ -95,6 +183,23 @@ impl ksni::Tray for AppTray {
         ..Default::default()
       }
       .into(),
+    ];
+    if let Some(profiles) = profiles_menu(&snapshot) {
+      menu.push(profiles);
+    }
+    let selectors = proxy_selectors_menu(&snapshot);
+    if !selectors.is_empty() {
+      menu.push(
+        SubMenu {
+          label: "代理组".to_owned(),
+          enabled: mihomo_ready,
+          submenu: selectors,
+          ..Default::default()
+        }
+        .into(),
+      );
+    }
+    menu.extend([
       CheckmarkItem {
         label: "系统代理".to_owned(),
         enabled: can_toggle_system_proxy && !system_proxy.busy,
@@ -102,6 +207,19 @@ impl ksni::Tray for AppTray {
         activate: Box::new(|tray: &mut Self| {
           let enabled = tray.client.current_snapshot().system_proxy.enabled;
           tray.send(UiCommand::SetSystemProxy(!enabled));
+        }),
+        ..Default::default()
+      }
+      .into(),
+      CheckmarkItem {
+        label: "TUN 模式".to_owned(),
+        enabled: snapshot.settings.value.tun_enabled || service_core_active(&snapshot.core),
+        checked: snapshot.settings.value.tun_enabled,
+        activate: Box::new(|tray: &mut Self| {
+          let snapshot = tray.client.current_snapshot();
+          let mut settings = snapshot.settings.value.clone();
+          settings.tun_enabled = !settings.tun_enabled;
+          tray.send(UiCommand::ApplySettings(Box::new(settings)));
         }),
         ..Default::default()
       }
@@ -145,8 +263,136 @@ impl ksni::Tray for AppTray {
         ..Default::default()
       }
       .into(),
-    ]
+    ]);
+    menu
   }
+}
+
+fn profiles_menu<const MENU_ON_CLICK: bool>(
+  snapshot: &AppSnapshot,
+) -> Option<MenuItem<AppTray<MENU_ON_CLICK>>> {
+  if snapshot.profiles.items.is_empty() {
+    return None;
+  }
+  let selected = snapshot
+    .profiles
+    .items
+    .iter()
+    .position(|profile| profile.active)
+    .unwrap_or(0);
+  let options = snapshot
+    .profiles
+    .items
+    .iter()
+    .map(|profile| RadioItem {
+      label: profile.name.clone(),
+      enabled: !snapshot.profiles.busy,
+      ..Default::default()
+    })
+    .collect();
+  Some(
+    SubMenu {
+      label: snapshot.profiles.current().map_or_else(
+        || "配置".to_owned(),
+        |profile| format!("配置：{}", profile.name),
+      ),
+      enabled: !snapshot.profiles.busy,
+      submenu: vec![
+        RadioGroup {
+          selected,
+          select: Box::new(|tray: &mut AppTray<MENU_ON_CLICK>, selected| {
+            let snapshot = tray.client.current_snapshot();
+            if let Some(profile) = snapshot.profiles.items.get(selected) {
+              tray.send(UiCommand::ActivateProfile {
+                uid: profile.uid.clone(),
+              });
+            }
+          }),
+          options,
+        }
+        .into(),
+      ],
+      ..Default::default()
+    }
+    .into(),
+  )
+}
+
+fn proxy_selectors_menu<const MENU_ON_CLICK: bool>(
+  snapshot: &AppSnapshot,
+) -> Vec<MenuItem<AppTray<MENU_ON_CLICK>>> {
+  snapshot
+    .mihomo
+    .groups
+    .iter()
+    .filter(|group| !group.options.is_empty())
+    .take(16)
+    .map(|group| {
+      let selected = group
+        .selected
+        .as_ref()
+        .and_then(|selected| {
+          group
+            .options
+            .iter()
+            .position(|option| &option.name == selected)
+        })
+        .unwrap_or(0);
+      let options = group
+        .options
+        .iter()
+        .take(128)
+        .map(|option| RadioItem {
+          label: option.name.clone(),
+          enabled: option.alive,
+          ..Default::default()
+        })
+        .collect();
+      let group_name = group.name.clone();
+      SubMenu {
+        label: group.selected.as_ref().map_or_else(
+          || group.name.clone(),
+          |selected| format!("{}：{selected}", group.name),
+        ),
+        submenu: vec![
+          RadioGroup {
+            selected,
+            select: Box::new(move |tray: &mut AppTray<MENU_ON_CLICK>, selected| {
+              let snapshot = tray.client.current_snapshot();
+              let Some(group) = snapshot
+                .mihomo
+                .groups
+                .iter()
+                .find(|candidate| candidate.name == group_name)
+              else {
+                return;
+              };
+              if let Some(proxy) = group.options.get(selected) {
+                tray.send(UiCommand::SelectProxy {
+                  group: group.name.clone(),
+                  proxy: proxy.name.clone(),
+                });
+              }
+            }),
+            options,
+          }
+          .into(),
+        ],
+        ..Default::default()
+      }
+      .into()
+    })
+    .collect()
+}
+
+const fn service_core_active(core: &CoreState) -> bool {
+  matches!(
+    core,
+    CoreState::Running {
+      mode: CoreRunMode::Service,
+      ..
+    }
+  )
 }
 
 const fn proxy_mode_index(mode: &ProxyMode) -> usize {

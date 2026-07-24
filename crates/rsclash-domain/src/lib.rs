@@ -304,6 +304,7 @@ pub struct AppSettings {
   pub auto_launch: bool,
   pub silent_start: bool,
   pub show_tray: bool,
+  pub system_proxy_enabled: bool,
   pub system_proxy_bypass: Vec<String>,
   pub pac_url: Option<String>,
   pub tun_enabled: bool,
@@ -346,6 +347,7 @@ impl Default for AppSettings {
       auto_launch: false,
       silent_start: false,
       show_tray: true,
+      system_proxy_enabled: false,
       system_proxy_bypass: vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),

@@ -225,6 +225,10 @@ struct DesktopApp {
 impl eframe::App for DesktopApp {
   fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
     self.ui.logic(context);
+    #[cfg(all(feature = "tray", target_os = "linux"))]
+    if let Some(tray) = self.tray.as_mut() {
+      tray.sync(self.runtime.handle());
+    }
   }
 
   fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
