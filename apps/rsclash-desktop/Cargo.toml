@@ -23,6 +23,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
+futures-util.workspace = true
 ksni = { workspace = true, optional = true }
 rsclash-config.workspace = true
 rsclash-core.workspace = true
@@ -30,6 +31,7 @@ rsclash-mihomo.workspace = true
 rsclash-platform.workspace = true
 rsclash-service.workspace = true
 rustls.workspace = true
+zbus.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "net", "time"] }

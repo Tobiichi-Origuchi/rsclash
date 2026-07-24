@@ -2638,6 +2638,7 @@ name = "rsclash-desktop"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "futures-util",
  "ksni",
  "rsclash-app",
  "rsclash-config",
@@ -2651,6 +2652,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zbus",
 ]
 
 [[package]]

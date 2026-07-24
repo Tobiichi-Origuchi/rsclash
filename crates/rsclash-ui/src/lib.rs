@@ -935,7 +935,7 @@ impl RsClashUi {
         } else if system_proxy.enabled && !system_proxy.applied {
           ui.add_space(8.0);
           ui.label(
-            RichText::new("系统设置已在外部发生变化；关闭时仍会恢复启用前的状态。")
+            RichText::new("系统设置已在外部发生变化；rsclash 将保留外部修改，不再覆盖它。")
               .small()
               .color(ui.visuals().warn_fg_color),
           );
@@ -3303,6 +3303,12 @@ fn settings_interface(ui: &mut Ui, draft: &mut AppSettings) {
     ui.checkbox(&mut draft.traffic_graph, "首页显示流量图");
     ui.checkbox(&mut draft.memory_usage, "首页显示内存用量");
     ui.checkbox(&mut draft.show_tray, "显示托盘图标");
+    ui.checkbox(&mut draft.global_hotkeys, "启用桌面全局快捷键");
+    ui.label(
+      RichText::new("首次启用时，Wayland 桌面将通过 XDG Portal 请求快捷键权限。")
+        .small()
+        .weak(),
+    );
     preference_label(ui, "首页卡片", "启用卡片并调整它们在首页中的显示顺序");
     ordered_home_card_editor(ui, &mut draft.home_cards);
     ui.horizontal(|ui| {

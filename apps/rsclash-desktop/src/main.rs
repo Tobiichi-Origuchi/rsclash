@@ -1,5 +1,7 @@
 mod fonts;
 #[cfg(target_os = "linux")]
+mod global_shortcuts;
+#[cfg(target_os = "linux")]
 mod linux_bootstrap;
 #[cfg(target_os = "linux")]
 mod logging;
@@ -70,6 +72,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .map(|instance| instance.listen(client.clone(), dispatch_launch_request))
         .transpose()
         .map_err(|error| -> Box<dyn Error + Send + Sync> { error.into() })?;
+      #[cfg(target_os = "linux")]
+      let global_shortcuts =
+        global_shortcuts::GlobalShortcutsHandle::spawn(runtime.handle(), client.clone());
 
       #[cfg(all(feature = "tray", target_os = "linux"))]
       let tray = match tray::TrayHandle::new(client.clone(), runtime.handle()) {
@@ -93,6 +98,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         tray,
         #[cfg(target_os = "linux")]
         _instance: instance,
+        #[cfg(target_os = "linux")]
+        _global_shortcuts: global_shortcuts,
       }))
     }),
   )?;
@@ -239,6 +246,8 @@ struct DesktopApp {
   tray: Option<tray::TrayHandle>,
   #[cfg(target_os = "linux")]
   _instance: Option<single_instance::InstanceHandle>,
+  #[cfg(target_os = "linux")]
+  _global_shortcuts: global_shortcuts::GlobalShortcutsHandle,
 }
 
 impl eframe::App for DesktopApp {
