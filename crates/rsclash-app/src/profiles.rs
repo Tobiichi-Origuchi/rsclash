@@ -20,8 +20,9 @@ use rsclash_config::{
   extract_control_plane,
 };
 use rsclash_domain::{
-  ProfileDownloadProxy, ProfileEnhancementRefs, ProfileQrCode, ProfileSourceKind, ProfileSummary,
-  ProfilesSnapshot, RemoteProfileOptions, SensitiveString, SubscriptionUsage,
+  ProfileDiagnosticStage, ProfileDiagnostics, ProfileDownloadProxy, ProfileEnhancementRefs,
+  ProfileOperationDiagnostic, ProfileOperationKind, ProfileQrCode, ProfileSourceKind,
+  ProfileSummary, ProfilesSnapshot, RemoteProfileOptions, SensitiveString, SubscriptionUsage,
 };
 use rsclash_platform::SystemProxyBackend;
 use serde_yaml_ng::Value;
@@ -198,7 +199,10 @@ impl ProfileWorker {
     Self {
       access,
       activator,
-      snapshot: ProfilesSnapshot::default(),
+      snapshot: ProfilesSnapshot {
+        diagnostics: profile_diagnostics(),
+        ..ProfilesSnapshot::default()
+      },
       event_tx,
     }
   }
@@ -231,12 +235,16 @@ impl ProfileWorker {
       ProfileBridgeCommand::Import(command) => {
         self.set_busy(true).await;
         let result = self.import(command).await;
-        self.finish_operation(result).await;
+        self
+          .finish_operation(ProfileOperationKind::Import, result)
+          .await;
       },
       ProfileBridgeCommand::Activate { uid } => {
         self.set_busy(true).await;
         let result = self.activate(uid).await;
-        self.finish_operation(result).await;
+        self
+          .finish_operation(ProfileOperationKind::Activate, result)
+          .await;
       },
       ProfileBridgeCommand::PersistSelection {
         group,
@@ -246,7 +254,9 @@ impl ProfileWorker {
       ProfileBridgeCommand::Mutate(command) => {
         self.set_busy(true).await;
         let result = self.mutate(command).await;
-        self.finish_operation(result).await;
+        self
+          .finish_operation(ProfileOperationKind::Manage, result)
+          .await;
       },
       ProfileBridgeCommand::Update(command) => {
         self.set_busy(true).await;
@@ -254,7 +264,9 @@ impl ProfileWorker {
           ProfileUpdateCommand::One { uid } => self.update_remote(uid).await,
           ProfileUpdateCommand::All => self.update_all_remote().await,
         };
-        self.finish_operation(result).await;
+        self
+          .finish_operation(ProfileOperationKind::Update, result)
+          .await;
       },
       ProfileBridgeCommand::Content(command) => {
         self.handle_content(command).await;
@@ -278,7 +290,9 @@ impl ProfileWorker {
       };
       let _ = self.event_tx.send(event).await;
     }
-    self.finish_operation(result.map(|_| ())).await;
+    self
+      .finish_operation(ProfileOperationKind::Edit, result.map(|_| ()))
+      .await;
   }
 
   async fn handle_qr(&self, command: ProfileQrCommand) {
@@ -627,7 +641,9 @@ impl ProfileWorker {
     };
     self.set_busy(true).await;
     let result = self.update_remote_profiles(uids).await;
-    self.finish_operation(result).await;
+    self
+      .finish_operation(ProfileOperationKind::AutomaticUpdate, result)
+      .await;
   }
 
   async fn save_profile_content(&self, uid: String, content: String) -> Result<(), String> {
@@ -734,15 +750,33 @@ impl ProfileWorker {
       .and_then(|result| result);
     match result {
       Ok(snapshot) => {
-        self.snapshot = snapshot;
+        self.snapshot = ProfilesSnapshot {
+          diagnostics: self.snapshot.diagnostics.clone(),
+          ..snapshot
+        };
         self.publish().await;
       },
       Err(error) => self.fail(error).await,
     }
   }
 
-  async fn finish_operation(&mut self, result: Result<(), String>) {
+  async fn finish_operation(
+    &mut self,
+    operation: ProfileOperationKind,
+    result: Result<(), String>,
+  ) {
     let error = result.err();
+    self.snapshot.diagnostics.last_operation = Some(ProfileOperationDiagnostic {
+      operation,
+      stage: error
+        .as_deref()
+        .map_or(ProfileDiagnosticStage::Completed, classify_profile_error),
+      success: error.is_none(),
+      message: error
+        .clone()
+        .unwrap_or_else(|| "operation completed successfully".to_string()),
+      timestamp: unix_seconds(),
+    });
     self.refresh().await;
     if let Some(error) = error {
       self.fail(error).await;
@@ -2044,7 +2078,70 @@ fn load_snapshot(store: &ProfileStore) -> Result<ProfilesSnapshot, String> {
       })
     })
     .collect();
-  Ok(ProfilesSnapshot { items, busy: false })
+  Ok(ProfilesSnapshot {
+    items,
+    busy: false,
+    diagnostics: ProfileDiagnostics::default(),
+  })
+}
+
+fn profile_diagnostics() -> ProfileDiagnostics {
+  ProfileDiagnostics {
+    native_transforms: NativeTransform::compatibility_defaults()
+      .iter()
+      .map(|transform| match transform {
+        NativeTransform::GuardLegacyScriptMode => "Guard legacy script mode",
+        NativeTransform::NormalizeHysteriaAlpn => "Normalize Hysteria ALPN",
+        NativeTransform::MigrateLegacyWebSocketOptions => "Migrate legacy WebSocket options",
+        NativeTransform::EnableProxyUdp => "Enable proxy UDP",
+      })
+      .map(str::to_string)
+      .collect(),
+    pipeline_order: [
+      "Sequence rules, proxies, and groups",
+      "Application defaults",
+      "Native compatibility transforms",
+      "TUN and DNS settings",
+      "Global merge",
+      "Profile merge",
+      "Restore application control plane",
+      "Clean references and sort fields",
+      "Mihomo validation",
+      "Atomic runtime deployment",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect(),
+    last_operation: None,
+  }
+}
+
+fn classify_profile_error(error: &str) -> ProfileDiagnosticStage {
+  let error = error.to_ascii_lowercase();
+  if error.contains("download")
+    || error.contains("subscription response")
+    || error.contains("remote profile import")
+    || error.contains("qr")
+  {
+    ProfileDiagnosticStage::Download
+  } else if error.contains("validate") || error.contains("validation") {
+    ProfileDiagnosticStage::Validation
+  } else if error.contains("enhance")
+    || error.contains("prepare")
+    || error.contains("referenced")
+    || error.contains("runtime config")
+  {
+    ProfileDiagnosticStage::Enhancement
+  } else if error.contains("deploy")
+    || error.contains("activate")
+    || error.contains("reload")
+    || error.contains("restart")
+    || error.contains("runtime")
+  {
+    ProfileDiagnosticStage::Deployment
+  } else {
+    ProfileDiagnosticStage::Storage
+  }
 }
 
 fn validate_profile_name(name: &str) -> Result<(), String> {
@@ -2105,6 +2202,7 @@ mod tests {
   use image::{GrayImage, Luma};
   use rsclash_config::initialize_default_runtime;
   use rsclash_config::{Result as ConfigResult, RuntimeActivator, RuntimeValidator};
+  use rsclash_domain::ProfileDiagnosticStage;
   use serde_yaml_ng::Value;
   use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
@@ -2113,13 +2211,29 @@ mod tests {
   };
 
   use super::{
-    DownloadedProfile, ProfileAccess, ProfileWorker, decode_profile_qr, delete_profiles,
-    due_remote_profile_uids, duplicate_profile, generate_profile_qr, import_content, import_local,
-    load_snapshot, persist_profile_selection, prepare_activation, profile_runtime_sync,
-    rename_profile, reorder_profile, resolve_remote_input, set_current_profile, set_remote_options,
+    DownloadedProfile, ProfileAccess, ProfileWorker, classify_profile_error, decode_profile_qr,
+    delete_profiles, due_remote_profile_uids, duplicate_profile, generate_profile_qr,
+    import_content, import_local, load_snapshot, persist_profile_selection, prepare_activation,
+    profile_diagnostics, profile_runtime_sync, rename_profile, reorder_profile,
+    resolve_remote_input, set_current_profile, set_remote_options,
   };
 
   static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+  #[test]
+  fn diagnostics_distinguish_validation_from_deployment_failures() {
+    assert_eq!(
+      classify_profile_error("activate edited profile: validate edited profile runtime"),
+      ProfileDiagnosticStage::Validation
+    );
+    assert_eq!(
+      classify_profile_error("activate profile runtime: reload failed"),
+      ProfileDiagnosticStage::Deployment
+    );
+    let diagnostics = profile_diagnostics();
+    assert!(!diagnostics.native_transforms.is_empty());
+    assert!(diagnostics.pipeline_order.len() >= 8);
+  }
 
   #[test]
   fn local_import_and_activation_preserve_application_control_fields() {

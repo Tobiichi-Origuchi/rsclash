@@ -14,8 +14,9 @@ use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, Stroke, Ui};
 use rsclash_app::{AppClient, AppEventReceiver, ClientError};
 use rsclash_domain::{
   AppEvent, AppSnapshot, AppStatus, CoreChannel, CoreRunMode, CoreState, MihomoConnection, Page,
-  ProfileDownloadProxy, ProfileQrCode, ProfileSourceKind, ProxyGroupSnapshot, ProxyMode,
-  RemoteProfileOptions, SensitiveString, ThemeMode, UiCommand,
+  ProfileDiagnosticStage, ProfileDiagnostics, ProfileDownloadProxy, ProfileOperationKind,
+  ProfileQrCode, ProfileSourceKind, ProxyGroupSnapshot, ProxyMode, RemoteProfileOptions,
+  SensitiveString, ThemeMode, UiCommand,
 };
 
 struct ProfileEditor {
@@ -700,6 +701,9 @@ impl RsClashUi {
         }
       });
     });
+    ui.add_space(16.0);
+
+    profile_diagnostics_card(ui, &profiles.diagnostics);
     ui.add_space(16.0);
 
     if self.profile_editor.is_some() {
@@ -1788,6 +1792,82 @@ fn sequence_item_value(
     }
   }
   Ok(value)
+}
+
+fn profile_diagnostics_card(ui: &mut Ui, diagnostics: &ProfileDiagnostics) {
+  card(ui, "原生增强与运行诊断", |ui| {
+    if let Some(last) = diagnostics.last_operation.as_ref() {
+      let color = if last.success {
+        Color32::from_rgb(38, 162, 105)
+      } else {
+        ui.visuals().error_fg_color
+      };
+      ui.horizontal_wrapped(|ui| {
+        ui.label(
+          RichText::new(if last.success {
+            "最近操作成功"
+          } else {
+            "最近操作失败"
+          })
+          .strong()
+          .color(color),
+        );
+        ui.label(format!(
+          "{} · {} · {}",
+          profile_operation_label(last.operation),
+          profile_stage_label(last.stage),
+          format_update_age(last.timestamp)
+        ));
+      });
+      if !last.success {
+        ui.label(RichText::new(&last.message).small().color(color));
+      }
+    } else {
+      ui.label(RichText::new("本次启动尚未执行配置操作。").small().weak());
+    }
+    ui.add_space(8.0);
+    egui::CollapsingHeader::new(format!(
+      "启用的原生兼容增强（{}）",
+      diagnostics.native_transforms.len()
+    ))
+    .default_open(true)
+    .show(ui, |ui| {
+      for transform in &diagnostics.native_transforms {
+        ui.label(format!("• {transform}"));
+      }
+    });
+    egui::CollapsingHeader::new(format!(
+      "生成、校验与部署顺序（{} 步）",
+      diagnostics.pipeline_order.len()
+    ))
+    .show(ui, |ui| {
+      for (index, stage) in diagnostics.pipeline_order.iter().enumerate() {
+        ui.label(format!("{}. {stage}", index + 1));
+      }
+    });
+  });
+}
+
+const fn profile_operation_label(operation: ProfileOperationKind) -> &'static str {
+  match operation {
+    ProfileOperationKind::Import => "导入配置",
+    ProfileOperationKind::Activate => "激活配置",
+    ProfileOperationKind::Update => "更新订阅",
+    ProfileOperationKind::Edit => "编辑配置",
+    ProfileOperationKind::Manage => "管理配置",
+    ProfileOperationKind::AutomaticUpdate => "自动更新",
+  }
+}
+
+const fn profile_stage_label(stage: ProfileDiagnosticStage) -> &'static str {
+  match stage {
+    ProfileDiagnosticStage::Download => "下载阶段",
+    ProfileDiagnosticStage::Enhancement => "增强生成阶段",
+    ProfileDiagnosticStage::Validation => "Mihomo 校验阶段",
+    ProfileDiagnosticStage::Deployment => "运行配置部署阶段",
+    ProfileDiagnosticStage::Storage => "配置存储阶段",
+    ProfileDiagnosticStage::Completed => "全部阶段完成",
+  }
 }
 
 fn remote_profile_options_editor(ui: &mut Ui, options: &mut RemoteProfileOptions) {

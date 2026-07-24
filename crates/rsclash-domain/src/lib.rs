@@ -271,6 +271,43 @@ pub struct ProfileSummary {
 pub struct ProfilesSnapshot {
   pub items: Vec<ProfileSummary>,
   pub busy: bool,
+  pub diagnostics: ProfileDiagnostics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProfileOperationKind {
+  Import,
+  Activate,
+  Update,
+  Edit,
+  Manage,
+  AutomaticUpdate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProfileDiagnosticStage {
+  Download,
+  Enhancement,
+  Validation,
+  Deployment,
+  Storage,
+  Completed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProfileOperationDiagnostic {
+  pub operation: ProfileOperationKind,
+  pub stage: ProfileDiagnosticStage,
+  pub success: bool,
+  pub message: String,
+  pub timestamp: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProfileDiagnostics {
+  pub native_transforms: Vec<String>,
+  pub pipeline_order: Vec<String>,
+  pub last_operation: Option<ProfileOperationDiagnostic>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
