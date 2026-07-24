@@ -15,12 +15,12 @@ use rsclash_app::{AppClient, AppEventReceiver, ClientError};
 use rsclash_domain::{
   AppEvent, AppLanguage, AppSettings, AppSnapshot, AppStatus, ApplicationDirectory,
   ConnectionSnapshot, CoreChannel, CoreRunMode, CoreState, DnsEnhancedMode, LogSnapshot,
-  MetricPoint, MihomoConnection, NavigationLayout, Page, ProfileDiagnosticStage,
+  MetricPoint, MihomoConnection, MihomoSnapshot, NavigationLayout, Page, ProfileDiagnosticStage,
   ProfileDiagnostics, ProfileDownloadProxy, ProfileOperationKind, ProfileQrCode, ProfileSourceKind,
   ProxyCapabilities, ProxyGroupLayout, ProxyGroupView, ProxyMemberSnapshot,
   ProxyMemberUnresolvedReason, ProxyMode, ProxyNodeSnapshot, ProxyNodeSource, ProxyViewV1,
-  RemoteProfileOptions, RuleSnapshot, SensitiveString, StreamLogLevel, ThemeMode, TrayClickAction,
-  TunStack, UiCommand,
+  RemoteProfileOptions, RuleSnapshot, SensitiveString, StreamLogLevel, SystemProxyView, ThemeMode,
+  TrayClickAction, TunStack, UiCommand,
 };
 
 struct ProfileEditor {
@@ -797,9 +797,6 @@ impl RsClashUi {
     let core = self.snapshot.core.clone();
     let mihomo = self.snapshot.mihomo.clone();
     let system_proxy = self.snapshot.system_proxy.clone();
-    let can_enable_system_proxy = system_proxy.available
-      && (self.snapshot.settings.value.pac_url.is_some()
-        || (mihomo.connection == MihomoConnection::Connected && mihomo.mixed_port.is_some()));
     ui.horizontal(|ui| {
       mihomo_connection_pill(ui, mihomo.connection);
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -811,9 +808,25 @@ impl RsClashUi {
     });
     ui.add_space(14.0);
 
+    let cards = normalized_home_cards(&self.snapshot.settings.value.home_cards);
+    for (index, item) in cards.iter().enumerate() {
+      if index > 0 {
+        ui.add_space(12.0);
+      }
+      match item.as_str() {
+        "profile" => self.home_profile(ui, &core, &mihomo),
+        "proxy" => self.home_proxy(ui, &mihomo),
+        "network" => self.home_network(ui, &core, &mihomo, &system_proxy),
+        "traffic" => self.home_traffic(ui, &mihomo),
+        _ => {},
+      }
+    }
+  }
+
+  fn home_profile(&mut self, ui: &mut Ui, core: &CoreState, mihomo: &MihomoSnapshot) {
     ui.columns(2, |columns| {
       card(&mut columns[0], "Mihomo 核心", |ui| {
-        self.core_controls(ui, &core);
+        self.core_controls(ui, core);
       });
       card(&mut columns[1], "当前代理", |ui| {
         ui.label(
@@ -843,8 +856,133 @@ impl RsClashUi {
         );
       });
     });
+  }
 
-    ui.add_space(12.0);
+  fn home_proxy(&mut self, ui: &mut Ui, mihomo: &MihomoSnapshot) {
+    card(ui, "出站模式", |ui| {
+      self.mode_controls(ui, &mihomo.mode);
+      if let Some(error) = mihomo.last_error.as_deref() {
+        ui.add_space(8.0);
+        ui.label(
+          RichText::new(format!("控制器暂时不可用：{error}"))
+            .small()
+            .color(ui.visuals().warn_fg_color),
+        );
+      }
+    });
+  }
+
+  fn home_network(
+    &mut self,
+    ui: &mut Ui,
+    core: &CoreState,
+    mihomo: &MihomoSnapshot,
+    system_proxy: &SystemProxyView,
+  ) {
+    let can_enable_system_proxy = system_proxy.available
+      && (self.snapshot.settings.value.pac_url.is_some()
+        || (mihomo.connection == MihomoConnection::Connected && mihomo.mixed_port.is_some()));
+    ui.columns(2, |columns| {
+      card(&mut columns[0], "系统代理", |ui| {
+        ui.horizontal(|ui| {
+          ui.vertical(|ui| {
+            ui.label(
+              RichText::new(if system_proxy.enabled {
+                "已接管系统代理"
+              } else {
+                "未接管系统代理"
+              })
+              .size(18.0)
+              .strong(),
+            );
+            let backend = system_proxy
+              .backend
+              .as_deref()
+              .unwrap_or("正在检测 Linux 后端");
+            ui.label(RichText::new(backend).small().weak());
+          });
+          ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if system_proxy.busy {
+              ui.spinner();
+            }
+            if ui
+              .add_enabled(
+                !system_proxy.busy && (system_proxy.enabled || can_enable_system_proxy),
+                egui::Button::new(if system_proxy.enabled {
+                  "关闭系统代理"
+                } else {
+                  "启用系统代理"
+                }),
+              )
+              .clicked()
+            {
+              self.command(UiCommand::SetSystemProxy(!system_proxy.enabled));
+            }
+          });
+        });
+        if !system_proxy.available {
+          ui.add_space(8.0);
+          ui.label(
+            RichText::new(
+              system_proxy
+                .detail
+                .as_deref()
+                .unwrap_or("当前桌面环境不支持系统代理控制"),
+            )
+            .small()
+            .color(ui.visuals().warn_fg_color),
+          );
+        } else if system_proxy.enabled && !system_proxy.applied {
+          ui.add_space(8.0);
+          ui.label(
+            RichText::new("系统设置已在外部发生变化；关闭时仍会恢复启用前的状态。")
+              .small()
+              .color(ui.visuals().warn_fg_color),
+          );
+        } else if !can_enable_system_proxy && !system_proxy.enabled {
+          ui.add_space(8.0);
+          ui.label(
+            RichText::new("启动 Mihomo 后即可启用系统代理。")
+              .small()
+              .weak(),
+          );
+        }
+      });
+      card(&mut columns[1], "TUN 模式", |ui| {
+        let (status, detail, available) = tun_capability(core, mihomo.tun_enabled);
+        ui.label(
+          RichText::new(status)
+            .size(18.0)
+            .strong()
+            .color(if available {
+              theme::tokens(ui).success
+            } else {
+              ui.visuals().warn_fg_color
+            }),
+        );
+        ui.label(RichText::new(detail).small().weak());
+        let enabled = self.snapshot.settings.value.tun_enabled;
+        if ui
+          .add_enabled(
+            available || enabled,
+            egui::Button::new(if enabled { "关闭 TUN" } else { "启用 TUN" }).selected(enabled),
+          )
+          .clicked()
+        {
+          let mut settings = self.snapshot.settings.value.clone();
+          settings.tun_enabled = !enabled;
+          self.command(UiCommand::ApplySettings(Box::new(settings)));
+        }
+      });
+    });
+  }
+
+  fn home_traffic(&self, ui: &mut Ui, mihomo: &MihomoSnapshot) {
+    let memory = if self.snapshot.settings.value.memory_usage {
+      format_bytes(mihomo.memory_bytes)
+    } else {
+      "已隐藏".to_string()
+    };
     ui.columns(2, |columns| {
       card(&mut columns[0], "实时流量", |ui| {
         stat_pair(
@@ -859,116 +997,13 @@ impl RsClashUi {
         stat_pair(
           ui,
           "内存",
-          &format_bytes(mihomo.memory_bytes),
+          &memory,
           "连接",
           &mihomo.connection_count.to_string(),
         );
       });
     });
-
-    ui.add_space(12.0);
-    card(ui, "出站模式", |ui| {
-      self.mode_controls(ui, &mihomo.mode);
-      if let Some(error) = mihomo.last_error.as_deref() {
-        ui.add_space(8.0);
-        ui.label(
-          RichText::new(format!("控制器暂时不可用：{error}"))
-            .small()
-            .color(ui.visuals().warn_fg_color),
-        );
-      }
-    });
-
-    ui.add_space(12.0);
-    card(ui, "系统代理", |ui| {
-      ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-          ui.label(
-            RichText::new(if system_proxy.enabled {
-              "已接管系统代理"
-            } else {
-              "未接管系统代理"
-            })
-            .size(18.0)
-            .strong(),
-          );
-          let backend = system_proxy
-            .backend
-            .as_deref()
-            .unwrap_or("正在检测 Linux 后端");
-          ui.label(RichText::new(backend).small().weak());
-        });
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-          if system_proxy.busy {
-            ui.spinner();
-          }
-          if ui
-            .add_enabled(
-              !system_proxy.busy && (system_proxy.enabled || can_enable_system_proxy),
-              egui::Button::new(if system_proxy.enabled {
-                "关闭系统代理"
-              } else {
-                "启用系统代理"
-              }),
-            )
-            .clicked()
-          {
-            self.command(UiCommand::SetSystemProxy(!system_proxy.enabled));
-          }
-        });
-      });
-      if !system_proxy.available {
-        ui.add_space(8.0);
-        ui.label(
-          RichText::new(
-            system_proxy
-              .detail
-              .as_deref()
-              .unwrap_or("当前桌面环境不支持系统代理控制"),
-          )
-          .small()
-          .color(ui.visuals().warn_fg_color),
-        );
-      } else if system_proxy.enabled && !system_proxy.applied {
-        ui.add_space(8.0);
-        ui.label(
-          RichText::new("系统设置已在外部发生变化；关闭时仍会恢复启用前的状态。")
-            .small()
-            .color(ui.visuals().warn_fg_color),
-        );
-      } else if !can_enable_system_proxy && !system_proxy.enabled {
-        ui.add_space(8.0);
-        ui.label(
-          RichText::new("启动 Mihomo 后即可启用系统代理。")
-            .small()
-            .weak(),
-        );
-      }
-    });
-
-    ui.add_space(12.0);
-    card(ui, "TUN 能力", |ui| {
-      let (status, detail, available) = tun_capability(&core, mihomo.tun_enabled);
-      ui.label(
-        RichText::new(status)
-          .size(18.0)
-          .strong()
-          .color(if available {
-            Color32::from_rgb(38, 162, 105)
-          } else {
-            ui.visuals().warn_fg_color
-          }),
-      );
-      ui.label(RichText::new(detail).small().weak());
-      if available && !mihomo.tun_enabled {
-        ui.label(
-          RichText::new("P6 仅显示权限状态；TUN 配置开关将在设置事务接入后开放。")
-            .small()
-            .weak(),
-        );
-      }
-    });
-    if !mihomo.metrics.is_empty() {
+    if !mihomo.metrics.is_empty() && self.snapshot.settings.value.traffic_graph {
       ui.add_space(12.0);
       card(ui, "实时流量与内存", |ui| {
         ui.label(
@@ -979,9 +1014,7 @@ impl RsClashUi {
           .small()
           .weak(),
         );
-        if self.snapshot.settings.value.traffic_graph {
-          metric_chart(ui, &mihomo.metrics);
-        }
+        metric_chart(ui, &mihomo.metrics);
       });
     }
   }
@@ -3270,6 +3303,8 @@ fn settings_interface(ui: &mut Ui, draft: &mut AppSettings) {
     ui.checkbox(&mut draft.traffic_graph, "首页显示流量图");
     ui.checkbox(&mut draft.memory_usage, "首页显示内存用量");
     ui.checkbox(&mut draft.show_tray, "显示托盘图标");
+    preference_label(ui, "首页卡片", "启用卡片并调整它们在首页中的显示顺序");
+    ordered_home_card_editor(ui, &mut draft.home_cards);
     ui.horizontal(|ui| {
       ui.label("刷新间隔");
       ui.add(
@@ -3337,12 +3372,12 @@ fn settings_interface(ui: &mut Ui, draft: &mut AppSettings) {
         .range(100..=120_000)
         .suffix(" ms"),
     );
-    preference_label(
-      ui,
-      "连接列",
-      "每行一个列标识，可拖拽排序将在后续视觉增强中加入",
-    );
-    string_list_editor(ui, &mut draft.connection_columns, "process");
+    preference_label(ui, "连接列", "目标和流量始终显示，以下字段可以单独开关");
+    ui.horizontal_wrapped(|ui| {
+      setting_membership_checkbox(ui, &mut draft.connection_columns, "process", "进程");
+      setting_membership_checkbox(ui, &mut draft.connection_columns, "rule", "规则");
+      setting_membership_checkbox(ui, &mut draft.connection_columns, "chains", "代理链");
+    });
   });
   ui.add_space(12.0);
   card(ui, "应用日志保留", |ui| {
@@ -3450,6 +3485,93 @@ fn settings_maintenance(
 fn preference_label(ui: &mut Ui, title: &str, description: &str) {
   ui.label(RichText::new(title).strong());
   ui.label(RichText::new(description).small().weak());
+}
+
+fn normalized_home_cards(cards: &[String]) -> Vec<String> {
+  let mut seen = BTreeSet::new();
+  let cards = cards
+    .iter()
+    .filter(|card| matches!(card.as_str(), "profile" | "proxy" | "network" | "traffic"))
+    .filter(|card| seen.insert(card.as_str()))
+    .cloned()
+    .collect::<Vec<_>>();
+  if cards.is_empty() {
+    vec!["profile".to_string()]
+  } else {
+    cards
+  }
+}
+
+fn ordered_home_card_editor(ui: &mut Ui, cards: &mut Vec<String>) {
+  let mut order = normalized_home_cards(cards);
+  for key in ["profile", "proxy", "network", "traffic"] {
+    if !order.iter().any(|card| card == key) {
+      order.push(key.to_string());
+    }
+  }
+  let mut action = None;
+  for key in order {
+    let position = cards.iter().position(|card| card == &key);
+    let mut enabled = position.is_some();
+    ui.horizontal(|ui| {
+      if ui.checkbox(&mut enabled, home_card_label(&key)).changed() {
+        action = Some(if enabled {
+          HomeCardEdit::Enable(key.clone())
+        } else {
+          HomeCardEdit::Disable(key.clone())
+        });
+      }
+      if let Some(position) = position {
+        if ui
+          .add_enabled(position > 0, egui::Button::new("↑"))
+          .clicked()
+        {
+          action = Some(HomeCardEdit::MoveUp(position));
+        }
+        if ui
+          .add_enabled(position + 1 < cards.len(), egui::Button::new("↓"))
+          .clicked()
+        {
+          action = Some(HomeCardEdit::MoveDown(position));
+        }
+      }
+    });
+  }
+  match action {
+    Some(HomeCardEdit::Enable(key)) => cards.push(key),
+    Some(HomeCardEdit::Disable(key)) => cards.retain(|card| card != &key),
+    Some(HomeCardEdit::MoveUp(position)) => cards.swap(position, position - 1),
+    Some(HomeCardEdit::MoveDown(position)) => cards.swap(position, position + 1),
+    None => {},
+  }
+}
+
+enum HomeCardEdit {
+  Enable(String),
+  Disable(String),
+  MoveUp(usize),
+  MoveDown(usize),
+}
+
+fn home_card_label(key: &str) -> &str {
+  match key {
+    "profile" => "核心与当前配置",
+    "proxy" => "出站模式",
+    "network" => "系统代理与 TUN",
+    "traffic" => "流量与资源",
+    _ => key,
+  }
+}
+
+fn setting_membership_checkbox(ui: &mut Ui, values: &mut Vec<String>, key: &str, label: &str) {
+  let mut enabled = values.iter().any(|value| value == key);
+  if ui.checkbox(&mut enabled, label).changed() {
+    if enabled {
+      values.push(key.to_string());
+    } else {
+      values.retain(|value| value != key);
+    }
+  }
 }
 
 fn optional_port_editor(ui: &mut Ui, label: &str, port: &mut Option<u16>, default: u16) {

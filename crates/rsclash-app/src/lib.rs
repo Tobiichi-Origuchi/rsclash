@@ -1201,6 +1201,16 @@ impl Coordinator {
           let _ = command_tx.try_send(MihomoBridgeCommand::SetLogLevel(
             self.snapshot.settings.value.mihomo_log_level,
           ));
+          let _ = command_tx.try_send(MihomoBridgeCommand::SetLatencyTest {
+            url: self.snapshot.settings.value.latency_test_url.clone(),
+            timeout_ms: self
+              .snapshot
+              .settings
+              .value
+              .latency_timeout_ms
+              .try_into()
+              .unwrap_or(u32::MAX),
+          });
         }
         self.ensure_desired_system_proxy();
         self.publish_snapshot();

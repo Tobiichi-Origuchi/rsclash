@@ -31,11 +31,11 @@ pub fn validate_application_settings(settings: &AppSettings) -> Result<()> {
   if !(100..=120_000).contains(&settings.latency_timeout_ms) {
     return invalid("latency timeout must be between 100 and 120000 milliseconds");
   }
-  if settings.app_log_max_size_mib == 0
-    || settings.app_log_max_count == 0
-    || settings.app_log_retention_days == 0
+  if !(1..=1_024).contains(&settings.app_log_max_size_mib)
+    || !(1..=100).contains(&settings.app_log_max_count)
+    || !(1..=365).contains(&settings.app_log_retention_days)
   {
-    return invalid("application log limits must be non-zero");
+    return invalid("application log limits exceed the supported bounds");
   }
   if settings.startup_script.len() > 64 * 1024 {
     return invalid("startup script exceeds the 64 KiB limit");
@@ -52,8 +52,40 @@ pub fn validate_application_settings(settings: &AppSettings) -> Result<()> {
   {
     return invalid("PAC URL must use HTTP or HTTPS");
   }
+  if !valid_http_url(&settings.latency_test_url) {
+    return invalid("latency test URL must use HTTP or HTTPS");
+  }
+  validate_known_unique_values(
+    &settings.home_cards,
+    &["profile", "proxy", "network", "traffic"],
+    "home cards",
+  )?;
+  validate_known_unique_values(
+    &settings.connection_columns,
+    &["destination", "traffic", "process", "rule", "chains"],
+    "connection columns",
+  )?;
+  if settings
+    .network_interface
+    .as_deref()
+    .is_some_and(|interface| interface.contains(['\n', '\r']))
+  {
+    return invalid("network interface must be a single-line value");
+  }
   if settings.controller.enabled {
     validate_socket_address(&settings.controller.address, "external controller address")?;
+    let controller = settings
+      .controller
+      .address
+      .parse::<std::net::SocketAddr>()
+      .map_err(|_| {
+        Error::InvalidConfiguration(
+          "external controller address must be an IP socket address".to_string(),
+        )
+      })?;
+    if !controller.ip().is_loopback() && settings.controller.secret.expose().is_empty() {
+      return invalid("a non-loopback external controller requires a secret");
+    }
     if settings.controller.allowed_origins.iter().any(|origin| {
       origin != "*" && !origin.starts_with("http://") && !origin.starts_with("https://")
     }) {
@@ -142,6 +174,7 @@ pub fn apply_application_settings(
     mapping.insert("external-controller-cors".into(), Value::Mapping(cors));
   } else {
     mapping.remove("external-controller");
+    mapping.remove("secret");
     mapping.remove("external-controller-cors");
   }
 
@@ -212,6 +245,17 @@ pub fn apply_application_settings(
   Ok(())
 }
 
+fn validate_known_unique_values(values: &[String], supported: &[&str], label: &str) -> Result<()> {
+  let mut seen = BTreeSet::new();
+  if values
+    .iter()
+    .any(|value| !supported.contains(&value.as_str()) || !seen.insert(value))
+  {
+    return invalid(format!("{label} contain unsupported or duplicate values"));
+  }
+  Ok(())
+}
+
 fn set_optional_port(mapping: &mut Mapping, key: &str, value: Option<u16>) {
   if let Some(port) = value {
     insert(mapping, key, port);
@@ -258,6 +302,18 @@ mod tests {
     let mut settings = AppSettings::default();
     settings.ports.http = Some(settings.ports.mixed);
 
+    assert!(validate_application_settings(&settings).is_err());
+  }
+
+  #[test]
+  fn rejects_insecure_or_unknown_application_preferences() {
+    let mut settings = AppSettings::default();
+    settings.controller.enabled = true;
+    settings.controller.address = "0.0.0.0:9090".to_string();
+    assert!(validate_application_settings(&settings).is_err());
+
+    settings.controller.address = "127.0.0.1:9090".to_string();
+    settings.home_cards.push("unknown".to_string());
     assert!(validate_application_settings(&settings).is_err());
   }
 

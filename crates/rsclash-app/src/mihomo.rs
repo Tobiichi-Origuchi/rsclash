@@ -81,6 +81,7 @@ pub(crate) enum MihomoBridgeCommand {
   SetLogsPaused(bool),
   SetLogLevel(StreamLogLevel),
   SetStreamFlushInterval(u64),
+  SetLatencyTest { url: String, timeout_ms: u32 },
   SynchronizeProfile(ProfileRuntimeSync),
   CloseConnectionsForProxy { proxy: String },
   SetMode(ProxyMode),
@@ -105,6 +106,8 @@ struct MihomoWorker {
   page: Page,
   visible: bool,
   log_level: StreamLogLevel,
+  latency_test_url: String,
+  latency_timeout_ms: u32,
   traffic_stream: Option<MihomoStream<Traffic>>,
   memory_stream: Option<MihomoStream<Memory>>,
   connections_stream: Option<MihomoStream<Connections>>,
@@ -129,6 +132,8 @@ impl MihomoWorker {
       page: Page::Home,
       visible: true,
       log_level: StreamLogLevel::Info,
+      latency_test_url: DEFAULT_DELAY_TEST_URL.to_string(),
+      latency_timeout_ms: DEFAULT_DELAY_TIMEOUT_MS,
       traffic_stream: None,
       memory_stream: None,
       connections_stream: None,
@@ -251,6 +256,10 @@ impl MihomoWorker {
         self.configure_streams().await;
       },
       MihomoBridgeCommand::SetStreamFlushInterval(_) => {},
+      MihomoBridgeCommand::SetLatencyTest { url, timeout_ms } => {
+        self.latency_test_url = url;
+        self.latency_timeout_ms = timeout_ms;
+      },
       MihomoBridgeCommand::SynchronizeProfile(sync) => {
         if self.active.is_some() {
           self.synchronize_profile(sync).await;
@@ -698,11 +707,11 @@ impl MihomoWorker {
       return;
     };
     self.set_proxy_busy(true);
-    let test_url = record.test_url.as_deref().unwrap_or(DEFAULT_DELAY_TEST_URL);
+    let test_url = record.test_url.as_deref().unwrap_or(&self.latency_test_url);
     let result = match record.source.as_ref() {
       Some(ProxyNodeSource::Core { proxy_name }) => {
         client
-          .delay_proxy(proxy_name, test_url, DEFAULT_DELAY_TIMEOUT_MS)
+          .delay_proxy(proxy_name, test_url, self.latency_timeout_ms)
           .await
       },
       Some(ProxyNodeSource::Provider {
@@ -710,12 +719,7 @@ impl MihomoWorker {
         proxy_name,
       }) => {
         client
-          .healthcheck_provider_proxy(
-            provider_name,
-            proxy_name,
-            test_url,
-            DEFAULT_DELAY_TIMEOUT_MS,
-          )
+          .healthcheck_provider_proxy(provider_name, proxy_name, test_url, self.latency_timeout_ms)
           .await
       },
       None => {
@@ -756,10 +760,10 @@ impl MihomoWorker {
       .chain(self.state.proxy_view.global.iter())
       .find(|group| group.name == name)
       .and_then(|group| group.test_url.clone())
-      .unwrap_or_else(|| DEFAULT_DELAY_TEST_URL.to_string());
+      .unwrap_or_else(|| self.latency_test_url.clone());
     self.set_proxy_busy(true);
     match client
-      .delay_group(&name, &test_url, DEFAULT_DELAY_TIMEOUT_MS)
+      .delay_group(&name, &test_url, self.latency_timeout_ms)
       .await
     {
       Ok(delays) => {
@@ -799,7 +803,7 @@ impl MihomoWorker {
           group
             .test_url
             .clone()
-            .unwrap_or_else(|| DEFAULT_DELAY_TEST_URL.to_string()),
+            .unwrap_or_else(|| self.latency_test_url.clone()),
         )
       })
       .collect::<Vec<_>>();
@@ -811,7 +815,7 @@ impl MihomoWorker {
     }
     for (group, url) in groups {
       match client
-        .delay_group(&group, &url, DEFAULT_DELAY_TIMEOUT_MS)
+        .delay_group(&group, &url, self.latency_timeout_ms)
         .await
       {
         Ok(delays) => self.apply_proxy_delays(&delays),
@@ -1134,7 +1138,7 @@ pub(crate) async fn run_mihomo_worker(
 mod tests {
   use std::sync::Arc;
 
-  use rsclash_domain::{CoreRunMode, Page};
+  use rsclash_domain::{CoreRunMode, Page, ProxyGroupView};
   use rsclash_mihomo::{
     FakeMihomoApi, FakeMihomoState, MihomoApi, MihomoCall,
     models::{Connection, Connections, Groups, LogEntry, Proxy},
@@ -1232,6 +1236,39 @@ mod tests {
     assert!(worker.traffic_stream.is_none());
     assert!(worker.memory_stream.is_none());
     assert!(worker.logs_stream.is_none());
+  }
+
+  #[tokio::test]
+  async fn latency_preferences_apply_to_group_tests() {
+    let fake = FakeMihomoApi::default();
+    let api: Arc<dyn MihomoApi> = Arc::new(fake.clone());
+    let (event_tx, _event_rx) = mpsc::channel(8);
+    let mut worker = MihomoWorker::new(MihomoAccess::same(Arc::clone(&api)), event_tx);
+    worker.active = Some((CoreRunMode::Sidecar, api));
+    Arc::make_mut(&mut worker.state.proxy_view)
+      .groups
+      .push(ProxyGroupView {
+        name: "Primary".to_string(),
+        ..ProxyGroupView::default()
+      });
+
+    worker
+      .handle_command(MihomoBridgeCommand::SetLatencyTest {
+        url: "https://latency.example/generate_204".to_string(),
+        timeout_ms: 2_500,
+      })
+      .await;
+    worker.test_proxy_group("Primary".to_string()).await;
+
+    assert!(
+      fake
+        .calls()
+        .is_ok_and(|calls| calls.contains(&MihomoCall::DelayGroup {
+          name: "Primary".to_string(),
+          test_url: "https://latency.example/generate_204".to_string(),
+          timeout_ms: 2_500,
+        }))
+    );
   }
 
   #[tokio::test]
