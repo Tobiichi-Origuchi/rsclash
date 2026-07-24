@@ -16,7 +16,11 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 #[cfg(target_os = "linux")]
+mod linux_desktop;
+#[cfg(target_os = "linux")]
 mod linux_proxy;
+#[cfg(target_os = "linux")]
+pub use linux_desktop::{LinuxDesktopIntegration, LinuxDesktopPaths};
 #[cfg(target_os = "linux")]
 pub use linux_proxy::LinuxSystemProxyBackend;
 
@@ -97,6 +101,24 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppDirectory {
+  Configuration,
+  Data,
+  Logs,
+  Core,
+}
+
+#[async_trait]
+pub trait DesktopIntegration: Send + Sync + 'static {
+  async fn autostart_enabled(&self) -> Result<bool>;
+  async fn set_autostart(&self, enabled: bool, silent: bool) -> Result<()>;
+  async fn register_deep_links(&self) -> Result<()>;
+  async fn open_directory(&self, directory: AppDirectory) -> Result<()>;
+  async fn notify(&self, title: &str, body: &str) -> Result<()>;
+  async fn run_startup_script(&self, script: &str) -> Result<()>;
+}
 
 #[async_trait]
 pub trait SystemRecoveryBackend: Send + Sync + 'static {
