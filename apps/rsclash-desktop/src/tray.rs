@@ -83,7 +83,9 @@ impl ksni::Tray for AppTray {
     let system_proxy = &snapshot.system_proxy;
     let mihomo_ready = snapshot.mihomo.connection == MihomoConnection::Connected;
     let can_toggle_system_proxy = system_proxy.enabled
-      || (system_proxy.available && mihomo_ready && snapshot.mihomo.mixed_port.is_some());
+      || (system_proxy.available
+        && (snapshot.settings.value.pac_url.is_some()
+          || (mihomo_ready && snapshot.mihomo.mixed_port.is_some())));
     let current_mode = snapshot.mihomo.mode.clone();
     vec![
       StandardItem {

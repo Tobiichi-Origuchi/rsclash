@@ -15,13 +15,14 @@ rsclash-core.workspace = true
 rsclash-domain.workspace = true
 rsclash-mihomo = { workspace = true, features = ["rustls-ring"] }
 rsclash-platform.workspace = true
+rsclash-service.workspace = true
 reqwest = { workspace = true, features = ["rustls-no-provider"] }
 rqrr.workspace = true
 rustls.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "macros", "process", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]

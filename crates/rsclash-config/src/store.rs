@@ -6,6 +6,7 @@ use std::{
   sync::atomic::{AtomicU64, Ordering},
 };
 
+use rsclash_domain::AppSettings;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -23,6 +24,7 @@ pub struct ConfigPaths {
   pub backups_dir: PathBuf,
   pub profiles_catalog: PathBuf,
   pub verge_config: PathBuf,
+  pub settings_config: PathBuf,
   pub clash_config: PathBuf,
   pub dns_config: PathBuf,
   pub runtime_config: PathBuf,
@@ -37,6 +39,7 @@ impl ConfigPaths {
       backups_dir: root.join("backups"),
       profiles_catalog: root.join("profiles.yaml"),
       verge_config: root.join("verge.yaml"),
+      settings_config: root.join("settings.yaml"),
       clash_config: root.join("clash.yaml"),
       dns_config: root.join("dns_config.yaml"),
       runtime_config: root.join("runtime.yaml"),
@@ -89,6 +92,35 @@ impl ProfileStore {
     reject_symlink(&self.paths.verge_config)?;
     let source = read_file(&self.paths.verge_config)?;
     from_yaml(&source)
+  }
+
+  pub fn load_application_settings(&self) -> Result<AppSettings> {
+    match fs::symlink_metadata(&self.paths.settings_config) {
+      Ok(metadata) if metadata.file_type().is_symlink() => {
+        return Err(Error::InvalidConfiguration(format!(
+          "application settings must not be a symbolic link: {}",
+          self.paths.settings_config.display()
+        )));
+      },
+      Ok(_) => {},
+      Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+        return Ok(AppSettings::default());
+      },
+      Err(source) => {
+        return Err(Error::io(
+          "inspect application settings",
+          &self.paths.settings_config,
+          source,
+        ));
+      },
+    }
+    let source = read_file(&self.paths.settings_config)?;
+    from_yaml(&source)
+  }
+
+  pub fn save_application_settings(&self, settings: &AppSettings) -> Result<()> {
+    let yaml = to_yaml(settings)?;
+    atomic_write(&self.paths.settings_config, yaml.as_bytes())
   }
 
   pub fn save_catalog(&self, catalog: &ProfileCatalog) -> Result<()> {

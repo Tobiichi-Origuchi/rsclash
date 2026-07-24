@@ -6,6 +6,7 @@ pub mod enhance;
 mod error;
 mod import;
 mod model;
+mod settings;
 mod store;
 mod transaction;
 
@@ -27,5 +28,6 @@ pub use model::{
   ProfileOptions, ProfileSelection, RuntimeConfig, SubscriptionInfo, VergeConfig, VergeTestItem,
   VergeTheme, from_yaml, to_yaml,
 };
+pub use settings::{apply_application_settings, validate_application_settings};
 pub use store::{ConfigPaths, ProfileStore};
 pub use transaction::{Draft, DraftState, ProfileTransaction};

@@ -13,12 +13,14 @@ use std::{
 use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, Stroke, Ui};
 use rsclash_app::{AppClient, AppEventReceiver, ClientError};
 use rsclash_domain::{
-  AppEvent, AppSnapshot, AppStatus, ConnectionSnapshot, CoreChannel, CoreRunMode, CoreState,
-  LogSnapshot, MetricPoint, MihomoConnection, Page, ProfileDiagnosticStage, ProfileDiagnostics,
-  ProfileDownloadProxy, ProfileOperationKind, ProfileQrCode, ProfileSourceKind, ProxyCapabilities,
-  ProxyGroupView, ProxyMemberSnapshot, ProxyMemberUnresolvedReason, ProxyMode, ProxyNodeSnapshot,
-  ProxyNodeSource, ProxyViewV1, RemoteProfileOptions, RuleSnapshot, SensitiveString,
-  StreamLogLevel, ThemeMode, UiCommand,
+  AppEvent, AppLanguage, AppSettings, AppSnapshot, AppStatus, ApplicationDirectory,
+  ConnectionSnapshot, CoreChannel, CoreRunMode, CoreState, DnsEnhancedMode, LogSnapshot,
+  MetricPoint, MihomoConnection, NavigationLayout, Page, ProfileDiagnosticStage,
+  ProfileDiagnostics, ProfileDownloadProxy, ProfileOperationKind, ProfileQrCode, ProfileSourceKind,
+  ProxyCapabilities, ProxyGroupLayout, ProxyGroupView, ProxyMemberSnapshot,
+  ProxyMemberUnresolvedReason, ProxyMode, ProxyNodeSnapshot, ProxyNodeSource, ProxyViewV1,
+  RemoteProfileOptions, RuleSnapshot, SensitiveString, StreamLogLevel, ThemeMode, TrayClickAction,
+  TunStack, UiCommand,
 };
 
 struct ProfileEditor {
@@ -111,6 +113,51 @@ enum ConnectionSort {
   Started,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SettingsSection {
+  #[default]
+  General,
+  Proxy,
+  Mihomo,
+  DnsTun,
+  Interface,
+  Maintenance,
+}
+
+impl SettingsSection {
+  const ALL: [Self; 6] = [
+    Self::General,
+    Self::Proxy,
+    Self::Mihomo,
+    Self::DnsTun,
+    Self::Interface,
+    Self::Maintenance,
+  ];
+
+  const fn label(self) -> &'static str {
+    match self {
+      Self::General => "常规",
+      Self::Proxy => "代理控制",
+      Self::Mihomo => "Mihomo",
+      Self::DnsTun => "DNS 与 TUN",
+      Self::Interface => "界面与行为",
+      Self::Maintenance => "维护",
+    }
+  }
+}
+
+enum SettingsUiAction {
+  Apply,
+  Discard,
+  ToggleSystemProxy(bool),
+  InstallService,
+  UninstallService,
+  RegisterDeepLinks,
+  OpenDirectory(ApplicationDirectory),
+  OpenWebUi,
+  RestartCore(CoreChannel),
+}
+
 struct RuleDraft {
   kind: String,
   payload: String,
@@ -189,6 +236,9 @@ pub struct RsClashUi {
   log_reverse: bool,
   log_level: StreamLogLevel,
   navigation_collapsed: bool,
+  settings_section: SettingsSection,
+  settings_draft: AppSettings,
+  settings_dirty: bool,
 }
 
 impl RsClashUi {
@@ -196,6 +246,7 @@ impl RsClashUi {
     theme::install_styles(context);
     let snapshot = client.current_snapshot();
     theme::apply_preference(context, snapshot.theme);
+    let settings_draft = snapshot.settings.value.clone();
 
     Self {
       events: client.subscribe_events(),
@@ -249,6 +300,9 @@ impl RsClashUi {
       log_reverse: false,
       log_level: StreamLogLevel::Info,
       navigation_collapsed: false,
+      settings_section: SettingsSection::default(),
+      settings_draft,
+      settings_dirty: false,
     }
   }
 
@@ -266,6 +320,9 @@ impl RsClashUi {
         self.proxy_chain_nodes = snapshot.mihomo.proxy_chain.nodes.clone();
       } else if was_chain_connected {
         self.proxy_chain_nodes.clear();
+      }
+      if !self.settings_dirty {
+        self.settings_draft = snapshot.settings.value.clone();
       }
       self.snapshot = snapshot;
     }
@@ -339,6 +396,12 @@ impl RsClashUi {
         AppEvent::ProfileQrReady(qr) => {
           self.profile_qr = Some(qr);
         },
+        AppEvent::SettingsChanged => {
+          if !self.snapshot.settings.busy {
+            self.settings_dirty = false;
+            self.settings_draft = self.snapshot.settings.value.clone();
+          }
+        },
         _ => {},
       }
     }
@@ -383,8 +446,14 @@ impl RsClashUi {
   }
 
   pub fn ui(&mut self, root: &mut Ui) {
-    let automatically_compact = root.available_width() < 940.0;
-    let compact_navigation = automatically_compact || self.navigation_collapsed;
+    let narrow = root.available_width() < 940.0;
+    let automatically_compact =
+      narrow || self.snapshot.settings.value.navigation_layout == NavigationLayout::Compact;
+    let compact_navigation = match self.snapshot.settings.value.navigation_layout {
+      NavigationLayout::Automatic => automatically_compact || self.navigation_collapsed,
+      NavigationLayout::Expanded => narrow || self.navigation_collapsed,
+      NavigationLayout::Compact => true,
+    };
     egui::Panel::left("navigation")
       .exact_size(if compact_navigation { 76.0 } else { 220.0 })
       .frame(
@@ -613,8 +682,9 @@ impl RsClashUi {
                 !system_proxy.busy
                   && (system_proxy.enabled
                     || (system_proxy.available
-                      && self.snapshot.mihomo.connection == MihomoConnection::Connected
-                      && self.snapshot.mihomo.mixed_port.is_some())),
+                      && (self.snapshot.settings.value.pac_url.is_some()
+                        || (self.snapshot.mihomo.connection == MihomoConnection::Connected
+                          && self.snapshot.mihomo.mixed_port.is_some())))),
                 egui::Button::new(if system_proxy.enabled {
                   "系统代理已开启"
                 } else {
@@ -693,8 +763,8 @@ impl RsClashUi {
     let mihomo = self.snapshot.mihomo.clone();
     let system_proxy = self.snapshot.system_proxy.clone();
     let can_enable_system_proxy = system_proxy.available
-      && mihomo.connection == MihomoConnection::Connected
-      && mihomo.mixed_port.is_some();
+      && (self.snapshot.settings.value.pac_url.is_some()
+        || (mihomo.connection == MihomoConnection::Connected && mihomo.mixed_port.is_some()));
     ui.horizontal(|ui| {
       mihomo_connection_pill(ui, mihomo.connection);
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -874,7 +944,9 @@ impl RsClashUi {
           .small()
           .weak(),
         );
-        metric_chart(ui, &mihomo.metrics);
+        if self.snapshot.settings.value.traffic_graph {
+          metric_chart(ui, &mihomo.metrics);
+        }
       });
     }
   }
@@ -2536,33 +2608,142 @@ impl RsClashUi {
   }
 
   fn settings(&mut self, ui: &mut Ui) {
-    ui.label(RichText::new("外观").size(20.0).strong());
-    ui.label(RichText::new("主题命令会经过异步应用协调器，而不是直接修改全局状态。").weak());
+    let state = self.snapshot.settings.clone();
+    let mut draft = self.settings_draft.clone();
+    let mut action = None;
+    let tokens = theme::tokens(ui);
+
+    Frame::new()
+      .fill(tokens.surface)
+      .stroke(Stroke::new(1.0, tokens.border))
+      .corner_radius(12)
+      .inner_margin(egui::Margin::symmetric(16, 11))
+      .show(ui, |ui| {
+        ui.horizontal(|ui| {
+          if state.busy {
+            ui.spinner();
+            ui.label("正在验证并应用设置…");
+          } else if self.settings_dirty {
+            ui.label(
+              RichText::new("有未保存的更改")
+                .strong()
+                .color(tokens.warning),
+            );
+          } else if let Some(summary) = state.last_applied.as_deref() {
+            ui.label(RichText::new(summary).color(tokens.success));
+          } else {
+            ui.label(RichText::new("设置已同步").weak());
+          }
+          ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+              .add_enabled(
+                !state.busy && self.settings_dirty,
+                egui::Button::new("保存并应用"),
+              )
+              .clicked()
+            {
+              action = Some(SettingsUiAction::Apply);
+            }
+            if ui
+              .add_enabled(
+                !state.busy && self.settings_dirty,
+                egui::Button::new("放弃更改"),
+              )
+              .clicked()
+            {
+              action = Some(SettingsUiAction::Discard);
+            }
+            if ui
+              .add_enabled(!state.busy, egui::Button::new("刷新"))
+              .clicked()
+            {
+              self.command(UiCommand::RefreshSettings);
+            }
+          });
+        });
+      });
     ui.add_space(14.0);
 
-    card(ui, "颜色模式", |ui| {
-      ui.horizontal(|ui| {
-        for (mode, label) in [
-          (ThemeMode::System, "跟随系统"),
-          (ThemeMode::Light, "浅色"),
-          (ThemeMode::Dark, "深色"),
-        ] {
-          if ui
-            .selectable_label(self.snapshot.theme == mode, label)
-            .clicked()
-          {
-            self.command(UiCommand::SetTheme(mode));
+    let narrow = ui.available_width() < 760.0;
+    if narrow {
+      ScrollArea::horizontal()
+        .id_salt("settings-tabs")
+        .show(ui, |ui| {
+          ui.horizontal(|ui| {
+            for section in SettingsSection::ALL {
+              ui.selectable_value(&mut self.settings_section, section, section.label());
+            }
+          });
+        });
+      ui.add_space(12.0);
+      settings_section(
+        ui,
+        self.settings_section,
+        &mut draft,
+        &self.snapshot,
+        &mut action,
+      );
+    } else {
+      ui.horizontal_top(|ui| {
+        ui.vertical(|ui| {
+          ui.set_width(160.0);
+          for section in SettingsSection::ALL {
+            if ui
+              .add_sized(
+                [ui.available_width(), 38.0],
+                egui::Button::new(section.label())
+                  .selected(self.settings_section == section)
+                  .frame(self.settings_section == section),
+              )
+              .clicked()
+            {
+              self.settings_section = section;
+            }
           }
-        }
+        });
+        ui.separator();
+        ui.vertical(|ui| {
+          ui.set_min_width((ui.available_width() - 8.0).max(400.0));
+          settings_section(
+            ui,
+            self.settings_section,
+            &mut draft,
+            &self.snapshot,
+            &mut action,
+          );
+        });
       });
-    });
+    }
 
-    ui.add_space(12.0);
-    card(ui, "原生 UI 策略", |ui| {
-      ui.label("使用语义主题 token，不支持浏览器 CSS 注入。");
-      ui.label("默认使用系统标题栏；外部 Mihomo Web UI 将由默认浏览器打开。");
-      ui.label("页面不可见时停止高频数据流，避免隐藏的持续渲染与内存增长。");
-    });
+    if draft != self.settings_draft {
+      self.settings_draft = draft;
+      self.settings_dirty = self.settings_draft != state.value;
+    }
+    match action {
+      Some(SettingsUiAction::Apply) => {
+        self.command(UiCommand::ApplySettings(Box::new(
+          self.settings_draft.clone(),
+        )));
+      },
+      Some(SettingsUiAction::Discard) => {
+        self.settings_draft = state.value;
+        self.settings_dirty = false;
+      },
+      Some(SettingsUiAction::ToggleSystemProxy(enabled)) => {
+        self.command(UiCommand::SetSystemProxy(enabled));
+      },
+      Some(SettingsUiAction::InstallService) => self.command(UiCommand::InstallService),
+      Some(SettingsUiAction::UninstallService) => self.command(UiCommand::UninstallService),
+      Some(SettingsUiAction::RegisterDeepLinks) => self.command(UiCommand::RegisterDeepLinks),
+      Some(SettingsUiAction::OpenDirectory(directory)) => {
+        self.command(UiCommand::OpenDirectory(directory));
+      },
+      Some(SettingsUiAction::OpenWebUi) => self.command(UiCommand::OpenWebUi),
+      Some(SettingsUiAction::RestartCore(channel)) => {
+        self.command(UiCommand::RestartCore(channel));
+      },
+      None => {},
+    }
   }
 
   fn placeholder(&self, ui: &mut Ui, page: Page) {
@@ -2623,6 +2804,650 @@ impl RsClashUi {
         self.local_error = Some("仅支持拖入 YAML 配置或 PNG/JPEG 二维码图片。".to_string());
       },
     }
+  }
+}
+
+fn settings_section(
+  ui: &mut Ui,
+  section: SettingsSection,
+  draft: &mut AppSettings,
+  snapshot: &AppSnapshot,
+  action: &mut Option<SettingsUiAction>,
+) {
+  ui.label(RichText::new(section.label()).size(19.0).strong());
+  ui.add_space(8.0);
+  match section {
+    SettingsSection::General => settings_general(ui, draft),
+    SettingsSection::Proxy => settings_proxy(ui, draft, snapshot, action),
+    SettingsSection::Mihomo => settings_mihomo(ui, draft),
+    SettingsSection::DnsTun => settings_dns_tun(ui, draft, snapshot),
+    SettingsSection::Interface => settings_interface(ui, draft),
+    SettingsSection::Maintenance => settings_maintenance(ui, draft, snapshot, action),
+  }
+}
+
+fn settings_general(ui: &mut Ui, draft: &mut AppSettings) {
+  card(ui, "外观与语言", |ui| {
+    preference_label(ui, "颜色模式", "跟随系统或固定使用浅色/深色主题");
+    ui.horizontal_wrapped(|ui| {
+      for (mode, label) in [
+        (ThemeMode::System, "跟随系统"),
+        (ThemeMode::Light, "浅色"),
+        (ThemeMode::Dark, "深色"),
+      ] {
+        ui.selectable_value(&mut draft.theme, mode, label);
+      }
+    });
+    ui.separator();
+    preference_label(ui, "界面语言", "语言资源将在后续本地化阶段继续扩充");
+    egui::ComboBox::from_id_salt("settings-language")
+      .selected_text(match draft.language {
+        AppLanguage::System => "跟随系统",
+        AppLanguage::ChineseSimplified => "简体中文",
+        AppLanguage::English => "English",
+      })
+      .show_ui(ui, |ui| {
+        ui.selectable_value(&mut draft.language, AppLanguage::System, "跟随系统");
+        ui.selectable_value(
+          &mut draft.language,
+          AppLanguage::ChineseSimplified,
+          "简体中文",
+        );
+        ui.selectable_value(&mut draft.language, AppLanguage::English, "English");
+      });
+  });
+  ui.add_space(12.0);
+  card(ui, "启动", |ui| {
+    ui.checkbox(&mut draft.auto_launch, "登录后自动启动");
+    ui.checkbox(&mut draft.silent_start, "自动启动时隐藏主窗口");
+    preference_label(ui, "启动页面", "打开主窗口时首先显示的页面");
+    egui::ComboBox::from_id_salt("settings-start-page")
+      .selected_text(draft.start_page.label())
+      .show_ui(ui, |ui| {
+        for page in Page::ALL.into_iter().filter(|page| *page != Page::Unlock) {
+          ui.selectable_value(&mut draft.start_page, page, page.label());
+        }
+      });
+    preference_label(
+      ui,
+      "启动脚本",
+      "保存后仅在下次主实例启动时执行；脚本由 /bin/sh 运行",
+    );
+    ui.add(
+      egui::TextEdit::multiline(&mut draft.startup_script)
+        .hint_text("留空表示不执行")
+        .desired_rows(4)
+        .code_editor(),
+    );
+  });
+  ui.add_space(12.0);
+  card(ui, "托盘", |ui| {
+    ui.checkbox(&mut draft.show_tray, "显示系统托盘图标");
+    preference_label(ui, "单击托盘图标", "选择主操作");
+    egui::ComboBox::from_id_salt("settings-tray-click")
+      .selected_text(match draft.tray_click {
+        TrayClickAction::ToggleWindow => "显示或隐藏窗口",
+        TrayClickAction::ShowMenu => "显示菜单",
+        TrayClickAction::Disabled => "不执行操作",
+      })
+      .show_ui(ui, |ui| {
+        ui.selectable_value(
+          &mut draft.tray_click,
+          TrayClickAction::ToggleWindow,
+          "显示或隐藏窗口",
+        );
+        ui.selectable_value(&mut draft.tray_click, TrayClickAction::ShowMenu, "显示菜单");
+        ui.selectable_value(
+          &mut draft.tray_click,
+          TrayClickAction::Disabled,
+          "不执行操作",
+        );
+      });
+  });
+}
+
+fn settings_proxy(
+  ui: &mut Ui,
+  draft: &mut AppSettings,
+  snapshot: &AppSnapshot,
+  action: &mut Option<SettingsUiAction>,
+) {
+  let system = &snapshot.system_proxy;
+  card(ui, "系统代理", |ui| {
+    preference_label(
+      ui,
+      if system.enabled {
+        "系统代理已开启"
+      } else {
+        "系统代理已关闭"
+      },
+      system
+        .backend
+        .as_deref()
+        .unwrap_or("正在检测 Linux 桌面后端"),
+    );
+    if ui
+      .add_enabled(
+        !system.busy
+          && (system.enabled
+            || (system.available
+              && (draft.pac_url.is_some()
+                || snapshot.mihomo.connection == MihomoConnection::Connected))),
+        egui::Button::new(if system.enabled {
+          "关闭系统代理"
+        } else {
+          "开启系统代理"
+        })
+        .selected(system.enabled),
+      )
+      .clicked()
+    {
+      *action = Some(SettingsUiAction::ToggleSystemProxy(!system.enabled));
+    }
+    if let Some(detail) = system.detail.as_deref() {
+      ui.label(
+        RichText::new(detail)
+          .small()
+          .color(theme::tokens(ui).warning),
+      );
+    }
+    ui.separator();
+    preference_label(ui, "绕过列表", "每行一个主机、域名或 CIDR");
+    string_list_editor(ui, &mut draft.system_proxy_bypass, "localhost");
+    ui.separator();
+    let mut pac = draft.pac_url.is_some();
+    if ui.checkbox(&mut pac, "使用 PAC 自动配置 URL").changed() {
+      draft.pac_url = pac.then(|| "http://127.0.0.1/proxy.pac".to_string());
+    }
+    if let Some(url) = draft.pac_url.as_mut() {
+      ui.add(
+        egui::TextEdit::singleline(url)
+          .hint_text("https://example.test/proxy.pac")
+          .desired_width(f32::INFINITY),
+      );
+    }
+  });
+  ui.add_space(12.0);
+  card(ui, "特权服务", |ui| {
+    let service = &snapshot.settings.service;
+    preference_label(
+      ui,
+      if service.reachable {
+        "服务运行正常"
+      } else if service.installed {
+        "服务已安装但不可用"
+      } else {
+        "服务尚未安装"
+      },
+      service
+        .version
+        .as_deref()
+        .or(service.detail.as_deref())
+        .unwrap_or("TUN 需要安装一次受限特权服务"),
+    );
+    ui.horizontal_wrapped(|ui| {
+      if ui
+        .add_enabled(
+          !snapshot.settings.busy && !service.reachable,
+          egui::Button::new(if service.installed {
+            "修复或升级服务"
+          } else {
+            "安装服务"
+          }),
+        )
+        .clicked()
+      {
+        *action = Some(SettingsUiAction::InstallService);
+      }
+      if ui
+        .add_enabled(
+          !snapshot.settings.busy && service.installed,
+          egui::Button::new("卸载服务"),
+        )
+        .clicked()
+      {
+        *action = Some(SettingsUiAction::UninstallService);
+      }
+    });
+    ui.label(
+      RichText::new("安装和卸载通过 polkit 显示系统密码窗口；应用不会保存 root 凭据。")
+        .small()
+        .weak(),
+    );
+  });
+}
+
+fn settings_mihomo(ui: &mut Ui, draft: &mut AppSettings) {
+  card(ui, "基础网络", |ui| {
+    ui.checkbox(&mut draft.allow_lan, "允许局域网设备连接");
+    ui.checkbox(&mut draft.ipv6, "启用 IPv6");
+    ui.checkbox(&mut draft.unified_delay, "使用统一延迟");
+    preference_label(ui, "Mihomo 日志等级", "控制核心生成的日志详细程度");
+    egui::ComboBox::from_id_salt("settings-mihomo-log-level")
+      .selected_text(stream_log_level_label(draft.mihomo_log_level))
+      .show_ui(ui, |ui| {
+        for level in [
+          StreamLogLevel::Debug,
+          StreamLogLevel::Info,
+          StreamLogLevel::Warning,
+          StreamLogLevel::Error,
+          StreamLogLevel::Silent,
+        ] {
+          ui.selectable_value(
+            &mut draft.mihomo_log_level,
+            level,
+            stream_log_level_label(level),
+          );
+        }
+      });
+  });
+  ui.add_space(12.0);
+  card(ui, "监听端口", |ui| {
+    ui.horizontal(|ui| {
+      ui.label("Mixed");
+      ui.add(egui::DragValue::new(&mut draft.ports.mixed).range(1..=u16::MAX));
+    });
+    optional_port_editor(ui, "SOCKS", &mut draft.ports.socks, 17_898);
+    optional_port_editor(ui, "HTTP", &mut draft.ports.http, 17_899);
+    optional_port_editor(ui, "Redir", &mut draft.ports.redir, 17_900);
+    optional_port_editor(ui, "TProxy", &mut draft.ports.tproxy, 17_901);
+    ui.label(
+      RichText::new("保存前会拒绝端口 0 和重复端口。")
+        .small()
+        .weak(),
+    );
+  });
+  ui.add_space(12.0);
+  card(ui, "外部控制器与 CORS", |ui| {
+    ui.checkbox(&mut draft.controller.enabled, "开放 TCP 外部控制器");
+    ui.add_enabled_ui(draft.controller.enabled, |ui| {
+      ui.add(egui::TextEdit::singleline(&mut draft.controller.address).hint_text("127.0.0.1:9090"));
+      let mut secret = draft.controller.secret.expose().to_string();
+      if ui
+        .add(
+          egui::TextEdit::singleline(&mut secret)
+            .password(true)
+            .hint_text("Controller secret"),
+        )
+        .changed()
+      {
+        draft.controller.secret = SensitiveString::new(secret);
+      }
+      ui.checkbox(
+        &mut draft.controller.allow_private_network,
+        "允许浏览器 Private Network 请求",
+      );
+      preference_label(ui, "允许的 Origins", "每行一个 HTTP(S) origin，也可使用 *");
+      string_list_editor(
+        ui,
+        &mut draft.controller.allowed_origins,
+        "http://localhost",
+      );
+    });
+  });
+}
+
+fn settings_dns_tun(ui: &mut Ui, draft: &mut AppSettings, snapshot: &AppSnapshot) {
+  let service_active = matches!(
+    snapshot.core,
+    CoreState::Running {
+      mode: CoreRunMode::Service,
+      ..
+    }
+  );
+  card(ui, "TUN", |ui| {
+    ui.add_enabled_ui(service_active || draft.tun_enabled, |ui| {
+      ui.checkbox(&mut draft.tun_enabled, "启用 TUN 模式");
+    });
+    if !service_active && !draft.tun_enabled {
+      ui.label(
+        RichText::new("先安装特权服务并重启核心，才能启用 rsclash TUN 网卡。")
+          .small()
+          .color(theme::tokens(ui).warning),
+      );
+    }
+    preference_label(ui, "网络栈", "默认 mixed 兼顾兼容性与性能");
+    egui::ComboBox::from_id_salt("settings-tun-stack")
+      .selected_text(match draft.tun_stack {
+        TunStack::System => "system",
+        TunStack::Gvisor => "gvisor",
+        TunStack::Mixed => "mixed",
+      })
+      .show_ui(ui, |ui| {
+        ui.selectable_value(&mut draft.tun_stack, TunStack::System, "system");
+        ui.selectable_value(&mut draft.tun_stack, TunStack::Gvisor, "gvisor");
+        ui.selectable_value(&mut draft.tun_stack, TunStack::Mixed, "mixed");
+      });
+    let mut automatic = draft.network_interface.is_none();
+    if ui.checkbox(&mut automatic, "自动检测网络接口").changed() {
+      draft.network_interface = (!automatic).then(String::new);
+    }
+    if let Some(interface) = draft.network_interface.as_mut() {
+      ui.add(egui::TextEdit::singleline(interface).hint_text("例如 wlan0"));
+    }
+    ui.label(
+      RichText::new("TUN 设备名固定为 rsclash，避免与其他代理客户端冲突。")
+        .small()
+        .weak(),
+    );
+  });
+  ui.add_space(12.0);
+  card(ui, "DNS", |ui| {
+    ui.checkbox(&mut draft.dns.enabled, "使用 rsclash DNS 覆盖");
+    ui.add_enabled_ui(draft.dns.enabled, |ui| {
+      ui.horizontal(|ui| {
+        ui.label("监听");
+        ui.add(egui::TextEdit::singleline(&mut draft.dns.listen).hint_text("0.0.0.0:1053"));
+      });
+      ui.checkbox(&mut draft.dns.ipv6, "DNS 返回 IPv6");
+      egui::ComboBox::from_id_salt("settings-dns-mode")
+        .selected_text(match draft.dns.enhanced_mode {
+          DnsEnhancedMode::Normal => "normal",
+          DnsEnhancedMode::RedirHost => "redir-host",
+          DnsEnhancedMode::FakeIp => "fake-ip",
+        })
+        .show_ui(ui, |ui| {
+          ui.selectable_value(
+            &mut draft.dns.enhanced_mode,
+            DnsEnhancedMode::Normal,
+            "normal",
+          );
+          ui.selectable_value(
+            &mut draft.dns.enhanced_mode,
+            DnsEnhancedMode::RedirHost,
+            "redir-host",
+          );
+          ui.selectable_value(
+            &mut draft.dns.enhanced_mode,
+            DnsEnhancedMode::FakeIp,
+            "fake-ip",
+          );
+        });
+      if draft.dns.enhanced_mode == DnsEnhancedMode::FakeIp {
+        ui.add(egui::TextEdit::singleline(&mut draft.dns.fake_ip_range).hint_text("198.18.0.1/16"));
+      }
+      preference_label(ui, "默认 DNS", "用于解析 DoH/DoT 服务器域名");
+      string_list_editor(ui, &mut draft.dns.default_nameservers, "223.5.5.5");
+      preference_label(ui, "Nameservers", "主要解析服务器");
+      string_list_editor(
+        ui,
+        &mut draft.dns.nameservers,
+        "https://dns.alidns.com/dns-query",
+      );
+      preference_label(ui, "Fallback", "可选的后备解析服务器");
+      string_list_editor(ui, &mut draft.dns.fallback, "https://1.1.1.1/dns-query");
+    });
+  });
+  ui.add_space(12.0);
+  card(ui, "Tunnels", |ui| {
+    let mut remove = None;
+    for (index, tunnel) in draft.tunnels.iter_mut().enumerate() {
+      Frame::new()
+        .fill(theme::tokens(ui).surface_raised)
+        .corner_radius(8)
+        .inner_margin(10)
+        .show(ui, |ui| {
+          let mut tcp = tunnel.network.iter().any(|network| network == "tcp");
+          let mut udp = tunnel.network.iter().any(|network| network == "udp");
+          ui.horizontal(|ui| {
+            ui.checkbox(&mut tcp, "TCP");
+            ui.checkbox(&mut udp, "UDP");
+            if ui.button("删除").clicked() {
+              remove = Some(index);
+            }
+          });
+          tunnel.network.clear();
+          if tcp {
+            tunnel.network.push("tcp".to_string());
+          }
+          if udp {
+            tunnel.network.push("udp".to_string());
+          }
+          ui.add(egui::TextEdit::singleline(&mut tunnel.address).hint_text("127.0.0.1:8000"));
+          ui.add(egui::TextEdit::singleline(&mut tunnel.target).hint_text("target.example:443"));
+          let proxy_empty = {
+            let proxy = tunnel.proxy.get_or_insert_default();
+            ui.add(egui::TextEdit::singleline(proxy).hint_text("代理组（可选）"));
+            proxy.trim().is_empty()
+          };
+          if proxy_empty {
+            tunnel.proxy = None;
+          }
+        });
+      ui.add_space(6.0);
+    }
+    if let Some(index) = remove {
+      draft.tunnels.remove(index);
+    }
+    if ui.button("添加 Tunnel").clicked() {
+      draft.tunnels.push(rsclash_domain::TunnelSettings {
+        network: vec!["tcp".to_string()],
+        address: "127.0.0.1:8000".to_string(),
+        target: String::new(),
+        proxy: None,
+      });
+    }
+  });
+}
+
+fn settings_interface(ui: &mut Ui, draft: &mut AppSettings) {
+  card(ui, "布局", |ui| {
+    ui.checkbox(&mut draft.traffic_graph, "首页显示流量图");
+    ui.checkbox(&mut draft.memory_usage, "首页显示内存用量");
+    ui.checkbox(&mut draft.show_tray, "显示托盘图标");
+    ui.horizontal(|ui| {
+      ui.label("刷新间隔");
+      ui.add(
+        egui::DragValue::new(&mut draft.refresh_interval_ms)
+          .range(100..=60_000)
+          .suffix(" ms"),
+      );
+    });
+    preference_label(ui, "导航栏", "自动模式会在窄窗口折叠");
+    egui::ComboBox::from_id_salt("settings-navigation-layout")
+      .selected_text(match draft.navigation_layout {
+        NavigationLayout::Automatic => "自动",
+        NavigationLayout::Expanded => "展开",
+        NavigationLayout::Compact => "紧凑",
+      })
+      .show_ui(ui, |ui| {
+        ui.selectable_value(
+          &mut draft.navigation_layout,
+          NavigationLayout::Automatic,
+          "自动",
+        );
+        ui.selectable_value(
+          &mut draft.navigation_layout,
+          NavigationLayout::Expanded,
+          "展开",
+        );
+        ui.selectable_value(
+          &mut draft.navigation_layout,
+          NavigationLayout::Compact,
+          "紧凑",
+        );
+      });
+    preference_label(ui, "代理组布局", "卡片更直观，紧凑模式提高信息密度");
+    ui.horizontal(|ui| {
+      ui.selectable_value(
+        &mut draft.proxy_group_layout,
+        ProxyGroupLayout::Cards,
+        "卡片",
+      );
+      ui.selectable_value(
+        &mut draft.proxy_group_layout,
+        ProxyGroupLayout::Compact,
+        "紧凑",
+      );
+      ui.add(
+        egui::DragValue::new(&mut draft.proxy_layout_columns)
+          .range(1..=6)
+          .suffix(" 列"),
+      );
+    });
+  });
+  ui.add_space(12.0);
+  card(ui, "连接与测速", |ui| {
+    ui.checkbox(
+      &mut draft.auto_close_connections,
+      "切换配置或代理后自动关闭旧连接",
+    );
+    ui.checkbox(&mut draft.auto_test, "更新配置后自动测速");
+    ui.add(
+      egui::TextEdit::singleline(&mut draft.latency_test_url)
+        .hint_text("https://www.gstatic.com/generate_204"),
+    );
+    ui.add(
+      egui::DragValue::new(&mut draft.latency_timeout_ms)
+        .range(100..=120_000)
+        .suffix(" ms"),
+    );
+    preference_label(
+      ui,
+      "连接列",
+      "每行一个列标识，可拖拽排序将在后续视觉增强中加入",
+    );
+    string_list_editor(ui, &mut draft.connection_columns, "process");
+  });
+  ui.add_space(12.0);
+  card(ui, "应用日志保留", |ui| {
+    ui.horizontal_wrapped(|ui| {
+      ui.add(
+        egui::DragValue::new(&mut draft.app_log_max_size_mib)
+          .range(1..=1024)
+          .suffix(" MiB/文件"),
+      );
+      ui.add(
+        egui::DragValue::new(&mut draft.app_log_max_count)
+          .range(1..=100)
+          .suffix(" 个文件"),
+      );
+      ui.add(
+        egui::DragValue::new(&mut draft.app_log_retention_days)
+          .range(1..=365)
+          .suffix(" 天"),
+      );
+    });
+  });
+}
+
+fn settings_maintenance(
+  ui: &mut Ui,
+  draft: &mut AppSettings,
+  snapshot: &AppSnapshot,
+  action: &mut Option<SettingsUiAction>,
+) {
+  card(ui, "核心通道", |ui| {
+    ui.horizontal(|ui| {
+      ui.selectable_value(&mut draft.core_channel, CoreChannel::Stable, "Stable");
+      ui.selectable_value(&mut draft.core_channel, CoreChannel::Alpha, "Alpha");
+      if matches!(snapshot.core, CoreState::Running { .. }) && ui.button("切换并重启").clicked()
+      {
+        *action = Some(SettingsUiAction::RestartCore(draft.core_channel));
+      }
+    });
+    ui.label(
+      RichText::new("核心与 GeoData 的安全下载、哈希校验和发布更新由打包阶段统一提供。")
+        .small()
+        .weak(),
+    );
+  });
+  ui.add_space(12.0);
+  card(ui, "目录", |ui| {
+    for (directory, label, path) in [
+      (
+        ApplicationDirectory::Configuration,
+        "配置目录",
+        snapshot.settings.paths.configuration.as_str(),
+      ),
+      (
+        ApplicationDirectory::Data,
+        "数据目录",
+        snapshot.settings.paths.data.as_str(),
+      ),
+      (
+        ApplicationDirectory::Logs,
+        "日志目录",
+        snapshot.settings.paths.logs.as_str(),
+      ),
+      (
+        ApplicationDirectory::Core,
+        "核心目录",
+        snapshot.settings.paths.core.as_str(),
+      ),
+    ] {
+      ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+          ui.label(RichText::new(label).strong());
+          ui.label(RichText::new(path).small().weak());
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+          if ui.button("打开").clicked() {
+            *action = Some(SettingsUiAction::OpenDirectory(directory));
+          }
+        });
+      });
+      ui.separator();
+    }
+  });
+  ui.add_space(12.0);
+  card(ui, "桌面集成", |ui| {
+    if ui.button("注册 clash:// 深链").clicked() {
+      *action = Some(SettingsUiAction::RegisterDeepLinks);
+    }
+    if ui
+      .add_enabled(
+        draft.controller.enabled,
+        egui::Button::new("打开外部 Web UI"),
+      )
+      .clicked()
+    {
+      *action = Some(SettingsUiAction::OpenWebUi);
+    }
+    ui.label(
+      RichText::new("外部 Web UI 始终在默认浏览器中打开，不会嵌入 WebView。")
+        .small()
+        .weak(),
+    );
+  });
+}
+
+fn preference_label(ui: &mut Ui, title: &str, description: &str) {
+  ui.label(RichText::new(title).strong());
+  ui.label(RichText::new(description).small().weak());
+}
+
+fn optional_port_editor(ui: &mut Ui, label: &str, port: &mut Option<u16>, default: u16) {
+  ui.horizontal(|ui| {
+    let mut enabled = port.is_some();
+    if ui.checkbox(&mut enabled, label).changed() {
+      *port = enabled.then_some(default);
+    }
+    if let Some(port) = port.as_mut() {
+      ui.add(egui::DragValue::new(port).range(1..=u16::MAX));
+    }
+  });
+}
+
+fn string_list_editor(ui: &mut Ui, values: &mut Vec<String>, hint: &str) {
+  let mut remove = None;
+  for (index, value) in values.iter_mut().enumerate() {
+    ui.horizontal(|ui| {
+      ui.add(
+        egui::TextEdit::singleline(value)
+          .hint_text(hint)
+          .desired_width((ui.available_width() - 52.0).max(160.0)),
+      );
+      if ui.small_button("删除").clicked() {
+        remove = Some(index);
+      }
+    });
+  }
+  if let Some(index) = remove {
+    values.remove(index);
+  }
+  if ui.small_button("添加一项").clicked() {
+    values.push(String::new());
   }
 }
 

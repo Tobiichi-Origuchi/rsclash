@@ -2598,6 +2598,7 @@ dependencies = [
  "rsclash-domain",
  "rsclash-mihomo",
  "rsclash-platform",
+ "rsclash-service",
  "rustls",
  "serde_json",
  "serde_yaml_ng",
@@ -2611,6 +2612,7 @@ name = "rsclash-config"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "rsclash-domain",
  "serde",
  "serde_json",
  "serde_yaml_ng",

@@ -80,7 +80,7 @@ impl LinuxSystemProxyBackend {
   fn current_sync(&self) -> Result<SystemProxySnapshot> {
     let mode = parse_variant_string(&self.runner.get(ROOT_SCHEMA, "mode")?)?;
     Ok(SystemProxySnapshot {
-      enabled: mode == "manual",
+      enabled: matches!(mode.as_str(), "manual" | "auto"),
       backend: Some(self.name().to_string()),
       mode: Some(mode),
       http_proxy: self.read_endpoint(HTTP_SCHEMA)?,

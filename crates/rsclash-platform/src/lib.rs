@@ -205,6 +205,45 @@ impl SystemProxyService {
         "system proxy host and port must be valid".to_string(),
       ));
     }
+    let endpoint = format_endpoint(host, port);
+    self
+      .enable_target(|original| SystemProxySnapshot {
+        enabled: true,
+        backend: Some(self.backend.name().to_string()),
+        mode: Some("manual".to_string()),
+        http_proxy: Some(endpoint.clone()),
+        https_proxy: Some(endpoint.clone()),
+        socks_proxy: Some(endpoint),
+        bypass,
+        auto_config_url: original.auto_config_url.clone(),
+      })
+      .await
+  }
+
+  pub async fn enable_pac(&self, url: &str, bypass: Vec<String>) -> Result<()> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+      return Err(Error::Platform(
+        "PAC URL must use HTTP or HTTPS".to_string(),
+      ));
+    }
+    self
+      .enable_target(|original| SystemProxySnapshot {
+        enabled: true,
+        backend: Some(self.backend.name().to_string()),
+        mode: Some("auto".to_string()),
+        http_proxy: original.http_proxy.clone(),
+        https_proxy: original.https_proxy.clone(),
+        socks_proxy: original.socks_proxy.clone(),
+        bypass,
+        auto_config_url: Some(url.to_string()),
+      })
+      .await
+  }
+
+  async fn enable_target(
+    &self,
+    target: impl FnOnce(&SystemProxySnapshot) -> SystemProxySnapshot,
+  ) -> Result<()> {
     let _guard = self.gate.lock().await;
     if self.recovery.pending().await?.is_some() {
       return Err(Error::InvalidJournal(
@@ -212,17 +251,7 @@ impl SystemProxyService {
       ));
     }
     let original = self.backend.current().await?;
-    let endpoint = format_endpoint(host, port);
-    let target = SystemProxySnapshot {
-      enabled: true,
-      backend: Some(self.backend.name().to_string()),
-      mode: Some("manual".to_string()),
-      http_proxy: Some(endpoint.clone()),
-      https_proxy: Some(endpoint.clone()),
-      socks_proxy: Some(endpoint),
-      bypass,
-      auto_config_url: original.auto_config_url.clone(),
-    };
+    let target = target(&original);
     self
       .recovery
       .mark_pending(&PendingSystemRecovery {

@@ -1,17 +1,19 @@
 use std::{env, path::PathBuf, sync::Arc};
 
-use rsclash_app::{MihomoAccess, ProfileAccess};
+use rsclash_app::{MihomoAccess, ProfileAccess, ServiceInstallAccess, SettingsAccess};
 use rsclash_config::{CommandRuntimeValidator, RuntimeValidator, initialize_default_runtime};
 use rsclash_core::{
   CoreBinaries, CoreRuntime, LinuxSidecarConfig, LinuxSidecarController, PreferredController,
 };
 use rsclash_mihomo::{ControllerConfig, ControllerEndpoint, MihomoApi, MihomoClient};
 use rsclash_platform::{
-  LinuxSystemProxyBackend, RecoveryOutcome, RecoveryReason, SystemProxyBackend, SystemProxyService,
+  DesktopIntegration, LinuxDesktopIntegration, LinuxDesktopPaths, LinuxSystemProxyBackend,
+  RecoveryOutcome, RecoveryReason, SystemProxyBackend, SystemProxyService,
   SystemStateRecovery as _,
 };
 use rsclash_service::{
-  DEFAULT_CONTROLLER_SOCKET, DEFAULT_SERVICE_SOCKET, LinuxServiceController, ServiceClient,
+  DEFAULT_CONTROLLER_SOCKET, DEFAULT_INSTALLED_CONFIG, DEFAULT_SERVICE_SOCKET,
+  LinuxServiceController, ServiceClient,
 };
 use tokio::runtime::Handle;
 
@@ -53,6 +55,9 @@ pub(crate) struct LinuxBootstrap {
   pub mihomo_access: MihomoAccess,
   pub profile_access: ProfileAccess,
   pub system_proxy: Arc<SystemProxyService>,
+  pub settings_access: SettingsAccess,
+  pub desktop: Arc<dyn DesktopIntegration>,
+  pub initial_settings: rsclash_domain::AppSettings,
 }
 
 impl LinuxBootstrap {
@@ -82,8 +87,9 @@ fn create_core_runtime_for_layout(
       .to_path_buf()
   };
 
+  let binaries = layout.binaries;
   let sidecar_config = LinuxSidecarConfig::new(
-    layout.binaries,
+    binaries.clone(),
     &store.paths().root,
     &store.paths().runtime_config,
     layout.runtime_root,
@@ -105,17 +111,71 @@ fn create_core_runtime_for_layout(
     &store.paths().root,
   ));
   let system_proxy_backend: Arc<dyn SystemProxyBackend> = Arc::new(LinuxSystemProxyBackend::new());
-  let profile_access = ProfileAccess::new(store.clone(), validator)?
+  let profile_access = ProfileAccess::new(store.clone(), Arc::clone(&validator))?
     .with_system_proxy_backend(Arc::clone(&system_proxy_backend));
   let system_proxy = Arc::new(SystemProxyService::new(
     store.paths().root.join("system-recovery.json"),
     system_proxy_backend,
   ));
+  let logs = store.paths().root.join("logs");
+  let core_directory = layout.config_root.parent().map_or_else(
+    || layout.config_root.join("core"),
+    |parent| parent.join("rsclash-core"),
+  );
+  let desktop: Arc<dyn DesktopIntegration> = Arc::new(
+    LinuxDesktopIntegration::discover(LinuxDesktopPaths {
+      config: store.paths().root.clone(),
+      data: core_directory
+        .parent()
+        .map_or_else(|| core_directory.clone(), PathBuf::from),
+      logs: logs.clone(),
+      core: core_directory.clone(),
+    })
+    .map_err(|error| format!("configure Linux desktop integration: {error}"))?,
+  );
+  let setup_binary = env::current_exe()
+    .map_err(|error| format!("resolve rsclash executable: {error}"))?
+    .with_file_name("rsclash-service-setup");
+  let paths = rsclash_domain::ApplicationPathsView {
+    configuration: store.paths().root.to_string_lossy().into_owned(),
+    data: core_directory
+      .parent()
+      .unwrap_or(&core_directory)
+      .to_string_lossy()
+      .into_owned(),
+    logs: logs.to_string_lossy().into_owned(),
+    core: core_directory.to_string_lossy().into_owned(),
+  };
+  let settings_access = SettingsAccess::new(
+    store.clone(),
+    Arc::clone(&validator),
+    Arc::clone(&desktop),
+    ServiceInstallAccess {
+      setup_binary,
+      installed_config: PathBuf::from(DEFAULT_INSTALLED_CONFIG),
+      stable_core: binaries
+        .for_channel(rsclash_domain::CoreChannel::Stable)
+        .unwrap_or_else(|| std::path::Path::new("mihomo"))
+        .to_path_buf(),
+      alpha_core: binaries
+        .for_channel(rsclash_domain::CoreChannel::Alpha)
+        .map(PathBuf::from),
+      config_root: store.paths().root.clone(),
+      service_socket: PathBuf::from(DEFAULT_SERVICE_SOCKET),
+    },
+    paths,
+  );
+  let initial_settings = store
+    .load_application_settings()
+    .map_err(|error| format!("load application settings: {error}"))?;
   Ok(LinuxBootstrap {
     core_runtime: CoreRuntime::spawn(runtime, controller),
     mihomo_access,
     profile_access,
     system_proxy,
+    settings_access,
+    desktop,
+    initial_settings,
   })
 }
 

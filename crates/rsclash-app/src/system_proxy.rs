@@ -4,15 +4,6 @@ use rsclash_domain::SystemProxyView;
 use rsclash_platform::SystemProxyService;
 use tokio::sync::mpsc;
 
-const DEFAULT_BYPASS: &[&str] = &[
-  "localhost",
-  "127.0.0.1",
-  "192.168.0.0/16",
-  "10.0.0.0/8",
-  "172.16.0.0/12",
-  "::1",
-];
-
 #[derive(Clone)]
 pub struct SystemProxyAccess {
   service: Arc<SystemProxyService>,
@@ -24,10 +15,15 @@ impl SystemProxyAccess {
   }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum SystemProxyBridgeCommand {
   Refresh,
-  SetEnabled { enabled: bool, port: u16 },
+  SetEnabled {
+    enabled: bool,
+    port: u16,
+    bypass: Vec<String>,
+    pac_url: Option<String>,
+  },
 }
 
 pub(crate) enum SystemProxyBridgeEvent {
@@ -55,18 +51,17 @@ impl SystemProxyWorker {
     while let Some(command) = command_rx.recv().await {
       match command {
         SystemProxyBridgeCommand::Refresh => self.refresh().await,
-        SystemProxyBridgeCommand::SetEnabled { enabled, port } => {
+        SystemProxyBridgeCommand::SetEnabled {
+          enabled,
+          port,
+          bypass,
+          pac_url,
+        } => {
           self.set_busy(true).await;
-          let result = if enabled {
-            self
-              .access
-              .service
-              .enable(
-                "127.0.0.1",
-                port,
-                DEFAULT_BYPASS.iter().map(ToString::to_string).collect(),
-              )
-              .await
+          let result = if let Some(url) = pac_url.filter(|_| enabled) {
+            self.access.service.enable_pac(&url, bypass).await
+          } else if enabled {
+            self.access.service.enable("127.0.0.1", port, bypass).await
           } else {
             self.access.service.disable().await.map(|_| ())
           };
@@ -254,6 +249,8 @@ mod tests {
       .send(SystemProxyBridgeCommand::SetEnabled {
         enabled: true,
         port: 17897,
+        bypass: vec!["localhost".to_string()],
+        pac_url: None,
       })
       .await
       .expect("the enable command should be queued");
@@ -273,6 +270,8 @@ mod tests {
       .send(SystemProxyBridgeCommand::SetEnabled {
         enabled: false,
         port: 0,
+        bypass: Vec::new(),
+        pac_url: None,
       })
       .await
       .expect("the disable command should be queued");

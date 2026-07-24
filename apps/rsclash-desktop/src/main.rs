@@ -10,8 +10,6 @@ use std::{error::Error, time::Duration};
 
 use eframe::egui;
 use rsclash_app::{AppClient, BackendHandle, WakeHandle};
-#[cfg(target_os = "linux")]
-use rsclash_domain::CoreChannel;
 use rsclash_domain::{RemoteProfileOptions, UiCommand};
 use rsclash_ui::RsClashUi;
 use tokio::runtime::{Builder, Runtime};
@@ -111,21 +109,41 @@ fn create_backend(runtime: &Runtime, wake: WakeHandle) -> BackendHandle {
   if let Err(error) = runtime.block_on(bootstrap.audit_startup()) {
     error!(%error, "failed to audit pending system state recovery");
   }
-  let backend = BackendHandle::spawn_with_system_proxy_integrations(
+  let initial_settings = bootstrap.initial_settings.clone();
+  let desktop = std::sync::Arc::clone(&bootstrap.desktop);
+  let backend = BackendHandle::spawn_with_linux_integrations(
     runtime.handle(),
     wake,
     bootstrap.core_runtime,
     bootstrap.system_proxy,
     bootstrap.mihomo_access,
     bootstrap.profile_access,
+    bootstrap.settings_access,
   );
+  apply_initial_settings(runtime, &backend, desktop.as_ref(), &initial_settings);
+  backend
+}
+
+#[cfg(target_os = "linux")]
+fn apply_initial_settings(
+  runtime: &Runtime,
+  backend: &BackendHandle,
+  desktop: &dyn rsclash_platform::DesktopIntegration,
+  settings: &rsclash_domain::AppSettings,
+) {
+  if let Err(error) = runtime.block_on(desktop.run_startup_script(&settings.startup_script)) {
+    error!(%error, "startup script failed");
+  }
+  let client = backend.client();
+  if let Err(error) = client.try_command(UiCommand::Navigate(settings.start_page)) {
+    error!(%error, "failed to apply the configured start page");
+  }
   if let Err(error) = backend
     .client()
-    .try_command(UiCommand::StartCore(CoreChannel::Stable))
+    .try_command(UiCommand::StartCore(settings.core_channel))
   {
     error!(%error, "failed to queue Mihomo startup");
   }
-  backend
 }
 
 #[cfg(not(target_os = "linux"))]

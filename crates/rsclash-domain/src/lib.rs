@@ -156,6 +156,274 @@ pub enum StreamLogLevel {
   Silent,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppLanguage {
+  #[default]
+  System,
+  ChineseSimplified,
+  English,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrayClickAction {
+  #[default]
+  ToggleWindow,
+  ShowMenu,
+  Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigationLayout {
+  #[default]
+  Automatic,
+  Expanded,
+  Compact,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyGroupLayout {
+  #[default]
+  Cards,
+  Compact,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TunStack {
+  System,
+  Gvisor,
+  #[default]
+  Mixed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DnsEnhancedMode {
+  Normal,
+  RedirHost,
+  #[default]
+  FakeIp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PortSettings {
+  pub mixed: u16,
+  pub socks: Option<u16>,
+  pub http: Option<u16>,
+  pub redir: Option<u16>,
+  pub tproxy: Option<u16>,
+}
+
+impl Default for PortSettings {
+  fn default() -> Self {
+    Self {
+      mixed: 17_897,
+      socks: None,
+      http: None,
+      redir: None,
+      tproxy: None,
+    }
+  }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControllerSettings {
+  pub enabled: bool,
+  pub address: String,
+  pub secret: SensitiveString,
+  pub allow_private_network: bool,
+  pub allowed_origins: Vec<String>,
+}
+
+impl Default for ControllerSettings {
+  fn default() -> Self {
+    Self {
+      enabled: false,
+      address: "127.0.0.1:9090".to_string(),
+      secret: SensitiveString::default(),
+      allow_private_network: false,
+      allowed_origins: vec!["http://localhost".to_string()],
+    }
+  }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DnsSettings {
+  pub enabled: bool,
+  pub listen: String,
+  pub ipv6: bool,
+  pub enhanced_mode: DnsEnhancedMode,
+  pub fake_ip_range: String,
+  pub default_nameservers: Vec<String>,
+  pub nameservers: Vec<String>,
+  pub fallback: Vec<String>,
+}
+
+impl Default for DnsSettings {
+  fn default() -> Self {
+    Self {
+      enabled: false,
+      listen: "0.0.0.0:1053".to_string(),
+      ipv6: false,
+      enhanced_mode: DnsEnhancedMode::FakeIp,
+      fake_ip_range: "198.18.0.1/16".to_string(),
+      default_nameservers: vec!["223.5.5.5".to_string(), "1.1.1.1".to_string()],
+      nameservers: vec![
+        "https://dns.alidns.com/dns-query".to_string(),
+        "https://1.1.1.1/dns-query".to_string(),
+      ],
+      fallback: Vec::new(),
+    }
+  }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TunnelSettings {
+  pub network: Vec<String>,
+  pub address: String,
+  pub target: String,
+  pub proxy: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppSettings {
+  pub theme: ThemeMode,
+  pub language: AppLanguage,
+  pub tray_click: TrayClickAction,
+  pub start_page: Page,
+  pub startup_script: String,
+  pub auto_launch: bool,
+  pub silent_start: bool,
+  pub show_tray: bool,
+  pub system_proxy_bypass: Vec<String>,
+  pub pac_url: Option<String>,
+  pub tun_enabled: bool,
+  pub tun_stack: TunStack,
+  pub network_interface: Option<String>,
+  pub allow_lan: bool,
+  pub ipv6: bool,
+  pub unified_delay: bool,
+  pub mihomo_log_level: StreamLogLevel,
+  pub ports: PortSettings,
+  pub controller: ControllerSettings,
+  pub dns: DnsSettings,
+  pub tunnels: Vec<TunnelSettings>,
+  pub core_channel: CoreChannel,
+  pub traffic_graph: bool,
+  pub memory_usage: bool,
+  pub refresh_interval_ms: u64,
+  pub home_cards: Vec<String>,
+  pub connection_columns: Vec<String>,
+  pub proxy_group_layout: ProxyGroupLayout,
+  pub proxy_layout_columns: u8,
+  pub navigation_layout: NavigationLayout,
+  pub auto_close_connections: bool,
+  pub auto_test: bool,
+  pub latency_test_url: String,
+  pub latency_timeout_ms: u64,
+  pub app_log_max_size_mib: u64,
+  pub app_log_max_count: usize,
+  pub app_log_retention_days: u32,
+}
+
+impl Default for AppSettings {
+  fn default() -> Self {
+    Self {
+      theme: ThemeMode::System,
+      language: AppLanguage::System,
+      tray_click: TrayClickAction::ToggleWindow,
+      start_page: Page::Home,
+      startup_script: String::new(),
+      auto_launch: false,
+      silent_start: false,
+      show_tray: true,
+      system_proxy_bypass: vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "192.168.0.0/16".to_string(),
+        "10.0.0.0/8".to_string(),
+        "172.16.0.0/12".to_string(),
+        "::1".to_string(),
+      ],
+      pac_url: None,
+      tun_enabled: false,
+      tun_stack: TunStack::Mixed,
+      network_interface: None,
+      allow_lan: false,
+      ipv6: false,
+      unified_delay: false,
+      mihomo_log_level: StreamLogLevel::Info,
+      ports: PortSettings::default(),
+      controller: ControllerSettings::default(),
+      dns: DnsSettings::default(),
+      tunnels: Vec::new(),
+      core_channel: CoreChannel::Stable,
+      traffic_graph: true,
+      memory_usage: true,
+      refresh_interval_ms: 1_000,
+      home_cards: vec![
+        "profile".to_string(),
+        "proxy".to_string(),
+        "network".to_string(),
+        "traffic".to_string(),
+      ],
+      connection_columns: vec![
+        "destination".to_string(),
+        "traffic".to_string(),
+        "process".to_string(),
+        "rule".to_string(),
+        "chains".to_string(),
+      ],
+      proxy_group_layout: ProxyGroupLayout::Cards,
+      proxy_layout_columns: 2,
+      navigation_layout: NavigationLayout::Automatic,
+      auto_close_connections: true,
+      auto_test: false,
+      latency_test_url: "https://www.gstatic.com/generate_204".to_string(),
+      latency_timeout_ms: 5_000,
+      app_log_max_size_mib: 16,
+      app_log_max_count: 5,
+      app_log_retention_days: 7,
+    }
+  }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ServiceIntegrationView {
+  pub installed: bool,
+  pub reachable: bool,
+  pub busy: bool,
+  pub version: Option<String>,
+  pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ApplicationPathsView {
+  pub configuration: String,
+  pub data: String,
+  pub logs: String,
+  pub core: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SettingsSnapshot {
+  pub value: AppSettings,
+  pub busy: bool,
+  pub autostart_enabled: bool,
+  pub service: ServiceIntegrationView,
+  pub paths: ApplicationPathsView,
+  pub last_applied: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TrafficSnapshot {
   pub upload_bytes_per_second: u64,
@@ -552,6 +820,7 @@ pub struct AppSnapshot {
   pub mihomo: MihomoSnapshot,
   pub profiles: ProfilesSnapshot,
   pub system_proxy: SystemProxyView,
+  pub settings: SettingsSnapshot,
   pub last_error: Option<ErrorView>,
 }
 
@@ -567,6 +836,7 @@ impl Default for AppSnapshot {
       mihomo: MihomoSnapshot::default(),
       profiles: ProfilesSnapshot::default(),
       system_proxy: SystemProxyView::default(),
+      settings: SettingsSnapshot::default(),
       last_error: None,
     }
   }
@@ -674,12 +944,27 @@ pub enum UiCommand {
   UpdateAllProfiles,
   RefreshSystemProxy,
   SetSystemProxy(bool),
+  RefreshSettings,
+  ApplySettings(Box<AppSettings>),
+  InstallService,
+  UninstallService,
+  RegisterDeepLinks,
+  OpenDirectory(ApplicationDirectory),
+  OpenWebUi,
   Navigate(Page),
   SetTheme(ThemeMode),
   SetWindowVisible(bool),
   ToggleWindow,
   ClearError,
   Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ApplicationDirectory {
+  Configuration,
+  Data,
+  Logs,
+  Core,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -704,6 +989,7 @@ pub enum AppEvent {
   },
   ProfileQrReady(ProfileQrCode),
   SystemProxyChanged,
+  SettingsChanged,
   NavigationChanged(Page),
   ThemeChanged(ThemeMode),
   WindowVisibilityChanged(bool),

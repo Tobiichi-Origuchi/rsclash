@@ -2139,8 +2139,8 @@ fn normalized_selections(selections: &[ProfileSelection]) -> Vec<StoredProxySele
 
 fn close_connections_after_proxy_change(store: &ProfileStore) -> Result<bool, String> {
   store
-    .load_verge_config()
-    .map(|config| config.auto_close_connection.unwrap_or(true))
+    .load_application_settings()
+    .map(|config| config.auto_close_connections)
     .map_err(|error| error.to_string())
 }
 
@@ -2659,11 +2659,13 @@ mod tests {
       ]
     );
 
-    fs::write(
-      &store.paths().verge_config,
-      "auto_close_connection: false\n",
-    )
-    .expect("the application setting should be written");
+    let settings = rsclash_domain::AppSettings {
+      auto_close_connections: false,
+      ..rsclash_domain::AppSettings::default()
+    };
+    store
+      .save_application_settings(&settings)
+      .expect("the application setting should be written");
     assert!(
       !profile_runtime_sync(&store, &uid, true)
         .expect("the disabled cleanup policy should load")

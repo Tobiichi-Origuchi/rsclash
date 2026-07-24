@@ -5,6 +5,7 @@ mod mihomo;
 mod profiles;
 mod proxy_view;
 mod runtime;
+mod settings;
 mod system_proxy;
 
 use std::{fmt, future::pending, sync::Arc, time::Duration};
@@ -31,6 +32,7 @@ pub use change::{
 pub use mihomo::MihomoAccess;
 pub use profiles::ProfileAccess;
 pub use runtime::CoreRuntimeActivator;
+pub use settings::{ServiceInstallAccess, SettingsAccess};
 pub use system_proxy::SystemProxyAccess;
 
 use mihomo::{MihomoBridgeCommand, MihomoBridgeEvent, run_mihomo_worker};
@@ -38,6 +40,7 @@ use profiles::{
   ProfileBridgeCommand, ProfileBridgeEvent, ProfileContentCommand, ProfileImportCommand,
   ProfileMutationCommand, ProfileQrCommand, ProfileUpdateCommand, run_profile_worker,
 };
+use settings::{SettingsBridgeCommand, SettingsBridgeEvent, run_settings_worker};
 use system_proxy::{SystemProxyBridgeCommand, SystemProxyBridgeEvent, run_system_proxy_worker};
 
 const COMMAND_CAPACITY: usize = 64;
@@ -209,17 +212,27 @@ pub struct BackendHandle {
   mihomo_worker: Option<JoinHandle<()>>,
   profile_worker: Option<JoinHandle<()>>,
   system_proxy_worker: Option<JoinHandle<()>>,
+  settings_worker: Option<JoinHandle<()>>,
   core_runtime: Option<CoreRuntime>,
   system_recovery: Option<Arc<dyn SystemStateRecovery>>,
 }
 
 impl BackendHandle {
   pub fn spawn(runtime: &Handle, wake: WakeHandle) -> Self {
-    Self::spawn_inner(runtime, wake, None, None, None, None, None)
+    Self::spawn_inner(runtime, wake, None, None, None, None, None, None)
   }
 
   pub fn spawn_with_core(runtime: &Handle, wake: WakeHandle, core_runtime: CoreRuntime) -> Self {
-    Self::spawn_inner(runtime, wake, Some(core_runtime), None, None, None, None)
+    Self::spawn_inner(
+      runtime,
+      wake,
+      Some(core_runtime),
+      None,
+      None,
+      None,
+      None,
+      None,
+    )
   }
 
   pub fn spawn_with_core_and_mihomo(
@@ -236,6 +249,7 @@ impl BackendHandle {
       Some(mihomo_access),
       None,
       None,
+      None,
     )
   }
 
@@ -250,6 +264,7 @@ impl BackendHandle {
       wake,
       Some(core_runtime),
       Some(system_recovery),
+      None,
       None,
       None,
       None,
@@ -271,6 +286,7 @@ impl BackendHandle {
       Some(mihomo_access),
       None,
       None,
+      None,
     )
   }
 
@@ -289,6 +305,7 @@ impl BackendHandle {
       Some(system_recovery),
       Some(mihomo_access),
       Some(profile_access),
+      None,
       None,
     )
   }
@@ -311,9 +328,37 @@ impl BackendHandle {
       Some(mihomo_access),
       Some(profile_access),
       Some(SystemProxyAccess::new(system_proxy)),
+      None,
     )
   }
 
+  pub fn spawn_with_linux_integrations(
+    runtime: &Handle,
+    wake: WakeHandle,
+    core_runtime: CoreRuntime,
+    system_proxy: Arc<SystemProxyService>,
+    mihomo_access: MihomoAccess,
+    profile_access: ProfileAccess,
+    settings_access: SettingsAccess,
+  ) -> Self {
+    let system_recovery: Arc<dyn SystemStateRecovery> =
+      Arc::<SystemProxyService>::clone(&system_proxy);
+    Self::spawn_inner(
+      runtime,
+      wake,
+      Some(core_runtime),
+      Some(system_recovery),
+      Some(mihomo_access),
+      Some(profile_access),
+      Some(SystemProxyAccess::new(system_proxy)),
+      Some(settings_access),
+    )
+  }
+
+  #[allow(
+    clippy::too_many_arguments,
+    reason = "the constructor keeps each optional worker integration explicit"
+  )]
   fn spawn_inner(
     runtime: &Handle,
     wake: WakeHandle,
@@ -322,9 +367,11 @@ impl BackendHandle {
     mihomo_access: Option<MihomoAccess>,
     profile_access: Option<ProfileAccess>,
     system_proxy_access: Option<SystemProxyAccess>,
+    settings_access: Option<SettingsAccess>,
   ) -> Self {
     let core = core_runtime.as_ref().map(CoreRuntime::handle);
     let profile_core = core.clone();
+    let settings_core = core.clone();
     let mut initial_snapshot = AppSnapshot::default();
     if let Some(core) = &core {
       initial_snapshot.core = core.current_state().as_ref().clone();
@@ -383,6 +430,18 @@ impl BackendHandle {
         },
         None => (None, None, None),
       };
+    let (settings_command_tx, settings_event_rx, settings_worker) =
+      match (settings_access, settings_core) {
+        (Some(access), Some(core)) => {
+          let (command_tx, command_rx) = mpsc::channel(CORE_EVENT_CAPACITY);
+          let (event_tx, event_rx) = mpsc::channel(CORE_EVENT_CAPACITY);
+          let activator: Arc<dyn rsclash_config::RuntimeActivator> =
+            Arc::new(CoreRuntimeActivator::new(core));
+          let worker = runtime.spawn(run_settings_worker(access, activator, command_rx, event_tx));
+          (Some(command_tx), Some(event_rx), Some(worker))
+        },
+        _ => (None, None, None),
+      };
 
     let coordinator = Coordinator {
       snapshot: (*initial_snapshot).clone(),
@@ -398,6 +457,8 @@ impl BackendHandle {
       profile_event_rx,
       system_proxy_command_tx,
       system_proxy_event_rx,
+      settings_command_tx,
+      settings_event_rx,
     };
     let coordinator = runtime.spawn(coordinator.run());
 
@@ -414,6 +475,7 @@ impl BackendHandle {
       mihomo_worker,
       profile_worker,
       system_proxy_worker,
+      settings_worker,
       core_runtime,
       system_recovery,
     }
@@ -462,6 +524,10 @@ impl BackendHandle {
       system_proxy_worker.abort();
       let _ = system_proxy_worker.await;
     }
+    if let Some(settings_worker) = self.settings_worker.take() {
+      settings_worker.abort();
+      let _ = settings_worker.await;
+    }
 
     let recovery_result = if let Some(system_recovery) = self.system_recovery.take() {
       system_recovery
@@ -508,6 +574,9 @@ impl Drop for BackendHandle {
     if let Some(system_proxy_worker) = self.system_proxy_worker.take() {
       system_proxy_worker.abort();
     }
+    if let Some(settings_worker) = self.settings_worker.take() {
+      settings_worker.abort();
+    }
     let _ = self.system_recovery.take();
     let _ = self.core_runtime.take();
   }
@@ -540,6 +609,8 @@ struct Coordinator {
   profile_event_rx: Option<mpsc::Receiver<ProfileBridgeEvent>>,
   system_proxy_command_tx: Option<mpsc::Sender<SystemProxyBridgeCommand>>,
   system_proxy_event_rx: Option<mpsc::Receiver<SystemProxyBridgeEvent>>,
+  settings_command_tx: Option<mpsc::Sender<SettingsBridgeCommand>>,
+  settings_event_rx: Option<mpsc::Receiver<SettingsBridgeEvent>>,
 }
 
 impl Coordinator {
@@ -556,6 +627,7 @@ impl Coordinator {
         &mut self.mihomo_event_rx,
         &mut self.profile_event_rx,
         &mut self.system_proxy_event_rx,
+        &mut self.settings_event_rx,
       )
       .await
       {
@@ -586,6 +658,10 @@ impl Coordinator {
         CoordinatorInput::SystemProxy(system_proxy_event) => match system_proxy_event {
           Some(event) => self.handle_system_proxy_event(event),
           None => self.system_proxy_event_rx = None,
+        },
+        CoordinatorInput::Settings(settings_event) => match settings_event {
+          Some(event) => self.handle_settings_event(event),
+          None => self.settings_event_rx = None,
         },
       }
     }
@@ -717,6 +793,39 @@ impl Coordinator {
         self.dispatch_system_proxy(SystemProxyBridgeCommand::Refresh)
       },
       UiCommand::SetSystemProxy(enabled) => self.set_system_proxy(enabled),
+      UiCommand::RefreshSettings => self.dispatch_settings(SettingsBridgeCommand::Refresh),
+      UiCommand::ApplySettings(settings) => {
+        let settings = *settings;
+        if settings.tun_enabled
+          && !matches!(
+            self.snapshot.core,
+            CoreState::Running {
+              mode: rsclash_domain::CoreRunMode::Service,
+              ..
+            }
+          )
+        {
+          return (
+            Err(CommandError::InvalidState(
+              "the privileged service must be the active core backend before enabling TUN"
+                .to_string(),
+            )),
+            false,
+          );
+        }
+        self.dispatch_settings(SettingsBridgeCommand::Apply(Box::new(settings)))
+      },
+      UiCommand::InstallService => self.dispatch_settings(SettingsBridgeCommand::InstallService),
+      UiCommand::UninstallService => {
+        self.dispatch_settings(SettingsBridgeCommand::UninstallService)
+      },
+      UiCommand::RegisterDeepLinks => {
+        self.dispatch_settings(SettingsBridgeCommand::RegisterDeepLinks)
+      },
+      UiCommand::OpenDirectory(directory) => {
+        self.dispatch_settings(SettingsBridgeCommand::OpenDirectory(directory))
+      },
+      UiCommand::OpenWebUi => self.dispatch_settings(SettingsBridgeCommand::OpenWebUi),
       UiCommand::Navigate(page) => {
         self.snapshot.page = page;
         self.update_mihomo_presentation();
@@ -863,6 +972,16 @@ impl Coordinator {
       return self.dispatch_system_proxy(SystemProxyBridgeCommand::SetEnabled {
         enabled: false,
         port: 0,
+        bypass: Vec::new(),
+        pac_url: None,
+      });
+    }
+    if self.snapshot.settings.value.pac_url.is_some() {
+      return self.dispatch_system_proxy(SystemProxyBridgeCommand::SetEnabled {
+        enabled: true,
+        port: 0,
+        bypass: self.snapshot.settings.value.system_proxy_bypass.clone(),
+        pac_url: self.snapshot.settings.value.pac_url.clone(),
       });
     }
     if !matches!(self.snapshot.core, CoreState::Running { .. }) {
@@ -884,7 +1003,35 @@ impl Coordinator {
     self.dispatch_system_proxy(SystemProxyBridgeCommand::SetEnabled {
       enabled: true,
       port,
+      bypass: self.snapshot.settings.value.system_proxy_bypass.clone(),
+      pac_url: self.snapshot.settings.value.pac_url.clone(),
     })
+  }
+
+  fn dispatch_settings(&self, command: SettingsBridgeCommand) -> (CommandResult, bool) {
+    let Some(command_tx) = &self.settings_command_tx else {
+      return (
+        Err(CommandError::InvalidState(
+          "the settings backend is not configured".to_string(),
+        )),
+        false,
+      );
+    };
+    match command_tx.try_send(command) {
+      Ok(()) => (Ok(CommandOutput::Accepted), false),
+      Err(mpsc::error::TrySendError::Full(_)) => (
+        Err(CommandError::InvalidState(
+          "the settings command queue is full".to_string(),
+        )),
+        false,
+      ),
+      Err(mpsc::error::TrySendError::Closed(_)) => (
+        Err(CommandError::InvalidState(
+          "the settings bridge is closed".to_string(),
+        )),
+        false,
+      ),
+    }
   }
 
   fn handle_core_event(&mut self, event: CoreBridgeEvent) {
@@ -913,6 +1060,8 @@ impl Coordinator {
           let _ = command_tx.try_send(SystemProxyBridgeCommand::SetEnabled {
             enabled: false,
             port: 0,
+            bypass: Vec::new(),
+            pac_url: None,
           });
         }
         self.snapshot.core = state.clone();
@@ -1031,6 +1180,30 @@ impl Coordinator {
     }
   }
 
+  fn handle_settings_event(&mut self, event: SettingsBridgeEvent) {
+    match event {
+      SettingsBridgeEvent::Snapshot(snapshot) => {
+        let snapshot = *snapshot;
+        let theme_changed = self.snapshot.theme != snapshot.value.theme;
+        self.snapshot.theme = snapshot.value.theme;
+        self.snapshot.settings = snapshot;
+        self.publish_snapshot();
+        self.emit(AppEvent::SettingsChanged);
+        if theme_changed {
+          self.emit(AppEvent::ThemeChanged(self.snapshot.theme));
+        }
+      },
+      SettingsBridgeEvent::CommandFailed(message) => {
+        self.snapshot.last_error = Some(ErrorView {
+          title: "Settings operation failed".to_string(),
+          detail: message,
+          retryable: true,
+        });
+        self.publish_snapshot();
+      },
+    }
+  }
+
   fn set_window_visible(&mut self, visible: bool) {
     if self.snapshot.window_visible != visible {
       self.snapshot.window_visible = visible;
@@ -1069,6 +1242,7 @@ enum CoordinatorInput {
   Mihomo(Option<MihomoBridgeEvent>),
   Profile(Option<ProfileBridgeEvent>),
   SystemProxy(Option<SystemProxyBridgeEvent>),
+  Settings(Option<SettingsBridgeEvent>),
 }
 
 async fn receive_coordinator_input(
@@ -1077,6 +1251,7 @@ async fn receive_coordinator_input(
   mihomo_event_rx: &mut Option<mpsc::Receiver<MihomoBridgeEvent>>,
   profile_event_rx: &mut Option<mpsc::Receiver<ProfileBridgeEvent>>,
   system_proxy_event_rx: &mut Option<mpsc::Receiver<SystemProxyBridgeEvent>>,
+  settings_event_rx: &mut Option<mpsc::Receiver<SettingsBridgeEvent>>,
 ) -> CoordinatorInput {
   tokio::select! {
     biased;
@@ -1087,6 +1262,7 @@ async fn receive_coordinator_input(
     event = receive_system_proxy_event(system_proxy_event_rx) => {
       CoordinatorInput::SystemProxy(event)
     },
+    event = receive_settings_event(settings_event_rx) => CoordinatorInput::Settings(event),
   }
 }
 
@@ -1162,6 +1338,16 @@ async fn receive_system_proxy_event(
     receiver.recv().await
   } else {
     pending::<Option<SystemProxyBridgeEvent>>().await
+  }
+}
+
+async fn receive_settings_event(
+  receiver: &mut Option<mpsc::Receiver<SettingsBridgeEvent>>,
+) -> Option<SettingsBridgeEvent> {
+  if let Some(receiver) = receiver {
+    receiver.recv().await
+  } else {
+    pending::<Option<SettingsBridgeEvent>>().await
   }
 }
 
