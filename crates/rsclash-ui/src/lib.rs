@@ -188,6 +188,7 @@ pub struct RsClashUi {
   log_search: String,
   log_reverse: bool,
   log_level: StreamLogLevel,
+  navigation_collapsed: bool,
 }
 
 impl RsClashUi {
@@ -247,6 +248,7 @@ impl RsClashUi {
       log_search: String::new(),
       log_reverse: false,
       log_level: StreamLogLevel::Info,
+      navigation_collapsed: false,
     }
   }
 
@@ -381,93 +383,250 @@ impl RsClashUi {
   }
 
   pub fn ui(&mut self, root: &mut Ui) {
+    let automatically_compact = root.available_width() < 940.0;
+    let compact_navigation = automatically_compact || self.navigation_collapsed;
     egui::Panel::left("navigation")
-      .exact_size(190.0)
+      .exact_size(if compact_navigation { 76.0 } else { 220.0 })
       .frame(
         Frame::side_top_panel(root.style())
           .fill(root.visuals().panel_fill)
-          .inner_margin(egui::Margin::symmetric(12, 16)),
+          .stroke(Stroke::new(1.0, theme::tokens(root).border))
+          .inner_margin(egui::Margin::symmetric(10, 14)),
       )
-      .show(root, |ui| self.navigation(ui));
+      .show(root, |ui| {
+        self.navigation(ui, compact_navigation, automatically_compact);
+      });
 
     egui::CentralPanel::default()
       .frame(
         Frame::central_panel(root.style())
-          .fill(root.visuals().window_fill())
+          .fill(theme::tokens(root).canvas)
           .inner_margin(egui::Margin::same(0)),
       )
       .show(root, |ui| {
         self.header(ui);
-        ui.separator();
         ScrollArea::vertical()
           .auto_shrink([false, false])
           .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.add_space(20.0);
-            ui.horizontal(|ui| {
-              ui.add_space(24.0);
-              ui.vertical(|ui| {
-                ui.set_max_width((ui.available_width() - 24.0).max(320.0));
-                self.page(ui);
-              });
+            ui.add_space(22.0);
+            ui.with_layout(Layout::top_down(Align::Center), |ui| {
+              let content_width = ui.available_width().min(1180.0);
+              ui.allocate_ui_with_layout(
+                egui::vec2(content_width, ui.available_height()),
+                Layout::top_down(Align::Min),
+                |ui| {
+                  self.page(ui);
+                },
+              );
             });
-            ui.add_space(24.0);
+            ui.add_space(32.0);
           });
       });
   }
 
-  fn navigation(&mut self, ui: &mut Ui) {
+  fn navigation(&mut self, ui: &mut Ui, compact: bool, forced_compact: bool) {
+    let tokens = theme::tokens(ui);
     ui.horizontal(|ui| {
-      let accent = ui.visuals().selection.bg_fill;
-      ui.label(RichText::new("◈").size(28.0).color(accent));
-      ui.vertical(|ui| {
-        ui.label(RichText::new("rsclash").size(19.0).strong());
-        ui.label(RichText::new("Native Mihomo GUI").small().weak());
-      });
-    });
-    ui.add_space(22.0);
-
-    for page in Page::ALL {
-      let selected = self.snapshot.page == page;
-      let label = format!("{}   {}", page.symbol(), page.label());
-      if ui
-        .add_sized(
-          [ui.available_width(), 40.0],
-          egui::Button::new(RichText::new(label).size(15.0))
-            .selected(selected)
-            .corner_radius(9),
-        )
-        .clicked()
-      {
-        self.command(UiCommand::Navigate(page));
+      ui.add_space(if compact { 7.0 } else { 5.0 });
+      Frame::new()
+        .fill(tokens.accent)
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(9, 6))
+        .show(ui, |ui| {
+          ui.label(RichText::new("R").size(18.0).strong().color(Color32::WHITE));
+        });
+      if !compact {
+        ui.vertical(|ui| {
+          ui.label(RichText::new("rsclash").size(18.0).strong());
+          ui.label(RichText::new("Mihomo Desktop").small().weak());
+        });
       }
-      ui.add_space(3.0);
+    });
+    ui.add_space(20.0);
+
+    for (title, pages) in [
+      ("概览", &[Page::Home][..]),
+      (
+        "代理",
+        &[
+          Page::Proxies,
+          Page::Profiles,
+          Page::Connections,
+          Page::Rules,
+        ][..],
+      ),
+      ("诊断", &[Page::Logs][..]),
+    ] {
+      if !compact {
+        ui.add_space(6.0);
+        ui.label(
+          RichText::new(title)
+            .size(11.0)
+            .strong()
+            .color(tokens.text_muted),
+        );
+        ui.add_space(3.0);
+      }
+      for page in pages {
+        self.navigation_item(ui, *page, compact);
+      }
+      ui.add_space(if compact { 5.0 } else { 8.0 });
     }
 
     ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-      ui.label(RichText::new("原生 egui · Mihomo").small().weak());
-      ui.label(
-        RichText::new(format!("状态版本 {}", self.snapshot.revision))
-          .small()
-          .weak(),
-      );
+      self.navigation_item(ui, Page::Settings, compact);
+      if !forced_compact {
+        let label = if compact { "»" } else { "«  收起侧栏" };
+        if ui
+          .add_sized(
+            [ui.available_width(), 34.0],
+            egui::Button::new(RichText::new(label).color(tokens.text_muted)).frame(false),
+          )
+          .clicked()
+        {
+          self.navigation_collapsed = !self.navigation_collapsed;
+        }
+      }
+      ui.add_space(8.0);
+      Frame::new()
+        .fill(tokens.surface)
+        .stroke(Stroke::new(1.0, tokens.border))
+        .corner_radius(10)
+        .inner_margin(if compact {
+          egui::Margin::same(8)
+        } else {
+          egui::Margin::symmetric(11, 9)
+        })
+        .show(ui, |ui| {
+          let running = matches!(self.snapshot.core, CoreState::Running { .. });
+          if compact {
+            ui.vertical_centered(|ui| {
+              ui.label(RichText::new("●").color(if running {
+                tokens.success
+              } else {
+                tokens.text_muted
+              }))
+              .on_hover_text(if running {
+                "Mihomo 正在运行"
+              } else {
+                "Mihomo 未运行"
+              });
+            });
+          } else {
+            ui.horizontal(|ui| {
+              ui.label(RichText::new("●").color(if running {
+                tokens.success
+              } else {
+                tokens.text_muted
+              }));
+              ui.vertical(|ui| {
+                ui.label(
+                  RichText::new(if running {
+                    "代理服务运行中"
+                  } else {
+                    "代理服务已停止"
+                  })
+                  .strong(),
+                );
+                ui.label(
+                  RichText::new(
+                    self
+                      .snapshot
+                      .profiles
+                      .current()
+                      .map_or("尚未选择配置", |profile| profile.name.as_str()),
+                  )
+                  .small()
+                  .weak(),
+                );
+              });
+            });
+          }
+        });
+      ui.add_space(8.0);
     });
   }
 
+  fn navigation_item(&mut self, ui: &mut Ui, page: Page, compact: bool) {
+    let selected = self.snapshot.page == page;
+    let tokens = theme::tokens(ui);
+    let label = if compact {
+      page.symbol().to_string()
+    } else {
+      format!("{}   {}", page.symbol(), page.label())
+    };
+    let response = ui.add_sized(
+      [ui.available_width(), 39.0],
+      egui::Button::new(RichText::new(label).size(if compact { 18.0 } else { 14.5 }))
+        .selected(selected)
+        .fill(if selected {
+          tokens.accent_soft
+        } else {
+          Color32::TRANSPARENT
+        })
+        .stroke(Stroke::NONE)
+        .corner_radius(9),
+    );
+    if response.clicked() {
+      self.command(UiCommand::Navigate(page));
+    }
+    if compact {
+      response.on_hover_text(page.label());
+    }
+  }
+
   fn header(&mut self, ui: &mut Ui) {
+    let tokens = theme::tokens(ui);
     Frame::new()
-      .inner_margin(egui::Margin::symmetric(24, 15))
+      .fill(tokens.surface)
+      .stroke(Stroke::new(1.0, tokens.border))
+      .inner_margin(egui::Margin::symmetric(22, 14))
       .show(ui, |ui| {
         ui.horizontal(|ui| {
-          ui.heading(self.snapshot.page.label());
+          ui.vertical(|ui| {
+            ui.label(
+              RichText::new(self.snapshot.page.label())
+                .size(20.0)
+                .strong(),
+            );
+            ui.label(
+              RichText::new(page_description(self.snapshot.page))
+                .small()
+                .color(tokens.text_muted),
+            );
+          });
           ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.button("退出").clicked() {
-              self.command(UiCommand::Shutdown);
+            ui.menu_button("⋮", |ui| {
+              if self.close_to_tray && ui.button("隐藏到托盘").clicked() {
+                self.command(UiCommand::SetWindowVisible(false));
+                ui.close();
+              }
+              if ui.button("退出 rsclash").clicked() {
+                self.command(UiCommand::Shutdown);
+                ui.close();
+              }
+            });
+            let system_proxy = self.snapshot.system_proxy.clone();
+            if ui
+              .add_enabled(
+                !system_proxy.busy
+                  && (system_proxy.enabled
+                    || (system_proxy.available
+                      && self.snapshot.mihomo.connection == MihomoConnection::Connected
+                      && self.snapshot.mihomo.mixed_port.is_some())),
+                egui::Button::new(if system_proxy.enabled {
+                  "系统代理已开启"
+                } else {
+                  "开启系统代理"
+                })
+                .selected(system_proxy.enabled),
+              )
+              .clicked()
+            {
+              self.command(UiCommand::SetSystemProxy(!system_proxy.enabled));
             }
-            if self.close_to_tray && ui.button("隐藏到托盘").clicked() {
-              self.command(UiCommand::SetWindowVisible(false));
-            }
-            status_pill(ui, self.snapshot.status);
+            core_status_pill(ui, &self.snapshot.core);
           });
         });
       });
@@ -537,19 +696,15 @@ impl RsClashUi {
       && mihomo.connection == MihomoConnection::Connected
       && mihomo.mixed_port.is_some();
     ui.horizontal(|ui| {
-      ui.vertical(|ui| {
-        ui.label(RichText::new("网络概览").size(24.0).strong());
-        ui.label(RichText::new("Mihomo 与系统代理的实时状态").weak());
-      });
+      mihomo_connection_pill(ui, mihomo.connection);
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if ui.button("刷新").clicked() {
+        if ui.button("刷新状态").clicked() {
           self.command(UiCommand::RefreshMihomo);
           self.command(UiCommand::RefreshSystemProxy);
         }
-        mihomo_connection_pill(ui, mihomo.connection);
       });
     });
-    ui.add_space(18.0);
+    ui.add_space(14.0);
 
     ui.columns(2, |columns| {
       card(&mut columns[0], "Mihomo 核心", |ui| {
@@ -728,10 +883,14 @@ impl RsClashUi {
     let mihomo = self.snapshot.mihomo.clone();
     let view = Arc::clone(&mihomo.proxy_view);
     ui.horizontal(|ui| {
-      ui.vertical(|ui| {
-        ui.label(RichText::new("代理选择").size(24.0).strong());
-        ui.label(RichText::new("无歧义地选择、筛选和测速核心与 provider 节点").weak());
-      });
+      ui.label(
+        RichText::new(format!(
+          "{} 个代理组 · {} 个节点",
+          view.groups.len() + usize::from(view.global.is_some()),
+          view.records.len()
+        ))
+        .weak(),
+      );
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if mihomo.proxy_busy {
           ui.spinner();
@@ -1222,10 +1381,7 @@ impl RsClashUi {
   fn rules(&mut self, ui: &mut Ui) {
     let mihomo = self.snapshot.mihomo.clone();
     ui.horizontal(|ui| {
-      ui.vertical(|ui| {
-        ui.label(RichText::new("运行规则").size(24.0).strong());
-        ui.label(RichText::new("搜索 Mihomo 当前规则并更新 rule provider").weak());
-      });
+      ui.label(RichText::new(format!("当前加载 {} 条规则", mihomo.rules.len())).weak());
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if ui.button("刷新").clicked() {
           self.command(UiCommand::RefreshMihomo);
@@ -1353,9 +1509,6 @@ impl RsClashUi {
 
   fn connections(&mut self, ui: &mut Ui) {
     let mihomo = self.snapshot.mihomo.clone();
-    ui.label(RichText::new("连接").size(24.0).strong());
-    ui.label(RichText::new("活动与最近关闭连接的固定容量视图").weak());
-    ui.add_space(14.0);
     card(ui, "连接控制", |ui| {
       ui.horizontal_wrapped(|ui| {
         ui.selectable_value(&mut self.show_closed_connections, false, "活动");
@@ -1491,9 +1644,6 @@ impl RsClashUi {
 
   fn logs(&mut self, ui: &mut Ui) {
     let mihomo = self.snapshot.mihomo.clone();
-    ui.label(RichText::new("Mihomo 日志").size(24.0).strong());
-    ui.label(RichText::new("固定保留最近 10,000 条，并按 100 ms 批量发布").weak());
-    ui.add_space(14.0);
     card(ui, "日志控制", |ui| {
       ui.horizontal_wrapped(|ui| {
         egui::ComboBox::from_id_salt("log-level")
@@ -1569,10 +1719,7 @@ impl RsClashUi {
       .iter()
       .any(|profile| profile.source == ProfileSourceKind::Remote);
     ui.horizontal(|ui| {
-      ui.vertical(|ui| {
-        ui.label(RichText::new("订阅与配置").size(24.0).strong());
-        ui.label(RichText::new("导入本地 YAML 或远程订阅，并激活为当前运行配置").weak());
-      });
+      ui.label(RichText::new(format!("{} 个配置来源", profiles.items.len())).weak());
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
         if profiles.busy {
           ui.spinner();
@@ -3259,11 +3406,28 @@ fn format_update_age(updated_at: u64) -> String {
   }
 }
 
-fn status_pill(ui: &mut Ui, status: AppStatus) {
-  let (text, color) = match status {
-    AppStatus::Booting => ("启动中", Color32::from_rgb(196, 121, 0)),
-    AppStatus::Ready => ("后台已就绪", Color32::from_rgb(38, 162, 105)),
-    AppStatus::ShuttingDown => ("正在退出", Color32::from_rgb(192, 28, 40)),
+const fn page_description(page: Page) -> &'static str {
+  match page {
+    Page::Home => "运行状态与快捷控制",
+    Page::Proxies => "选择节点、测速与代理链",
+    Page::Profiles => "管理订阅和本地配置",
+    Page::Connections => "检查并控制实时连接",
+    Page::Rules => "查看运行规则与规则集",
+    Page::Logs => "查看 Mihomo 实时日志",
+    Page::Unlock => "检查流媒体与站点可用性",
+    Page::Settings => "配置应用、网络与 Mihomo",
+  }
+}
+
+fn core_status_pill(ui: &mut Ui, state: &CoreState) {
+  let tokens = theme::tokens(ui);
+  let (text, color) = match state {
+    CoreState::Stopped => ("已停止", tokens.text_muted),
+    CoreState::Starting => ("启动中", tokens.warning),
+    CoreState::Running { .. } => ("运行中", tokens.success),
+    CoreState::Reloading => ("加载中", tokens.warning),
+    CoreState::Stopping => ("停止中", tokens.warning),
+    CoreState::Failed { .. } => ("异常", tokens.danger),
   };
 
   Frame::new()
@@ -3441,16 +3605,16 @@ fn metric_chart(ui: &mut Ui, metrics: &[MetricPoint]) {
 }
 
 fn card(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui)) {
+  let tokens = theme::tokens(ui);
   Frame::new()
-    .fill(ui.visuals().faint_bg_color)
-    .stroke(Stroke::new(1.0, ui.visuals().window_stroke().color))
+    .fill(tokens.surface)
+    .stroke(Stroke::new(1.0, tokens.border))
     .corner_radius(12)
-    .inner_margin(18)
+    .inner_margin(egui::Margin::symmetric(18, 16))
     .show(ui, |ui| {
-      ui.set_min_height(92.0);
       ui.set_min_width((ui.available_width() - 1.0).max(240.0));
-      ui.label(RichText::new(title).size(15.0).strong());
-      ui.add_space(9.0);
+      ui.label(RichText::new(title).size(14.5).strong());
+      ui.add_space(8.0);
       contents(ui);
     });
 }

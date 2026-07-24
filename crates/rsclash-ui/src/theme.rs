@@ -1,7 +1,23 @@
 use egui::{
-  Color32, CornerRadius, FontId, Stroke, Style, TextStyle, Theme, ThemePreference, Visuals, vec2,
+  Color32, CornerRadius, FontId, Shadow, Stroke, Style, TextStyle, Theme, ThemePreference, Visuals,
+  vec2,
 };
 use rsclash_domain::ThemeMode;
+
+#[derive(Clone, Copy)]
+pub(crate) struct Tokens {
+  pub canvas: Color32,
+  pub sidebar: Color32,
+  pub surface: Color32,
+  pub surface_raised: Color32,
+  pub border: Color32,
+  pub text_muted: Color32,
+  pub accent: Color32,
+  pub accent_soft: Color32,
+  pub success: Color32,
+  pub warning: Color32,
+  pub danger: Color32,
+}
 
 pub(crate) fn install_styles(context: &egui::Context) {
   context.set_style_of(Theme::Light, adwaita_style(false));
@@ -17,21 +33,53 @@ pub(crate) fn apply_preference(context: &egui::Context, mode: ThemeMode) {
   context.set_theme(preference);
 }
 
+pub(crate) fn tokens(ui: &egui::Ui) -> Tokens {
+  if ui.visuals().dark_mode {
+    Tokens {
+      canvas: Color32::from_rgb(24, 25, 27),
+      sidebar: Color32::from_rgb(30, 31, 34),
+      surface: Color32::from_rgb(35, 36, 39),
+      surface_raised: Color32::from_rgb(42, 43, 47),
+      border: Color32::from_rgb(59, 60, 65),
+      text_muted: Color32::from_rgb(166, 167, 174),
+      accent: Color32::from_rgb(120, 174, 237),
+      accent_soft: Color32::from_rgb(39, 62, 87),
+      success: Color32::from_rgb(87, 200, 132),
+      warning: Color32::from_rgb(235, 174, 73),
+      danger: Color32::from_rgb(238, 111, 121),
+    }
+  } else {
+    Tokens {
+      canvas: Color32::from_rgb(247, 247, 248),
+      sidebar: Color32::from_rgb(242, 242, 244),
+      surface: Color32::from_rgb(255, 255, 255),
+      surface_raised: Color32::from_rgb(249, 249, 250),
+      border: Color32::from_rgb(220, 221, 224),
+      text_muted: Color32::from_rgb(101, 102, 109),
+      accent: Color32::from_rgb(45, 112, 187),
+      accent_soft: Color32::from_rgb(225, 237, 250),
+      success: Color32::from_rgb(38, 150, 90),
+      warning: Color32::from_rgb(190, 117, 24),
+      danger: Color32::from_rgb(192, 55, 67),
+    }
+  }
+}
+
 fn adwaita_style(dark: bool) -> Style {
   let mut style = Style::default();
-  style.spacing.item_spacing = vec2(8.0, 8.0);
-  style.spacing.button_padding = vec2(12.0, 7.0);
-  style.spacing.interact_size = vec2(40.0, 34.0);
-  style.spacing.window_margin = egui::Margin::same(12);
-  style.animation_time = 0.12;
+  style.spacing.item_spacing = vec2(8.0, 9.0);
+  style.spacing.button_padding = vec2(12.0, 8.0);
+  style.spacing.interact_size = vec2(40.0, 36.0);
+  style.spacing.window_margin = egui::Margin::same(16);
+  style.animation_time = 0.1;
   style.visuals = adwaita_visuals(dark);
   style.text_styles.insert(
     TextStyle::Heading,
-    FontId::new(26.0, egui::FontFamily::Proportional),
+    FontId::new(24.0, egui::FontFamily::Proportional),
   );
   style.text_styles.insert(
     TextStyle::Body,
-    FontId::new(14.5, egui::FontFamily::Proportional),
+    FontId::new(14.0, egui::FontFamily::Proportional),
   );
   style.text_styles.insert(
     TextStyle::Button,
@@ -46,52 +94,63 @@ fn adwaita_visuals(dark: bool) -> Visuals {
   } else {
     Visuals::light()
   };
-
-  let (window, panel, raised, hovered, active, border, text, weak_text, accent) = if dark {
-    (
-      Color32::from_rgb(30, 30, 32),
-      Color32::from_rgb(36, 36, 39),
-      Color32::from_rgb(44, 44, 48),
-      Color32::from_rgb(53, 53, 58),
-      Color32::from_rgb(61, 61, 67),
-      Color32::from_rgb(70, 70, 76),
-      Color32::from_rgb(244, 244, 245),
-      Color32::from_rgb(174, 174, 181),
-      Color32::from_rgb(53, 132, 228),
-    )
+  let token = if dark {
+    Tokens {
+      canvas: Color32::from_rgb(24, 25, 27),
+      sidebar: Color32::from_rgb(30, 31, 34),
+      surface: Color32::from_rgb(35, 36, 39),
+      surface_raised: Color32::from_rgb(42, 43, 47),
+      border: Color32::from_rgb(59, 60, 65),
+      text_muted: Color32::from_rgb(166, 167, 174),
+      accent: Color32::from_rgb(120, 174, 237),
+      accent_soft: Color32::from_rgb(39, 62, 87),
+      success: Color32::from_rgb(87, 200, 132),
+      warning: Color32::from_rgb(235, 174, 73),
+      danger: Color32::from_rgb(238, 111, 121),
+    }
   } else {
-    (
-      Color32::from_rgb(246, 245, 244),
-      Color32::from_rgb(250, 250, 250),
-      Color32::WHITE,
-      Color32::from_rgb(242, 242, 242),
-      Color32::from_rgb(232, 232, 232),
-      Color32::from_rgb(211, 210, 208),
-      Color32::from_rgb(36, 31, 49),
-      Color32::from_rgb(94, 92, 100),
-      Color32::from_rgb(28, 113, 216),
-    )
+    Tokens {
+      canvas: Color32::from_rgb(247, 247, 248),
+      sidebar: Color32::from_rgb(242, 242, 244),
+      surface: Color32::WHITE,
+      surface_raised: Color32::from_rgb(249, 249, 250),
+      border: Color32::from_rgb(220, 221, 224),
+      text_muted: Color32::from_rgb(101, 102, 109),
+      accent: Color32::from_rgb(45, 112, 187),
+      accent_soft: Color32::from_rgb(225, 237, 250),
+      success: Color32::from_rgb(38, 150, 90),
+      warning: Color32::from_rgb(190, 117, 24),
+      danger: Color32::from_rgb(192, 55, 67),
+    }
+  };
+
+  let text = if dark {
+    Color32::from_rgb(242, 242, 244)
+  } else {
+    Color32::from_rgb(32, 33, 37)
   };
 
   visuals.override_text_color = Some(text);
-  visuals.weak_text_color = Some(weak_text);
-  visuals.panel_fill = panel;
-  visuals.window_fill = window;
-  visuals.faint_bg_color = raised;
-  visuals.extreme_bg_color = if dark {
-    Color32::from_rgb(24, 24, 26)
-  } else {
-    Color32::from_rgb(238, 238, 238)
-  };
+  visuals.weak_text_color = Some(token.text_muted);
+  visuals.panel_fill = token.sidebar;
+  visuals.window_fill = token.canvas;
+  visuals.faint_bg_color = token.surface_raised;
+  visuals.extreme_bg_color = token.canvas;
   visuals.code_bg_color = visuals.extreme_bg_color;
-  visuals.window_stroke = Stroke::new(1.0, border);
+  visuals.window_stroke = Stroke::new(1.0, token.border);
   visuals.window_corner_radius = CornerRadius::same(12);
   visuals.menu_corner_radius = CornerRadius::same(10);
-  visuals.selection.bg_fill = accent;
-  visuals.selection.stroke = Stroke::new(1.0, Color32::WHITE);
-  visuals.hyperlink_color = accent;
-  visuals.warn_fg_color = Color32::from_rgb(230, 145, 56);
-  visuals.error_fg_color = Color32::from_rgb(224, 79, 95);
+  visuals.window_shadow = Shadow {
+    offset: [0, 5],
+    blur: 18,
+    spread: 0,
+    color: Color32::from_black_alpha(if dark { 70 } else { 22 }),
+  };
+  visuals.selection.bg_fill = token.accent;
+  visuals.selection.stroke = Stroke::new(1.0, token.surface);
+  visuals.hyperlink_color = token.accent;
+  visuals.warn_fg_color = token.warning;
+  visuals.error_fg_color = token.danger;
   visuals.button_frame = true;
   visuals.collapsing_header_frame = false;
   visuals.striped = false;
@@ -100,20 +159,20 @@ fn adwaita_visuals(dark: bool) -> Visuals {
     &mut visuals.widgets.noninteractive,
     &mut visuals.widgets.inactive,
   ] {
-    widget.bg_fill = raised;
-    widget.weak_bg_fill = raised;
-    widget.bg_stroke = Stroke::new(1.0, border);
+    widget.bg_fill = token.surface;
+    widget.weak_bg_fill = token.surface;
+    widget.bg_stroke = Stroke::new(1.0, token.border);
     widget.corner_radius = CornerRadius::same(8);
     widget.fg_stroke = Stroke::new(1.0, text);
   }
-  visuals.widgets.hovered.bg_fill = hovered;
-  visuals.widgets.hovered.weak_bg_fill = hovered;
-  visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, border);
+  visuals.widgets.hovered.bg_fill = token.surface_raised;
+  visuals.widgets.hovered.weak_bg_fill = token.surface_raised;
+  visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, token.border);
   visuals.widgets.hovered.corner_radius = CornerRadius::same(8);
   visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, text);
-  visuals.widgets.active.bg_fill = active;
-  visuals.widgets.active.weak_bg_fill = active;
-  visuals.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+  visuals.widgets.active.bg_fill = token.accent_soft;
+  visuals.widgets.active.weak_bg_fill = token.accent_soft;
+  visuals.widgets.active.bg_stroke = Stroke::new(1.0, token.accent);
   visuals.widgets.active.corner_radius = CornerRadius::same(8);
   visuals.widgets.active.fg_stroke = Stroke::new(1.0, text);
   visuals.widgets.open = visuals.widgets.active;
