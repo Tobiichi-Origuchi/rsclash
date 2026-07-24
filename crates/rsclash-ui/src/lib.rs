@@ -126,15 +126,6 @@ enum SettingsSection {
 }
 
 impl SettingsSection {
-  const ALL: [Self; 6] = [
-    Self::General,
-    Self::Proxy,
-    Self::Mihomo,
-    Self::DnsTun,
-    Self::Interface,
-    Self::Maintenance,
-  ];
-
   const fn label(self) -> &'static str {
     match self {
       Self::General => "常规",
@@ -239,6 +230,7 @@ pub struct RsClashUi {
   log_reverse: bool,
   log_level: StreamLogLevel,
   navigation_collapsed: bool,
+  settings_dialog: Option<SettingsSection>,
   settings_draft: AppSettings,
   settings_dirty: bool,
 }
@@ -319,6 +311,7 @@ impl RsClashUi {
       log_reverse: false,
       log_level: StreamLogLevel::Info,
       navigation_collapsed: false,
+      settings_dialog: None,
       settings_draft,
       settings_dirty: false,
     }
@@ -3127,43 +3120,154 @@ impl RsClashUi {
     let state = self.snapshot.settings.clone();
     let mut draft = self.settings_draft.clone();
     let mut action = None;
+    let mut requested_dialog = None;
     let viewport_width = ui.ctx().content_rect().width();
     let two_columns = geometry::settings_grid_columns(geometry::breakpoint(viewport_width)) == 2;
-    if two_columns {
-      ui.columns(2, |columns| {
-        for section in [
-          SettingsSection::General,
-          SettingsSection::Proxy,
-          SettingsSection::Mihomo,
-        ] {
-          settings_section(
-            &mut columns[0],
-            section,
-            &mut draft,
-            &self.snapshot,
-            &mut action,
-          );
-          columns[0].add_space(geometry::GRID_GAP);
+
+    let render_left = |ui: &mut Ui,
+                       draft: &mut AppSettings,
+                       action: &mut Option<SettingsUiAction>,
+                       requested_dialog: &mut Option<SettingsSection>| {
+      setting_list(ui, "系统设置", |ui| {
+        setting_switch_row(ui, "TUN 模式", &mut draft.tun_enabled);
+        let system_proxy = &self.snapshot.system_proxy;
+        if setting_action_row(
+          ui,
+          "系统代理",
+          if system_proxy.enabled {
+            "已开启"
+          } else {
+            "已关闭"
+          },
+        )
+        .clicked()
+        {
+          *action = Some(SettingsUiAction::ToggleSystemProxy(!system_proxy.enabled));
         }
-        for section in [
-          SettingsSection::DnsTun,
-          SettingsSection::Interface,
-          SettingsSection::Maintenance,
-        ] {
-          settings_section(
-            &mut columns[1],
-            section,
-            &mut draft,
-            &self.snapshot,
-            &mut action,
-          );
-          columns[1].add_space(geometry::GRID_GAP);
+        setting_switch_row(ui, "开机自启动", &mut draft.auto_launch);
+        setting_switch_row(ui, "静默启动", &mut draft.silent_start);
+      });
+      ui.add_space(geometry::GRID_GAP);
+      setting_list(ui, "Mihomo 设置", |ui| {
+        setting_switch_row(ui, "允许局域网连接", &mut draft.allow_lan);
+        if setting_action_row(
+          ui,
+          "DNS 设置",
+          if draft.dns.enabled {
+            "已启用"
+          } else {
+            "未启用"
+          },
+        )
+        .clicked()
+        {
+          *requested_dialog = Some(SettingsSection::DnsTun);
+        }
+        setting_switch_row(ui, "IPv6", &mut draft.ipv6);
+        setting_switch_row(ui, "统一延迟", &mut draft.unified_delay);
+        settings_log_level_row(ui, &mut draft.mihomo_log_level);
+        if setting_action_row(ui, "端口设置", &draft.ports.mixed.to_string()).clicked()
+          || setting_action_row(ui, "外部控制器", &draft.controller.address).clicked()
+        {
+          *requested_dialog = Some(SettingsSection::Mihomo);
+        }
+        if setting_action_row(
+          ui,
+          "网络、Tunnels 与高级配置",
+          draft.network_interface.as_deref().unwrap_or("自动"),
+        )
+        .clicked()
+        {
+          *requested_dialog = Some(SettingsSection::DnsTun);
         }
       });
-    } else {
-      for section in SettingsSection::ALL {
-        settings_section(ui, section, &mut draft, &self.snapshot, &mut action);
+    };
+
+    let render_right =
+      |ui: &mut Ui, draft: &mut AppSettings, requested_dialog: &mut Option<SettingsSection>| {
+        setting_list(ui, "应用设置", |ui| {
+          settings_theme_row(ui, &mut draft.theme);
+          setting_switch_row(ui, "系统托盘", &mut draft.show_tray);
+          setting_switch_row(ui, "流量图表", &mut draft.traffic_graph);
+          setting_switch_row(ui, "内存用量", &mut draft.memory_usage);
+          setting_switch_row(ui, "自动关闭连接", &mut draft.auto_close_connections);
+          setting_switch_row(ui, "Wayland 全局快捷键", &mut draft.global_hotkeys);
+          if setting_action_row(ui, "界面、首页与连接列", "配置").clicked() {
+            *requested_dialog = Some(SettingsSection::Interface);
+          }
+        });
         ui.add_space(geometry::GRID_GAP);
+        setting_list(ui, "高级设置", |ui| {
+          if setting_action_row(
+            ui,
+            "特权服务",
+            if self.snapshot.settings.service.reachable {
+              "运行正常"
+            } else if self.snapshot.settings.service.installed {
+              "不可用"
+            } else {
+              "未安装"
+            },
+          )
+          .clicked()
+          {
+            *requested_dialog = Some(SettingsSection::Proxy);
+          }
+          if setting_action_row(
+            ui,
+            "Mihomo 核心",
+            match draft.core_channel {
+              CoreChannel::Stable => "Stable",
+              CoreChannel::Alpha => "Alpha",
+            },
+          )
+          .clicked()
+          {
+            *requested_dialog = Some(SettingsSection::Maintenance);
+          }
+          if setting_action_row(ui, "代理控制", "PAC、绕过与服务").clicked() {
+            *requested_dialog = Some(SettingsSection::Proxy);
+          }
+          if setting_action_row(ui, "应用行为", "启动、托盘与脚本").clicked() {
+            *requested_dialog = Some(SettingsSection::General);
+          }
+          if setting_action_row(ui, "目录、Web UI 与诊断", "维护").clicked() {
+            *requested_dialog = Some(SettingsSection::Maintenance);
+          }
+        });
+      };
+
+    if two_columns {
+      ui.columns(2, |columns| {
+        render_left(
+          &mut columns[0],
+          &mut draft,
+          &mut action,
+          &mut requested_dialog,
+        );
+        render_right(&mut columns[1], &mut draft, &mut requested_dialog);
+      });
+    } else {
+      render_left(ui, &mut draft, &mut action, &mut requested_dialog);
+      ui.add_space(geometry::GRID_GAP);
+      render_right(ui, &mut draft, &mut requested_dialog);
+    }
+
+    if let Some(section) = requested_dialog {
+      self.settings_dialog = Some(section);
+    }
+    if let Some(section) = self.settings_dialog {
+      let mut open = true;
+      egui::Window::new(section.label())
+        .open(&mut open)
+        .default_width(620.0)
+        .default_height(560.0)
+        .vscroll(true)
+        .show(ui.ctx(), |ui| {
+          settings_section(ui, section, &mut draft, &self.snapshot, &mut action);
+        });
+      if !open {
+        self.settings_dialog = None;
       }
     }
 
@@ -3248,6 +3352,130 @@ impl RsClashUi {
       },
     }
   }
+}
+
+fn setting_list(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui)) {
+  let tokens = theme::tokens(ui);
+  let width = ui.available_width();
+  Frame::new()
+    .fill(tokens.surface)
+    .corner_radius(geometry::GLOBAL_RADIUS)
+    .show(ui, |ui| {
+      ui.set_width(width);
+      ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+      ui.allocate_ui_with_layout(
+        egui::vec2(width, 48.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+          ui.add_space(16.0);
+          ui.label(RichText::new(title).size(16.0).strong());
+        },
+      );
+      contents(ui);
+    });
+}
+
+fn setting_switch_row(ui: &mut Ui, label: &str, value: &mut bool) {
+  let width = ui.available_width();
+  ui.allocate_ui_with_layout(
+    egui::vec2(width, 48.0),
+    Layout::left_to_right(Align::Center),
+    |ui| {
+      ui.add_space(16.0);
+      ui.label(RichText::new(label).size(14.0));
+      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.add_space(12.0);
+        ui.checkbox(value, "");
+      });
+    },
+  );
+}
+
+fn setting_action_row(ui: &mut Ui, label: &str, value: &str) -> egui::Response {
+  let (rect, response) =
+    ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), egui::Sense::click());
+  if response.hovered() {
+    ui.painter()
+      .rect_filled(rect, 0.0, theme::tokens(ui).surface_raised);
+  }
+  ui.painter().text(
+    egui::pos2(rect.left() + 16.0, rect.center().y),
+    egui::Align2::LEFT_CENTER,
+    label,
+    egui::FontId::proportional(14.0),
+    ui.visuals().text_color(),
+  );
+  ui.painter().text(
+    egui::pos2(rect.right() - 36.0, rect.center().y),
+    egui::Align2::RIGHT_CENTER,
+    value,
+    egui::FontId::proportional(12.0),
+    theme::tokens(ui).text_muted,
+  );
+  ui.painter().text(
+    egui::pos2(rect.right() - 16.0, rect.center().y),
+    egui::Align2::CENTER_CENTER,
+    "›",
+    egui::FontId::proportional(20.0),
+    theme::tokens(ui).text_muted,
+  );
+  response
+}
+
+fn settings_theme_row(ui: &mut Ui, theme: &mut ThemeMode) {
+  let width = ui.available_width();
+  ui.allocate_ui_with_layout(
+    egui::vec2(width, 48.0),
+    Layout::left_to_right(Align::Center),
+    |ui| {
+      ui.add_space(16.0);
+      ui.label("主题");
+      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.add_space(12.0);
+        egui::ComboBox::from_id_salt("settings-summary-theme")
+          .width(92.0)
+          .selected_text(match theme {
+            ThemeMode::System => "跟随系统",
+            ThemeMode::Light => "浅色",
+            ThemeMode::Dark => "深色",
+          })
+          .show_ui(ui, |ui| {
+            ui.selectable_value(theme, ThemeMode::System, "跟随系统");
+            ui.selectable_value(theme, ThemeMode::Light, "浅色");
+            ui.selectable_value(theme, ThemeMode::Dark, "深色");
+          });
+      });
+    },
+  );
+}
+
+fn settings_log_level_row(ui: &mut Ui, level: &mut StreamLogLevel) {
+  let width = ui.available_width();
+  ui.allocate_ui_with_layout(
+    egui::vec2(width, 48.0),
+    Layout::left_to_right(Align::Center),
+    |ui| {
+      ui.add_space(16.0);
+      ui.label("日志等级");
+      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        ui.add_space(12.0);
+        egui::ComboBox::from_id_salt("settings-summary-log-level")
+          .width(92.0)
+          .selected_text(stream_log_level_label(*level))
+          .show_ui(ui, |ui| {
+            for value in [
+              StreamLogLevel::Debug,
+              StreamLogLevel::Info,
+              StreamLogLevel::Warning,
+              StreamLogLevel::Error,
+              StreamLogLevel::Silent,
+            ] {
+              ui.selectable_value(level, value, stream_log_level_label(value));
+            }
+          });
+      });
+    },
+  );
 }
 
 fn settings_section(
