@@ -1004,7 +1004,7 @@ fn resolve_remote_input(name: &str, input: &str) -> Result<ResolvedRemoteInput, 
     .map_err(|error| format!("invalid subscription or deep link: {error}"))?;
   let (url, deep_link_name) = match parsed.scheme() {
     "http" | "https" => (parsed, None),
-    "clash" | "clash-verge" => {
+    "rsclash" | "clash" | "clash-verge" => {
       let mut url = None;
       let mut deep_link_name = None;
       for (key, value) in parsed.query_pairs() {
@@ -1024,7 +1024,11 @@ fn resolve_remote_input(name: &str, input: &str) -> Result<ResolvedRemoteInput, 
         deep_link_name,
       )
     },
-    _ => return Err("subscription input must use HTTP(S), clash, or clash-verge".to_string()),
+    _ => {
+      return Err(
+        "subscription input must use HTTP(S), rsclash, clash, or clash-verge".to_string(),
+      );
+    },
   };
   if !matches!(url.scheme(), "http" | "https") {
     return Err("nested subscription URL must use HTTP(S)".to_string());
@@ -2682,7 +2686,7 @@ mod tests {
 
     let deep_link = resolve_remote_input(
       "",
-      "clash://install-config?url=https%3A%2F%2Fsub.example.com%2Fconfig%3Ftoken%3Dsecret&name=Work",
+      "rsclash://install-config?url=https%3A%2F%2Fsub.example.com%2Fconfig%3Ftoken%3Dsecret&name=Work",
     )
     .expect("deep link should resolve");
     assert_eq!(deep_link.name, "Work");

@@ -13,14 +13,14 @@ use std::{
 use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, Stroke, Ui};
 use rsclash_app::{AppClient, AppEventReceiver, ClientError};
 use rsclash_domain::{
-  AppEvent, AppLanguage, AppSettings, AppSnapshot, AppStatus, ApplicationDirectory,
-  ConnectionSnapshot, CoreChannel, CoreRunMode, CoreState, DnsEnhancedMode, LogSnapshot,
-  MetricPoint, MihomoConnection, MihomoSnapshot, NavigationLayout, Page, ProfileDiagnosticStage,
-  ProfileDiagnostics, ProfileDownloadProxy, ProfileOperationKind, ProfileQrCode, ProfileSourceKind,
-  ProxyCapabilities, ProxyGroupLayout, ProxyGroupView, ProxyMemberSnapshot,
-  ProxyMemberUnresolvedReason, ProxyMode, ProxyNodeSnapshot, ProxyNodeSource, ProxyViewV1,
-  RemoteProfileOptions, RuleSnapshot, SensitiveString, StreamLogLevel, SystemProxyView, ThemeMode,
-  TrayClickAction, TunStack, UiCommand,
+  AppEvent, AppSettings, AppSnapshot, AppStatus, ApplicationDirectory, ConnectionSnapshot,
+  CoreChannel, CoreRunMode, CoreState, DnsEnhancedMode, LogSnapshot, MetricPoint, MihomoConnection,
+  MihomoSnapshot, NavigationLayout, Page, ProfileDiagnosticStage, ProfileDiagnostics,
+  ProfileDownloadProxy, ProfileOperationKind, ProfileQrCode, ProfileSourceKind, ProxyCapabilities,
+  ProxyGroupLayout, ProxyGroupView, ProxyMemberSnapshot, ProxyMemberUnresolvedReason, ProxyMode,
+  ProxyNodeSnapshot, ProxyNodeSource, ProxyViewV1, RemoteProfileOptions, RuleSnapshot,
+  SensitiveString, StreamLogLevel, SystemProxyView, ThemeMode, TrayClickAction, TunStack,
+  UiCommand,
 };
 
 struct ProfileEditor {
@@ -1147,8 +1147,18 @@ impl RsClashUi {
       None
     };
 
-    for group in proxy_groups(&view) {
-      self.proxy_group_view(ui, group, &view, regex.as_ref(), mihomo.proxy_busy);
+    let groups = proxy_groups(&view).collect::<Vec<_>>();
+    let requested_columns = usize::from(self.snapshot.settings.value.proxy_layout_columns.max(1));
+    let fitting_columns = ((ui.available_width() / 360.0).floor() as usize).max(1);
+    let column_count = requested_columns
+      .min(fitting_columns)
+      .min(groups.len().max(1));
+    for row in groups.chunks(column_count) {
+      ui.columns(column_count, |columns| {
+        for (column, group) in columns.iter_mut().zip(row) {
+          self.proxy_group_view(column, group, &view, regex.as_ref(), mihomo.proxy_busy);
+        }
+      });
       ui.add_space(12.0);
     }
 
@@ -2895,7 +2905,7 @@ fn settings_section(
 }
 
 fn settings_general(ui: &mut Ui, draft: &mut AppSettings) {
-  card(ui, "外观与语言", |ui| {
+  card(ui, "外观", |ui| {
     preference_label(ui, "颜色模式", "跟随系统或固定使用浅色/深色主题");
     ui.horizontal_wrapped(|ui| {
       for (mode, label) in [
@@ -2906,23 +2916,6 @@ fn settings_general(ui: &mut Ui, draft: &mut AppSettings) {
         ui.selectable_value(&mut draft.theme, mode, label);
       }
     });
-    ui.separator();
-    preference_label(ui, "界面语言", "语言资源将在后续本地化阶段继续扩充");
-    egui::ComboBox::from_id_salt("settings-language")
-      .selected_text(match draft.language {
-        AppLanguage::System => "跟随系统",
-        AppLanguage::ChineseSimplified => "简体中文",
-        AppLanguage::English => "English",
-      })
-      .show_ui(ui, |ui| {
-        ui.selectable_value(&mut draft.language, AppLanguage::System, "跟随系统");
-        ui.selectable_value(
-          &mut draft.language,
-          AppLanguage::ChineseSimplified,
-          "简体中文",
-        );
-        ui.selectable_value(&mut draft.language, AppLanguage::English, "English");
-      });
   });
   ui.add_space(12.0);
   card(ui, "启动", |ui| {
@@ -3468,7 +3461,7 @@ fn settings_maintenance(
   });
   ui.add_space(12.0);
   card(ui, "桌面集成", |ui| {
-    if ui.button("注册 clash:// 深链").clicked() {
+    if ui.button("注册订阅深链").clicked() {
       *action = Some(SettingsUiAction::RegisterDeepLinks);
     }
     if ui

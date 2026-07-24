@@ -202,6 +202,7 @@ fn queue_import_argument(client: &AppClient, argument: std::ffi::OsString) {
   let value = argument.to_string_lossy();
   if value.starts_with("http://")
     || value.starts_with("https://")
+    || value.starts_with("rsclash://")
     || value.starts_with("clash://")
     || value.starts_with("clash-verge://")
   {

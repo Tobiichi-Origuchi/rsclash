@@ -74,7 +74,7 @@ impl LinuxDesktopIntegration {
        Icon=io.github.rsclash\n\
        Terminal=false\n\
        Categories=Network;\n\
-       MimeType=x-scheme-handler/clash;x-scheme-handler/clash-verge;\n\
+       MimeType=x-scheme-handler/rsclash;x-scheme-handler/clash;x-scheme-handler/clash-verge;\n\
        StartupNotify=true\n",
       desktop_exec_quote(&self.executable),
       argument
@@ -119,7 +119,11 @@ impl DesktopIntegration for LinuxDesktopIntegration {
     let contents = self.desktop_entry(false);
     tokio::task::spawn_blocking(move || {
       atomic_write(&path, contents.as_bytes(), 0o644)?;
-      for scheme in ["x-scheme-handler/clash", "x-scheme-handler/clash-verge"] {
+      for scheme in [
+        "x-scheme-handler/rsclash",
+        "x-scheme-handler/clash",
+        "x-scheme-handler/clash-verge",
+      ] {
         run_command("xdg-mime", ["default", DESKTOP_FILE_NAME, scheme])?;
       }
       Ok(())

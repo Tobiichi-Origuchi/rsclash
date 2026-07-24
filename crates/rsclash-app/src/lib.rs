@@ -1191,6 +1191,11 @@ impl Coordinator {
     match event {
       SettingsBridgeEvent::Snapshot(snapshot) => {
         let snapshot = *snapshot;
+        let system_proxy_target_changed = self.snapshot.settings.value.system_proxy_bypass
+          != snapshot.value.system_proxy_bypass
+          || self.snapshot.settings.value.pac_url != snapshot.value.pac_url;
+        let reapply_system_proxy =
+          system_proxy_target_changed && self.snapshot.system_proxy.enabled;
         let theme_changed = self.snapshot.theme != snapshot.value.theme;
         self.snapshot.theme = snapshot.value.theme;
         self.snapshot.settings = snapshot;
@@ -1211,6 +1216,10 @@ impl Coordinator {
               .try_into()
               .unwrap_or(u32::MAX),
           });
+        }
+        if reapply_system_proxy {
+          let _ = self.set_system_proxy(false);
+          let _ = self.set_system_proxy(true);
         }
         self.ensure_desired_system_proxy();
         self.publish_snapshot();

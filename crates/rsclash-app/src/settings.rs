@@ -392,7 +392,18 @@ async fn open_web_ui(settings: &AppSettings) -> Result<(), String> {
   if !settings.controller.enabled {
     return Err("请先启用外部控制器".to_string());
   }
-  let url = format!("http://{}/ui/", settings.controller.address);
+  let mut address = settings
+    .controller
+    .address
+    .parse::<std::net::SocketAddr>()
+    .map_err(|_| "外部控制器必须使用 IP:端口".to_string())?;
+  if address.ip().is_unspecified() {
+    address.set_ip(match address.ip() {
+      std::net::IpAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+      std::net::IpAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+    });
+  }
+  let url = format!("http://{address}/ui/");
   let status = Command::new("xdg-open")
     .arg(url)
     .status()

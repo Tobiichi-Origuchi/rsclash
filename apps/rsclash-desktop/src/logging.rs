@@ -63,19 +63,20 @@ impl RotatingLogWriter {
         diagnostic(format_args!("using default log limits: {error}"));
         AppSettings::default()
       });
-    Self::open(config_root.join("logs"), &settings)
+    Self::open(
+      config_root.join("logs"),
+      &settings,
+      Some(config_root.join("settings.yaml")),
+    )
   }
 
-  fn open(directory: PathBuf, settings: &AppSettings) -> io::Result<Self> {
+  fn open(
+    directory: PathBuf,
+    settings: &AppSettings,
+    settings_path: Option<PathBuf>,
+  ) -> io::Result<Self> {
     create_private_directory(&directory)?;
-    let max_bytes = settings
-      .app_log_max_size_mib
-      .clamp(1, 1_024)
-      .saturating_mul(1024 * 1024);
-    let max_count = settings.app_log_max_count.clamp(1, 100);
-    let retention = Duration::from_secs(
-      u64::from(settings.app_log_retention_days.clamp(1, 365)).saturating_mul(24 * 60 * 60),
-    );
+    let (max_bytes, max_count, retention) = log_limits(settings);
     let active = directory.join(ACTIVE_LOG);
     reject_symlink(&active)?;
     let file = open_private_append(&active)?;
@@ -89,6 +90,8 @@ impl RotatingLogWriter {
       max_count,
       retention,
       sequence: 0,
+      settings_path,
+      last_settings_check: UNIX_EPOCH,
     };
     state.prune()?;
     Ok(Self {
@@ -139,16 +142,45 @@ struct LogState {
   max_count: usize,
   retention: Duration,
   sequence: u64,
+  settings_path: Option<PathBuf>,
+  last_settings_check: SystemTime,
 }
 
 impl LogState {
   fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+    self.refresh_limits()?;
     if self.bytes > 0 && self.bytes.saturating_add(buffer.len() as u64) > self.max_bytes {
       self.rotate()?;
     }
     let written = self.file.write(buffer)?;
     self.bytes = self.bytes.saturating_add(written as u64);
     Ok(written)
+  }
+
+  fn refresh_limits(&mut self) -> io::Result<()> {
+    let now = SystemTime::now();
+    if now
+      .duration_since(self.last_settings_check)
+      .is_ok_and(|elapsed| elapsed < Duration::from_secs(1))
+    {
+      return Ok(());
+    }
+    self.last_settings_check = now;
+    let Some(path) = self.settings_path.as_ref() else {
+      return Ok(());
+    };
+    match fs::symlink_metadata(path) {
+      Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => return Ok(()),
+      Ok(_) => {},
+      Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+      Err(error) => return Err(error),
+    }
+    let source = fs::read_to_string(path)?;
+    let Ok(settings) = rsclash_config::from_yaml::<AppSettings>(&source) else {
+      return Ok(());
+    };
+    (self.max_bytes, self.max_count, self.retention) = log_limits(&settings);
+    self.prune()
   }
 
   fn rotate(&mut self) -> io::Result<()> {
@@ -206,6 +238,19 @@ impl LogState {
     }
     Ok(())
   }
+}
+
+fn log_limits(settings: &AppSettings) -> (u64, usize, Duration) {
+  (
+    settings
+      .app_log_max_size_mib
+      .clamp(1, 1_024)
+      .saturating_mul(1024 * 1024),
+    settings.app_log_max_count.clamp(1, 100),
+    Duration::from_secs(
+      u64::from(settings.app_log_retention_days.clamp(1, 365)).saturating_mul(24 * 60 * 60),
+    ),
+  )
 }
 
 fn create_private_directory(path: &Path) -> io::Result<()> {
@@ -276,7 +321,7 @@ mod tests {
       ..AppSettings::default()
     };
     let writer =
-      RotatingLogWriter::open(directory.clone(), &settings).expect("log writer should open");
+      RotatingLogWriter::open(directory.clone(), &settings, None).expect("log writer should open");
     let mut writer = super::LogWriterGuard {
       state: writer.state,
     };
