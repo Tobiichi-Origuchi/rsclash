@@ -209,6 +209,7 @@ pub struct RsClashUi {
   proxy_regex: bool,
   proxy_whole_word: bool,
   proxy_detailed: bool,
+  proxy_filter_visible: bool,
   proxy_sort: ProxySort,
   expanded_proxy_groups: BTreeSet<String>,
   locate_proxy: Option<(String, String)>,
@@ -222,6 +223,7 @@ pub struct RsClashUi {
   pending_rule_append: Option<String>,
   connection_search: String,
   show_closed_connections: bool,
+  connection_table_layout: bool,
   connection_sort: ConnectionSort,
   connection_show_process: bool,
   connection_show_rule: bool,
@@ -291,6 +293,7 @@ impl RsClashUi {
       proxy_regex: false,
       proxy_whole_word: false,
       proxy_detailed,
+      proxy_filter_visible: false,
       proxy_sort: ProxySort::default(),
       expanded_proxy_groups: BTreeSet::new(),
       locate_proxy: None,
@@ -304,6 +307,7 @@ impl RsClashUi {
       pending_rule_append: None,
       connection_search: String::new(),
       show_closed_connections: false,
+      connection_table_layout: false,
       connection_sort: ConnectionSort::default(),
       connection_show_process,
       connection_show_rule,
@@ -699,7 +703,7 @@ impl RsClashUi {
     }
     let full = matches!(
       self.snapshot.page,
-      Page::Connections | Page::Rules | Page::Logs
+      Page::Profiles | Page::Connections | Page::Rules | Page::Logs
     );
     if full {
       ui.scope(|ui| {
@@ -1016,6 +1020,23 @@ impl RsClashUi {
           .clicked()
         {
           self.command(UiCommand::CloseAllConnections);
+        }
+        if header_icon_button(
+          ui,
+          if self.connection_table_layout {
+            "☷"
+          } else {
+            "▦"
+          },
+          if self.connection_table_layout {
+            "列表视图"
+          } else {
+            "表格视图"
+          },
+        )
+        .clicked()
+        {
+          self.connection_table_layout = !self.connection_table_layout;
         }
         ui.label(format!(
           "↑ {}  ↓ {}",
@@ -1738,9 +1759,10 @@ impl RsClashUi {
     let (outer, _) =
       ui.allocate_exact_size(egui::vec2(ui.available_width(), 76.0), egui::Sense::hover());
     let header = outer.shrink2(egui::vec2(8.0, 4.0));
-    let tools = egui::Rect::from_center_size(
-      egui::pos2(header.right() - 80.0, header.center().y),
-      egui::vec2(126.0, 36.0),
+    let tools_width = 250.0_f32.min((header.width() - 48.0).max(0.0));
+    let tools = egui::Rect::from_min_max(
+      egui::pos2(header.right() - tools_width, header.top()),
+      header.right_bottom(),
     );
     let toggle_rect =
       egui::Rect::from_min_max(header.min, egui::pos2(tools.left() - 4.0, header.bottom()));
@@ -1774,27 +1796,57 @@ impl RsClashUi {
       egui::FontId::proportional(13.0),
       tokens.text_muted,
     );
-    let test_rect = egui::Rect::from_center_size(
-      egui::pos2(header.right() - 80.0, header.center().y),
-      egui::vec2(72.0, 30.0),
+
+    let mut tool_x = header.right() - 244.0;
+    let mut tool_response = |name: &'static str, symbol: &'static str, tooltip: &'static str| {
+      let rect = egui::Rect::from_min_size(
+        egui::pos2(tool_x, header.center().y - 15.0),
+        egui::Vec2::splat(30.0),
+      );
+      tool_x += 34.0;
+      proxy_tool_button(ui, rect, (&group.name, name), symbol, tooltip)
+    };
+    let locate = tool_response("locate", "⌾", "定位当前代理");
+    let test = tool_response("test", "⌁", "测速本组");
+    let sort = tool_response(
+      "sort",
+      match self.proxy_sort {
+        ProxySort::Configuration => "⇅",
+        ProxySort::Name => "A",
+        ProxySort::Delay => "◷",
+      },
+      "切换排序",
     );
-    let test = ui.interact(
-      test_rect,
-      ui.id().with(("test-proxy-group", &group.name)),
-      egui::Sense::click(),
+    let _url = tool_response("url", "◉", "延迟测试地址");
+    let detail = tool_response(
+      "detail",
+      if self.proxy_detailed { "◉" } else { "○" },
+      "显示代理详情",
     );
-    if test.hovered() {
-      ui.painter().rect_filled(test_rect, 6.0, tokens.accent_soft);
-    }
+    let filter = tool_response(
+      "filter",
+      if self.proxy_filter_visible {
+        "▼"
+      } else {
+        "▽"
+      },
+      "过滤代理",
+    );
+    let count_rect = egui::Rect::from_center_size(
+      egui::pos2(header.right() - 54.0, header.center().y),
+      egui::vec2(42.0, 24.0),
+    );
+    ui.painter()
+      .rect_filled(count_rect, 12.0, tokens.accent_soft);
     ui.painter().text(
-      test_rect.center(),
+      count_rect.center(),
       egui::Align2::CENTER_CENTER,
-      "测速本组",
+      group.members.len().to_string(),
       egui::FontId::proportional(12.0),
       tokens.accent,
     );
     ui.painter().text(
-      egui::pos2(header.right() - 20.0, header.center().y),
+      egui::pos2(header.right() - 18.0, header.center().y),
       egui::Align2::CENTER_CENTER,
       if expanded { "⌃" } else { "⌄" },
       egui::FontId::proportional(20.0),
@@ -1807,10 +1859,33 @@ impl RsClashUi {
         self.expanded_proxy_groups.insert(group.name.clone());
       }
     }
+    if locate.clicked() {
+      self.expanded_proxy_groups.insert(group.name.clone());
+      if let Some(selected) = group.selected.as_ref() {
+        self.locate_proxy = Some((group.name.clone(), selected.clone()));
+      }
+    }
     if test.clicked() && !busy {
+      self.expanded_proxy_groups.insert(group.name.clone());
       self.command(UiCommand::TestProxyGroup {
         name: group.name.clone(),
       });
+    }
+    if sort.clicked() {
+      self.expanded_proxy_groups.insert(group.name.clone());
+      self.proxy_sort = match self.proxy_sort {
+        ProxySort::Configuration => ProxySort::Delay,
+        ProxySort::Delay => ProxySort::Name,
+        ProxySort::Name => ProxySort::Configuration,
+      };
+    }
+    if detail.clicked() {
+      self.expanded_proxy_groups.insert(group.name.clone());
+      self.proxy_detailed = !self.proxy_detailed;
+    }
+    if filter.clicked() {
+      self.expanded_proxy_groups.insert(group.name.clone());
+      self.proxy_filter_visible = !self.proxy_filter_visible;
     }
     if !expanded {
       return;
@@ -1821,23 +1896,63 @@ impl RsClashUi {
       Layout::left_to_right(Align::Center),
       |ui| {
         ui.add_space(16.0);
-        ui.add_sized(
-          [(ui.available_width() - 250.0).max(100.0), 36.0],
-          egui::TextEdit::singleline(&mut self.proxy_search).hint_text("过滤"),
-        );
-        egui::ComboBox::from_id_salt(("proxy-sort", &group.name))
-          .width(92.0)
-          .selected_text(match self.proxy_sort {
-            ProxySort::Configuration => "默认排序",
-            ProxySort::Name => "名称",
-            ProxySort::Delay => "延迟",
-          })
-          .show_ui(ui, |ui| {
-            ui.selectable_value(&mut self.proxy_sort, ProxySort::Configuration, "默认排序");
-            ui.selectable_value(&mut self.proxy_sort, ProxySort::Name, "名称");
-            ui.selectable_value(&mut self.proxy_sort, ProxySort::Delay, "延迟");
+        if self.proxy_filter_visible {
+          let filter_width = (ui.available_width() - 236.0).max(72.0);
+          ui.add_sized(
+            [filter_width, 36.0],
+            egui::TextEdit::singleline(&mut self.proxy_search).hint_text("过滤"),
+          );
+        }
+        if header_icon_button(ui, "⌾", "定位当前代理").clicked()
+          && let Some(selected) = group.selected.as_ref()
+        {
+          self.locate_proxy = Some((group.name.clone(), selected.clone()));
+        }
+        if header_icon_button(ui, "⌁", "测速本组").clicked() && !busy {
+          self.command(UiCommand::TestProxyGroup {
+            name: group.name.clone(),
           });
-        ui.checkbox(&mut self.proxy_regex, ".*");
+        }
+        if header_icon_button(
+          ui,
+          match self.proxy_sort {
+            ProxySort::Configuration => "⇅",
+            ProxySort::Name => "A",
+            ProxySort::Delay => "◷",
+          },
+          "切换排序",
+        )
+        .clicked()
+        {
+          self.proxy_sort = match self.proxy_sort {
+            ProxySort::Configuration => ProxySort::Delay,
+            ProxySort::Delay => ProxySort::Name,
+            ProxySort::Name => ProxySort::Configuration,
+          };
+        }
+        header_icon_button(ui, "◉", "延迟测试地址");
+        if header_icon_button(
+          ui,
+          if self.proxy_detailed { "◉" } else { "○" },
+          "显示代理详情",
+        )
+        .clicked()
+        {
+          self.proxy_detailed = !self.proxy_detailed;
+        }
+        if header_icon_button(
+          ui,
+          if self.proxy_filter_visible {
+            "▼"
+          } else {
+            "▽"
+          },
+          "过滤代理",
+        )
+        .clicked()
+        {
+          self.proxy_filter_visible = !self.proxy_filter_visible;
+        }
       },
     );
 
@@ -1900,11 +2015,10 @@ impl RsClashUi {
       },
     );
     if selected {
-      ui.painter().rect_stroke(
-        rect,
+      ui.painter().rect_filled(
+        egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 3.0, rect.bottom())),
         6.0,
-        Stroke::new(1.0, tokens.accent),
-        egui::StrokeKind::Inside,
+        tokens.accent,
       );
     }
     ui.painter().text(
@@ -1914,22 +2028,7 @@ impl RsClashUi {
       egui::FontId::proportional(14.0),
       ui.visuals().text_color(),
     );
-    ui.painter().text(
-      egui::pos2(rect.left() + 12.0, rect.center().y + 11.0),
-      egui::Align2::LEFT_CENTER,
-      if self.proxy_detailed {
-        format!(
-          "{} · {} · {}",
-          item.kind,
-          item.source,
-          proxy_capability_label(&item.capabilities)
-        )
-      } else {
-        item.kind.clone()
-      },
-      egui::FontId::proportional(11.0),
-      tokens.text_muted,
-    );
+    paint_proxy_tags(ui, rect, item, self.proxy_detailed);
     ui.painter().text(
       egui::pos2(rect.right() - 12.0, rect.center().y),
       egui::Align2::RIGHT_CENTER,
@@ -2178,28 +2277,30 @@ impl RsClashUi {
         {
           self.show_closed_connections = true;
         }
-        egui::ComboBox::from_id_salt("connection-order")
-          .width(90.0)
-          .selected_text(match self.connection_sort {
-            ConnectionSort::Traffic => "默认排序",
-            ConnectionSort::Destination => "目标",
-            ConnectionSort::Process => "进程",
-            ConnectionSort::Started => "时间",
-          })
-          .show_ui(ui, |ui| {
-            ui.selectable_value(
-              &mut self.connection_sort,
-              ConnectionSort::Traffic,
-              "默认排序",
-            );
-            ui.selectable_value(
-              &mut self.connection_sort,
-              ConnectionSort::Destination,
-              "目标",
-            );
-            ui.selectable_value(&mut self.connection_sort, ConnectionSort::Process, "进程");
-            ui.selectable_value(&mut self.connection_sort, ConnectionSort::Started, "时间");
-          });
+        if !self.connection_table_layout {
+          egui::ComboBox::from_id_salt("connection-order")
+            .width(90.0)
+            .selected_text(match self.connection_sort {
+              ConnectionSort::Traffic => "默认排序",
+              ConnectionSort::Destination => "目标",
+              ConnectionSort::Process => "进程",
+              ConnectionSort::Started => "时间",
+            })
+            .show_ui(ui, |ui| {
+              ui.selectable_value(
+                &mut self.connection_sort,
+                ConnectionSort::Traffic,
+                "默认排序",
+              );
+              ui.selectable_value(
+                &mut self.connection_sort,
+                ConnectionSort::Destination,
+                "目标",
+              );
+              ui.selectable_value(&mut self.connection_sort, ConnectionSort::Process, "进程");
+              ui.selectable_value(&mut self.connection_sort, ConnectionSort::Started, "时间");
+            });
+        }
         ui.add_sized(
           [
             (ui.available_width() - geometry::PAGE_CONTENT_HORIZONTAL_MARGIN).max(40.0),
@@ -2221,19 +2322,36 @@ impl RsClashUi {
       return;
     }
 
-    ScrollArea::vertical()
-      .id_salt("cvr-connections-list")
-      .auto_shrink([false, false])
-      .show_rows(
-        ui,
-        geometry::CONNECTION_ROW_HEIGHT,
-        connections.len(),
-        |ui, rows| {
-          for connection in &connections[rows] {
-            self.connection_row(ui, connection, self.show_closed_connections);
+    if self.connection_table_layout {
+      self.connection_table(ui, &connections, self.show_closed_connections);
+    } else {
+      ScrollArea::vertical()
+        .id_salt("cvr-connections-list")
+        .auto_shrink([false, false])
+        .show_rows(
+          ui,
+          geometry::CONNECTION_ROW_HEIGHT,
+          connections.len(),
+          |ui, rows| {
+            for connection in &connections[rows] {
+              self.connection_row(ui, connection, self.show_closed_connections);
+            }
+          },
+        );
+    }
+    if self.show_closed_connections && !connections.is_empty() {
+      egui::Area::new(egui::Id::new("clear-closed-connections"))
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+        .order(egui::Order::Foreground)
+        .show(ui.ctx(), |ui| {
+          if ui
+            .add_sized([94.0, 40.0], egui::Button::new("⌫  清空").corner_radius(20))
+            .clicked()
+          {
+            self.command(UiCommand::ClearClosedConnections);
           }
-        },
-      );
+        });
+    }
     if let Some(id) = self.selected_connection.as_deref()
       && let Some(connection) = source.iter().find(|connection| connection.id == id)
     {
@@ -2246,6 +2364,117 @@ impl RsClashUi {
         self.selected_connection = None;
       }
     }
+  }
+
+  fn connection_table(&mut self, ui: &mut Ui, connections: &[&ConnectionSnapshot], closed: bool) {
+    let (header, _) =
+      ui.allocate_exact_size(egui::vec2(ui.available_width(), 40.0), egui::Sense::hover());
+    let tokens = theme::tokens(ui);
+    ui.painter().rect_filled(header, 0.0, tokens.surface);
+    let columns = connection_table_columns(header);
+    for (rect, label) in columns
+      .iter()
+      .zip(["目标", "网络", "进程", "代理链", "流量", ""])
+    {
+      ui.painter().text(
+        egui::pos2(rect.left() + 8.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(12.0),
+        tokens.text_muted,
+      );
+    }
+    ui.painter().line_segment(
+      [header.left_bottom(), header.right_bottom()],
+      Stroke::new(1.0, tokens.border),
+    );
+    ScrollArea::vertical()
+      .id_salt("cvr-connections-table")
+      .auto_shrink([false, false])
+      .show_rows(
+        ui,
+        geometry::CONNECTION_ROW_HEIGHT,
+        connections.len(),
+        |ui, rows| {
+          for connection in &connections[rows] {
+            self.connection_table_row(ui, connection, closed);
+          }
+        },
+      );
+  }
+
+  fn connection_table_row(&mut self, ui: &mut Ui, connection: &ConnectionSnapshot, closed: bool) {
+    let (rect, response) = ui.allocate_exact_size(
+      egui::vec2(ui.available_width(), geometry::CONNECTION_ROW_HEIGHT),
+      egui::Sense::click(),
+    );
+    let tokens = theme::tokens(ui);
+    if response.hovered() {
+      ui.painter().rect_filled(rect, 0.0, tokens.surface_raised);
+    }
+    if response.clicked() {
+      self.selected_connection = Some(connection.id.clone());
+    }
+    let values = [
+      if connection.host.is_empty() {
+        connection.destination.as_str()
+      } else {
+        connection.host.as_str()
+      },
+      connection.network.as_str(),
+      connection.process.as_str(),
+      connection.chains.last().map_or("", String::as_str),
+      "",
+      "",
+    ];
+    let columns = connection_table_columns(rect);
+    for (column, value) in columns.iter().zip(values) {
+      let painter = ui
+        .painter()
+        .with_clip_rect(column.shrink2(egui::vec2(8.0, 0.0)));
+      painter.text(
+        egui::pos2(column.left() + 8.0, column.center().y),
+        egui::Align2::LEFT_CENTER,
+        value,
+        egui::FontId::proportional(12.0),
+        ui.visuals().text_color(),
+      );
+    }
+    ui.painter().text(
+      egui::pos2(columns[4].left() + 8.0, columns[4].center().y),
+      egui::Align2::LEFT_CENTER,
+      format!(
+        "{} / {}",
+        format_bytes(connection.upload),
+        format_bytes(connection.download)
+      ),
+      egui::FontId::proportional(11.0),
+      tokens.text_muted,
+    );
+    if !closed {
+      let close_rect = columns[5].shrink(10.0);
+      let close = ui.interact(
+        close_rect,
+        ui.id().with(("table-close-connection", &connection.id)),
+        egui::Sense::click(),
+      );
+      ui.painter().text(
+        close_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "×",
+        egui::FontId::proportional(18.0),
+        ui.visuals().text_color(),
+      );
+      if close.clicked() {
+        self.command(UiCommand::CloseConnection {
+          id: connection.id.clone(),
+        });
+      }
+    }
+    ui.painter().line_segment(
+      [rect.left_bottom(), rect.right_bottom()],
+      Stroke::new(1.0, tokens.border),
+    );
   }
 
   fn connection_row(&mut self, ui: &mut Ui, connection: &ConnectionSnapshot, closed: bool) {
@@ -2270,7 +2499,11 @@ impl RsClashUi {
     ui.painter().text(
       egui::pos2(rect.left() + 12.0, rect.center().y - 9.0),
       egui::Align2::LEFT_CENTER,
-      &connection.destination,
+      if connection.host.is_empty() {
+        &connection.destination
+      } else {
+        &connection.host
+      },
       egui::FontId::proportional(14.0),
       ui.visuals().text_color(),
     );
@@ -2297,12 +2530,13 @@ impl RsClashUi {
       format_bytes(connection.upload),
       format_bytes(connection.download)
     ));
-    ui.painter().text(
-      egui::pos2(rect.left() + 12.0, rect.center().y + 11.0),
-      egui::Align2::LEFT_CENTER,
-      tags.join("   "),
-      egui::FontId::proportional(10.0),
-      theme::tokens(ui).text_muted,
+    paint_tag_row(
+      ui,
+      egui::Rect::from_min_max(
+        egui::pos2(rect.left() + 12.0, rect.center().y + 2.0),
+        egui::pos2(rect.right() - 48.0, rect.bottom() - 4.0),
+      ),
+      &tags,
     );
     if !closed {
       let close_rect = egui::Rect::from_center_size(
@@ -4989,6 +5223,83 @@ const fn proxy_unresolved_label(reason: ProxyMemberUnresolvedReason) -> &'static
   }
 }
 
+fn paint_tag_row(ui: &Ui, clip: egui::Rect, tags: &[String]) {
+  let tokens = theme::tokens(ui);
+  let painter = ui.painter().with_clip_rect(clip);
+  let mut x = clip.left();
+  for tag in tags {
+    let galley = painter.layout_no_wrap(
+      tag.clone(),
+      egui::FontId::proportional(10.0),
+      tokens.text_muted,
+    );
+    let width = galley.size().x + 8.0;
+    let tag_rect = egui::Rect::from_min_size(
+      egui::pos2(x, clip.center().y - 7.0),
+      egui::vec2(width, 14.0),
+    );
+    painter.rect_stroke(
+      tag_rect,
+      4.0,
+      Stroke::new(1.0, tokens.border),
+      egui::StrokeKind::Inside,
+    );
+    painter.galley(
+      egui::pos2(
+        tag_rect.left() + 4.0,
+        tag_rect.center().y - galley.size().y / 2.0,
+      ),
+      galley,
+      tokens.text_muted,
+    );
+    x += width + 4.0;
+  }
+}
+
+fn paint_proxy_tags(ui: &Ui, rect: egui::Rect, item: &ProxyDisplayItem, detailed: bool) {
+  let tokens = theme::tokens(ui);
+  let clip = egui::Rect::from_min_max(
+    egui::pos2(rect.left() + 12.0, rect.center().y + 2.0),
+    egui::pos2(rect.right() - 68.0, rect.bottom() - 3.0),
+  );
+  let painter = ui.painter().with_clip_rect(clip);
+  let capabilities = proxy_capability_label(&item.capabilities);
+  let mut tags = vec![item.kind.as_str()];
+  if detailed {
+    tags.push(item.source.as_str());
+    if capabilities != "无附加能力" {
+      tags.push(&capabilities);
+    }
+  }
+  let mut x = rect.left() + 12.0;
+  let y = rect.center().y + 11.0;
+  for tag in tags {
+    let galley = painter.layout_no_wrap(
+      tag.to_string(),
+      egui::FontId::proportional(10.0),
+      tokens.text_muted,
+    );
+    let width = galley.size().x + 8.0;
+    let tag_rect =
+      egui::Rect::from_center_size(egui::pos2(x + width / 2.0, y), egui::vec2(width, 16.0));
+    painter.rect_stroke(
+      tag_rect,
+      4.0,
+      Stroke::new(1.0, tokens.text_muted),
+      egui::StrokeKind::Inside,
+    );
+    painter.galley(
+      egui::pos2(
+        tag_rect.left() + 4.0,
+        tag_rect.center().y - galley.size().y / 2.0,
+      ),
+      galley,
+      tokens.text_muted,
+    );
+    x += width + 4.0;
+  }
+}
+
 fn proxy_capability_label(capabilities: &ProxyCapabilities) -> String {
   let mut enabled = Vec::new();
   for (available, label) in [
@@ -5124,6 +5435,25 @@ fn sort_connections(connections: &mut [&ConnectionSnapshot], sort: ConnectionSor
       connections.sort_by(|left, right| right.start.cmp(&left.start));
     },
   }
+}
+
+fn connection_table_columns(rect: egui::Rect) -> [egui::Rect; 6] {
+  let fractions = [0.30, 0.10, 0.18, 0.16, 0.20, 0.06];
+  let mut left = rect.left();
+  let mut columns = [rect; 6];
+  for (index, fraction) in fractions.into_iter().enumerate() {
+    let right = if index + 1 == fractions.len() {
+      rect.right()
+    } else {
+      left + rect.width() * fraction
+    };
+    columns[index] = egui::Rect::from_min_max(
+      egui::pos2(left, rect.top()),
+      egui::pos2(right, rect.bottom()),
+    );
+    left = right;
+  }
+  columns
 }
 
 fn connection_detail(ui: &mut Ui, connection: &ConnectionSnapshot) {
@@ -5670,6 +6000,30 @@ fn header_icon_button(ui: &mut Ui, symbol: &str, tooltip: &str) -> egui::Respons
     egui::Button::new(RichText::new(symbol).size(17.0)).frame(false),
   )
   .on_hover_text(tooltip)
+}
+
+fn proxy_tool_button(
+  ui: &Ui,
+  rect: egui::Rect,
+  id: impl std::hash::Hash + std::fmt::Debug,
+  symbol: &str,
+  tooltip: &str,
+) -> egui::Response {
+  let response = ui
+    .interact(rect, ui.id().with(id), egui::Sense::click())
+    .on_hover_text(tooltip);
+  if response.hovered() {
+    ui.painter()
+      .rect_filled(rect, 15.0, theme::tokens(ui).accent_soft);
+  }
+  ui.painter().text(
+    rect.center(),
+    egui::Align2::CENTER_CENTER,
+    symbol,
+    egui::FontId::proportional(16.0),
+    ui.visuals().text_color(),
+  );
+  response
 }
 
 fn paint_navigation_metric(
