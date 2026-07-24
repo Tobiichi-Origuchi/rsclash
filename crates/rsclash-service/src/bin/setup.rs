@@ -9,27 +9,34 @@ use rsclash_config::initialize_default_runtime;
 #[cfg(target_os = "linux")]
 fn main() -> Result<(), Box<dyn Error>> {
   let arguments = parse_arguments()?;
-  initialize_default_runtime(&arguments.config_root)?;
+  if !arguments.uninstall {
+    initialize_default_runtime(&arguments.config_root)?;
+  }
   if arguments.initialize_only {
     return Ok(());
   }
-  let status = Command::new("pkexec")
-    .arg(&arguments.installer)
-    .arg("--service-binary")
-    .arg(&arguments.service_binary)
-    .arg("--stable-core")
-    .arg(&arguments.stable_core)
-    .args(
-      arguments
-        .alpha_core
-        .as_ref()
-        .map(|path| [OsString::from("--alpha-core"), path.as_os_str().to_owned()])
-        .into_iter()
-        .flatten(),
-    )
-    .arg("--config-root")
-    .arg(&arguments.config_root)
-    .status()?;
+  let mut command = Command::new("pkexec");
+  command.arg(&arguments.installer);
+  if arguments.uninstall {
+    command.arg("--uninstall");
+  } else {
+    command
+      .arg("--service-binary")
+      .arg(&arguments.service_binary)
+      .arg("--stable-core")
+      .arg(&arguments.stable_core)
+      .args(
+        arguments
+          .alpha_core
+          .as_ref()
+          .map(|path| [OsString::from("--alpha-core"), path.as_os_str().to_owned()])
+          .into_iter()
+          .flatten(),
+      )
+      .arg("--config-root")
+      .arg(&arguments.config_root);
+  }
+  let status = command.status()?;
   if status.success() {
     Ok(())
   } else {
@@ -50,6 +57,7 @@ struct SetupArguments {
   alpha_core: Option<PathBuf>,
   config_root: PathBuf,
   initialize_only: bool,
+  uninstall: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -62,6 +70,7 @@ fn parse_arguments() -> Result<SetupArguments, String> {
   let mut alpha_core = None;
   let mut config_root = None;
   let mut initialize_only = false;
+  let mut uninstall = false;
   let mut arguments = env::args_os().skip(1);
   while let Some(flag) = arguments.next() {
     if flag == "--initialize-only" {
@@ -69,6 +78,13 @@ fn parse_arguments() -> Result<SetupArguments, String> {
         return Err("duplicate argument: --initialize-only".to_string());
       }
       initialize_only = true;
+      continue;
+    }
+    if flag == "--uninstall" {
+      if uninstall {
+        return Err("duplicate argument: --uninstall".to_string());
+      }
+      uninstall = true;
       continue;
     }
     let value = arguments
@@ -86,7 +102,7 @@ fn parse_arguments() -> Result<SetupArguments, String> {
   Ok(SetupArguments {
     installer: installer.unwrap_or_else(|| sibling("rsclash-service-install")),
     service_binary: service_binary.unwrap_or_else(|| sibling("rsclash-service")),
-    stable_core: match (stable_core, initialize_only) {
+    stable_core: match (stable_core, initialize_only || uninstall) {
       (Some(path), _) => path,
       (None, true) => PathBuf::new(),
       (None, false) => return Err(usage()),
@@ -94,6 +110,7 @@ fn parse_arguments() -> Result<SetupArguments, String> {
     alpha_core,
     config_root: config_root.map_or_else(default_config_root, Ok)?,
     initialize_only,
+    uninstall,
   })
 }
 
@@ -123,5 +140,7 @@ fn set_once(target: &mut Option<PathBuf>, value: OsString, flag: &str) -> Result
 
 #[cfg(target_os = "linux")]
 fn usage() -> String {
-  "usage: rsclash-service-setup (--stable-core PATH [--alpha-core PATH] | --initialize-only) [--config-root PATH] [--installer PATH] [--service-binary PATH]".to_string()
+  "usage: rsclash-service-setup (--stable-core PATH [--alpha-core PATH] | --initialize-only | \
+   --uninstall) [--config-root PATH] [--installer PATH] [--service-binary PATH]"
+    .to_string()
 }

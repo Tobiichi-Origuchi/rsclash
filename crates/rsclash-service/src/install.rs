@@ -175,6 +175,31 @@ impl SystemServiceInstaller {
     self.enable_and_start()?;
     Ok(config)
   }
+
+  pub fn uninstall_files(&self) -> Result<()> {
+    for path in [
+      self.layout.systemd_unit(),
+      self.layout.service_config(),
+      self.layout.alpha_core(),
+      self.layout.stable_core(),
+      self.layout.service_binary(),
+    ] {
+      remove_regular_file_if_present(&path)?;
+    }
+    remove_empty_directory(&self.layout.configuration_directory)?;
+    remove_empty_directory(&self.layout.install_directory)
+  }
+
+  pub fn uninstall(&self) -> Result<()> {
+    if rustix::process::geteuid().as_raw() != 0 {
+      return Err(Error::InvalidInstallation(
+        "the uninstaller must run as root through pkexec or sudo".to_string(),
+      ));
+    }
+    run_systemctl_allow_inactive(["disable", "--now", SERVICE_NAME])?;
+    self.uninstall_files()?;
+    run_systemctl(["daemon-reload"])
+  }
 }
 
 fn environment_id(name: &str) -> Option<u32> {
@@ -313,6 +338,21 @@ fn remove_regular_file_if_present(path: &Path) -> Result<()> {
   }
 }
 
+fn remove_empty_directory(path: &Path) -> Result<()> {
+  match fs::remove_dir(path) {
+    Ok(()) => Ok(()),
+    Err(error)
+      if matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+      ) =>
+    {
+      Ok(())
+    },
+    Err(error) => Err(error.into()),
+  }
+}
+
 fn render_systemd_unit(
   layout: &InstallLayout,
   config_root: &Path,
@@ -399,6 +439,27 @@ fn run_systemctl<const N: usize>(arguments: [&str; N]) -> Result<()> {
   )))
 }
 
+fn run_systemctl_allow_inactive<const N: usize>(arguments: [&str; N]) -> Result<()> {
+  let output = Command::new("systemctl").args(arguments).output()?;
+  if output.status.success()
+    || String::from_utf8_lossy(&output.stderr).contains("does not exist")
+    || String::from_utf8_lossy(&output.stderr).contains("not loaded")
+  {
+    Ok(())
+  } else {
+    let detail = if output.stderr.is_empty() {
+      String::from_utf8_lossy(&output.stdout).into_owned()
+    } else {
+      String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    Err(Error::InstallCommand(format!(
+      "systemctl exited with {}: {}",
+      output.status,
+      detail.trim()
+    )))
+  }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, reason = "tests use expect for clear failures")]
 mod tests {
@@ -471,6 +532,36 @@ mod tests {
         & 0o777,
       0o755
     );
+  }
+
+  #[test]
+  fn uninstall_removes_only_managed_regular_files() {
+    let directory = TestDirectory::new();
+    let layout = InstallLayout::under(&directory.path().join("root"));
+    fs::create_dir_all(&layout.install_directory).expect("install directory should exist");
+    fs::create_dir_all(&layout.configuration_directory)
+      .expect("configuration directory should exist");
+    fs::create_dir_all(&layout.unit_directory).expect("unit directory should exist");
+    for path in [
+      layout.service_binary(),
+      layout.stable_core(),
+      layout.alpha_core(),
+      layout.service_config(),
+      layout.systemd_unit(),
+    ] {
+      fs::write(path, b"managed").expect("managed file should exist");
+    }
+    let unrelated = layout.unit_directory.join("unrelated.service");
+    fs::write(&unrelated, b"unrelated").expect("unrelated file should exist");
+
+    SystemServiceInstaller::new(layout.clone())
+      .uninstall_files()
+      .expect("managed files should uninstall");
+
+    assert!(unrelated.exists());
+    assert!(!layout.service_binary().exists());
+    assert!(!layout.stable_core().exists());
+    assert!(!layout.systemd_unit().exists());
   }
 
   #[test]
