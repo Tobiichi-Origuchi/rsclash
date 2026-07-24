@@ -1,6 +1,6 @@
 //! Stable, UI-independent application protocol and state models.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -169,6 +169,133 @@ pub struct ProxyGroupSnapshot {
   pub options: Vec<ProxyOptionSnapshot>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProxyViewOrderSource {
+  Runtime,
+  #[default]
+  Fallback,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProxyViewProviderState {
+  Ready,
+  #[default]
+  Unavailable,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProxyCapabilities {
+  pub udp: bool,
+  pub uot: bool,
+  pub xudp: bool,
+  pub tfo: bool,
+  pub mptcp: bool,
+  pub smux: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProxyNodeSource {
+  Core {
+    proxy_name: String,
+  },
+  Provider {
+    provider_name: String,
+    proxy_name: String,
+  },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProxyMemberUnresolvedReason {
+  Missing,
+  Ambiguous,
+  ProviderUnavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProxyMemberSnapshot {
+  Group {
+    name: String,
+  },
+  Node {
+    name: String,
+    record_id: String,
+  },
+  Unresolved {
+    name: String,
+    reason: ProxyMemberUnresolvedReason,
+  },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProxyNodeSnapshot {
+  pub record_id: String,
+  pub name: String,
+  pub kind: String,
+  pub alive: bool,
+  pub delay_ms: Option<u32>,
+  pub hidden: bool,
+  pub icon: Option<String>,
+  pub test_url: Option<String>,
+  pub interface: Option<String>,
+  pub dialer_proxy: Option<String>,
+  pub capabilities: ProxyCapabilities,
+  pub source: Option<ProxyNodeSource>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProxyGroupView {
+  pub name: String,
+  pub kind: String,
+  pub alive: bool,
+  pub selected: Option<String>,
+  pub fixed: Option<String>,
+  pub hidden: bool,
+  pub icon: Option<String>,
+  pub test_url: Option<String>,
+  pub delay_ms: Option<u32>,
+  pub capabilities: ProxyCapabilities,
+  pub members: Vec<ProxyMemberSnapshot>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProxyProviderView {
+  pub name: String,
+  pub kind: String,
+  pub vehicle_type: String,
+  pub updated_at: Option<String>,
+  pub test_url: Option<String>,
+  pub proxy_record_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProxyViewV1 {
+  pub schema_version: u8,
+  pub order_source: ProxyViewOrderSource,
+  pub provider_state: ProxyViewProviderState,
+  pub global: Option<ProxyGroupView>,
+  pub direct: Option<String>,
+  pub groups: Vec<ProxyGroupView>,
+  pub records: BTreeMap<String, ProxyNodeSnapshot>,
+  pub standalone: Vec<String>,
+  pub providers: Vec<ProxyProviderView>,
+}
+
+impl Default for ProxyViewV1 {
+  fn default() -> Self {
+    Self {
+      schema_version: 1,
+      order_source: ProxyViewOrderSource::Fallback,
+      provider_state: ProxyViewProviderState::Unavailable,
+      global: None,
+      direct: None,
+      groups: Vec::new(),
+      records: BTreeMap::new(),
+      standalone: Vec::new(),
+      providers: Vec::new(),
+    }
+  }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MihomoSnapshot {
   pub connection: MihomoConnection,
@@ -180,6 +307,8 @@ pub struct MihomoSnapshot {
   pub memory_bytes: u64,
   pub connection_count: u64,
   pub groups: Vec<ProxyGroupSnapshot>,
+  pub proxy_view: ProxyViewV1,
+  pub proxy_busy: bool,
   pub last_error: Option<String>,
 }
 
@@ -384,6 +513,20 @@ pub enum UiCommand {
   SelectProxy {
     group: String,
     proxy: String,
+  },
+  TestProxy {
+    record_id: String,
+  },
+  TestProxyGroup {
+    name: String,
+  },
+  TestAllProxies,
+  UpdateProxyProvider {
+    name: String,
+  },
+  UpdateAllProxyProviders,
+  HealthcheckProxyProvider {
+    name: String,
   },
   SetProxyMode(ProxyMode),
   RefreshProfiles,

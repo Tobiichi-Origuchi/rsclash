@@ -15,8 +15,9 @@ use rsclash_app::{AppClient, AppEventReceiver, ClientError};
 use rsclash_domain::{
   AppEvent, AppSnapshot, AppStatus, CoreChannel, CoreRunMode, CoreState, MihomoConnection, Page,
   ProfileDiagnosticStage, ProfileDiagnostics, ProfileDownloadProxy, ProfileOperationKind,
-  ProfileQrCode, ProfileSourceKind, ProxyGroupSnapshot, ProxyMode, RemoteProfileOptions,
-  SensitiveString, ThemeMode, UiCommand,
+  ProfileQrCode, ProfileSourceKind, ProxyCapabilities, ProxyGroupView, ProxyMemberSnapshot,
+  ProxyMemberUnresolvedReason, ProxyMode, ProxyNodeSnapshot, ProxyNodeSource, ProxyViewV1,
+  RemoteProfileOptions, SensitiveString, ThemeMode, UiCommand,
 };
 
 struct ProfileEditor {
@@ -69,6 +70,25 @@ struct PendingSequenceEditor {
   kind: SequenceEditorKind,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ProxySort {
+  #[default]
+  Configuration,
+  Name,
+  Delay,
+}
+
+struct ProxyDisplayItem {
+  name: String,
+  kind: String,
+  record_id: Option<String>,
+  alive: bool,
+  delay_ms: Option<u32>,
+  source: String,
+  capabilities: ProxyCapabilities,
+  unresolved: Option<ProxyMemberUnresolvedReason>,
+}
+
 #[derive(Default)]
 struct YamlHighlightCache {
   source_hash: u64,
@@ -106,6 +126,13 @@ pub struct RsClashUi {
   sequence_editor: Option<SequenceEditor>,
   pending_sequence_editor: Option<PendingSequenceEditor>,
   pending_editor_close: bool,
+  proxy_search: String,
+  proxy_regex: bool,
+  proxy_whole_word: bool,
+  proxy_detailed: bool,
+  proxy_sort: ProxySort,
+  expanded_proxy_groups: BTreeSet<String>,
+  locate_proxy: Option<(String, String)>,
 }
 
 impl RsClashUi {
@@ -143,6 +170,13 @@ impl RsClashUi {
       sequence_editor: None,
       pending_sequence_editor: None,
       pending_editor_close: false,
+      proxy_search: String::new(),
+      proxy_regex: false,
+      proxy_whole_word: false,
+      proxy_detailed: false,
+      proxy_sort: ProxySort::default(),
+      expanded_proxy_groups: BTreeSet::new(),
+      locate_proxy: None,
     }
   }
 
@@ -589,13 +623,26 @@ impl RsClashUi {
 
   fn proxies(&mut self, ui: &mut Ui) {
     let mihomo = self.snapshot.mihomo.clone();
+    let view = mihomo.proxy_view.clone();
     ui.horizontal(|ui| {
       ui.vertical(|ui| {
         ui.label(RichText::new("代理选择").size(24.0).strong());
-        ui.label(RichText::new("选择出站模式和各代理组的当前节点").weak());
+        ui.label(RichText::new("无歧义地选择、筛选和测速核心与 provider 节点").weak());
       });
       ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if ui.button("刷新").clicked() {
+        if mihomo.proxy_busy {
+          ui.spinner();
+        }
+        if ui
+          .add_enabled(!mihomo.proxy_busy, egui::Button::new("全部测速"))
+          .clicked()
+        {
+          self.command(UiCommand::TestAllProxies);
+        }
+        if ui
+          .add_enabled(!mihomo.proxy_busy, egui::Button::new("刷新"))
+          .clicked()
+        {
           self.command(UiCommand::RefreshMihomo);
         }
       });
@@ -614,7 +661,7 @@ impl RsClashUi {
       );
       return;
     }
-    if mihomo.groups.is_empty() {
+    if view.groups.is_empty() && view.global.is_none() {
       empty_state(
         ui,
         "没有可用代理组",
@@ -623,41 +670,273 @@ impl RsClashUi {
       return;
     }
 
-    for group in &mihomo.groups {
-      self.proxy_group(ui, group);
+    card(ui, "查找与布局", |ui| {
+      ui.horizontal_wrapped(|ui| {
+        ui.add(
+          egui::TextEdit::singleline(&mut self.proxy_search)
+            .hint_text("搜索名称、类型或来源")
+            .desired_width(240.0),
+        );
+        ui.checkbox(&mut self.proxy_regex, "正则");
+        ui.checkbox(&mut self.proxy_whole_word, "全词");
+        ui.checkbox(&mut self.proxy_detailed, "详细");
+      });
+      ui.horizontal_wrapped(|ui| {
+        ui.label("排序");
+        for (sort, label) in [
+          (ProxySort::Configuration, "配置顺序"),
+          (ProxySort::Name, "名称"),
+          (ProxySort::Delay, "延迟"),
+        ] {
+          ui.selectable_value(&mut self.proxy_sort, sort, label);
+        }
+        if ui.button("展开全部").clicked() {
+          self
+            .expanded_proxy_groups
+            .extend(proxy_groups(&view).map(|group| group.name.clone()));
+        }
+        if ui.button("折叠全部").clicked() {
+          self.expanded_proxy_groups.clear();
+        }
+        if ui.button("定位当前").clicked()
+          && let Some((group, selected)) = proxy_groups(&view).find_map(|group| {
+            group
+              .selected
+              .clone()
+              .map(|selected| (group.name.clone(), selected))
+          })
+        {
+          self.expanded_proxy_groups.insert(group.clone());
+          self.locate_proxy = Some((group, selected));
+        }
+      });
+    });
+    ui.add_space(12.0);
+
+    let regex = if self.proxy_regex && !self.proxy_search.is_empty() {
+      let pattern = if self.proxy_whole_word {
+        format!("^(?:{})$", self.proxy_search)
+      } else {
+        self.proxy_search.clone()
+      };
+      match regex_lite::RegexBuilder::new(&pattern)
+        .case_insensitive(true)
+        .build()
+      {
+        Ok(regex) => Some(regex),
+        Err(error) => {
+          ui.label(
+            RichText::new(format!("正则表达式无效：{error}"))
+              .small()
+              .color(ui.visuals().error_fg_color),
+          );
+          None
+        },
+      }
+    } else {
+      None
+    };
+
+    for group in proxy_groups(&view) {
+      self.proxy_group_view(ui, group, &view, regex.as_ref(), mihomo.proxy_busy);
       ui.add_space(12.0);
+    }
+
+    if !view.providers.is_empty() {
+      ui.horizontal(|ui| {
+        ui.label(RichText::new("代理 Providers").size(20.0).strong());
+        if ui
+          .add_enabled(!mihomo.proxy_busy, egui::Button::new("更新全部"))
+          .clicked()
+        {
+          self.command(UiCommand::UpdateAllProxyProviders);
+        }
+      });
+      ui.add_space(8.0);
+      for provider in &view.providers {
+        card(ui, &provider.name, |ui| {
+          ui.label(
+            RichText::new(format!(
+              "{} · {} · {} 个节点",
+              provider.kind,
+              provider.vehicle_type,
+              provider.proxy_record_ids.len()
+            ))
+            .small()
+            .weak(),
+          );
+          if let Some(updated_at) = provider.updated_at.as_deref() {
+            ui.label(
+              RichText::new(format!("最近更新：{updated_at}"))
+                .small()
+                .weak(),
+            );
+          }
+          ui.horizontal(|ui| {
+            if ui
+              .add_enabled(!mihomo.proxy_busy, egui::Button::new("更新"))
+              .clicked()
+            {
+              self.command(UiCommand::UpdateProxyProvider {
+                name: provider.name.clone(),
+              });
+            }
+            if ui
+              .add_enabled(!mihomo.proxy_busy, egui::Button::new("健康检查"))
+              .clicked()
+            {
+              self.command(UiCommand::HealthcheckProxyProvider {
+                name: provider.name.clone(),
+              });
+            }
+          });
+        });
+        ui.add_space(10.0);
+      }
     }
   }
 
-  fn proxy_group(&mut self, ui: &mut Ui, group: &ProxyGroupSnapshot) {
+  fn proxy_group_view(
+    &mut self,
+    ui: &mut Ui,
+    group: &ProxyGroupView,
+    view: &ProxyViewV1,
+    regex: Option<&regex_lite::Regex>,
+    busy: bool,
+  ) {
+    let expanded = self.expanded_proxy_groups.contains(&group.name);
+    let mut toggle = false;
+    let mut test_group = false;
     card(ui, &group.name, |ui| {
       ui.horizontal(|ui| {
         ui.label(RichText::new(&group.kind).small().weak());
         if let Some(selected) = group.selected.as_deref() {
           ui.label(RichText::new(format!("当前：{selected}")).small().weak());
         }
-      });
-      ui.add_space(6.0);
-      ui.horizontal_wrapped(|ui| {
-        for option in &group.options {
-          let selected = group.selected.as_deref() == Some(option.name.as_str());
-          let delay = option
-            .delay_ms
-            .map_or_else(|| "—".to_string(), |delay| format!("{delay} ms"));
-          let text = format!("{}  {delay}", option.name);
-          let response = ui.add_enabled(
-            option.alive || selected,
-            egui::Button::new(text).selected(selected),
-          );
-          if response.clicked() {
-            self.command(UiCommand::SelectProxy {
-              group: group.name.clone(),
-              proxy: option.name.clone(),
-            });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+          if ui
+            .add_enabled(!busy, egui::Button::new("测速本组"))
+            .clicked()
+          {
+            test_group = true;
           }
-        }
+          if ui.button(if expanded { "收起" } else { "展开" }).clicked() {
+            toggle = true;
+          }
+        });
       });
+      if expanded {
+        let mut items = group
+          .members
+          .iter()
+          .map(|member| proxy_display_item(member, view))
+          .filter(|item| {
+            proxy_item_matches(
+              item,
+              &self.proxy_search,
+              regex,
+              self.proxy_regex,
+              self.proxy_whole_word,
+            )
+          })
+          .collect::<Vec<_>>();
+        sort_proxy_items(&mut items, self.proxy_sort);
+        if items.is_empty() {
+          ui.label(RichText::new("没有符合筛选条件的成员。").small().weak());
+        } else {
+          let row_height = if self.proxy_detailed { 62.0 } else { 36.0 };
+          ScrollArea::vertical()
+            .id_salt(("proxy-members", &group.name))
+            .max_height((row_height * items.len().min(10) as f32).max(row_height))
+            .auto_shrink([false, true])
+            .show_rows(ui, row_height, items.len(), |ui, rows| {
+              for item in &items[rows] {
+                self.proxy_item_row(ui, group, item, busy);
+              }
+            });
+        }
+      } else {
+        ui.label(
+          RichText::new(format!("{} 个成员", group.members.len()))
+            .small()
+            .weak(),
+        );
+      }
     });
+    if toggle {
+      if expanded {
+        self.expanded_proxy_groups.remove(&group.name);
+      } else {
+        self.expanded_proxy_groups.insert(group.name.clone());
+      }
+    }
+    if test_group {
+      self.command(UiCommand::TestProxyGroup {
+        name: group.name.clone(),
+      });
+    }
+  }
+
+  fn proxy_item_row(
+    &mut self,
+    ui: &mut Ui,
+    group: &ProxyGroupView,
+    item: &ProxyDisplayItem,
+    busy: bool,
+  ) {
+    let selected = group.selected.as_deref() == Some(item.name.as_str());
+    ui.horizontal(|ui| {
+      let response = ui.add_enabled(
+        !busy && item.unresolved.is_none() && (item.alive || selected),
+        egui::Button::new(&item.name).selected(selected),
+      );
+      if response.clicked() {
+        self.command(UiCommand::SelectProxy {
+          group: group.name.clone(),
+          proxy: item.name.clone(),
+        });
+      }
+      if self.locate_proxy.as_ref() == Some(&(group.name.clone(), item.name.clone())) {
+        response.scroll_to_me(Some(Align::Center));
+        self.locate_proxy = None;
+      }
+      ui.label(
+        RichText::new(
+          item
+            .delay_ms
+            .map_or_else(|| "—".to_string(), |delay| format!("{delay} ms")),
+        )
+        .small()
+        .color(proxy_delay_color(ui, item.delay_ms, item.alive)),
+      );
+      if let Some(record_id) = item.record_id.as_ref()
+        && ui.add_enabled(!busy, egui::Button::new("测速")).clicked()
+      {
+        self.command(UiCommand::TestProxy {
+          record_id: record_id.clone(),
+        });
+      }
+      if let Some(reason) = item.unresolved {
+        ui.label(
+          RichText::new(proxy_unresolved_label(reason))
+            .small()
+            .color(ui.visuals().warn_fg_color),
+        );
+      }
+    });
+    if self.proxy_detailed {
+      ui.label(
+        RichText::new(format!(
+          "{} · {} · {}",
+          item.kind,
+          item.source,
+          proxy_capability_label(&item.capabilities)
+        ))
+        .small()
+        .weak(),
+      );
+    }
+    ui.separator();
   }
 
   fn profiles(&mut self, ui: &mut Ui) {
@@ -1867,6 +2146,145 @@ const fn profile_stage_label(stage: ProfileDiagnosticStage) -> &'static str {
     ProfileDiagnosticStage::Deployment => "运行配置部署阶段",
     ProfileDiagnosticStage::Storage => "配置存储阶段",
     ProfileDiagnosticStage::Completed => "全部阶段完成",
+  }
+}
+
+fn proxy_groups(view: &ProxyViewV1) -> impl Iterator<Item = &ProxyGroupView> {
+  view.global.iter().chain(&view.groups)
+}
+
+fn proxy_display_item(member: &ProxyMemberSnapshot, view: &ProxyViewV1) -> ProxyDisplayItem {
+  match member {
+    ProxyMemberSnapshot::Node { name, record_id } => view.records.get(record_id).map_or_else(
+      || ProxyDisplayItem {
+        name: name.clone(),
+        kind: "Unknown".to_string(),
+        record_id: None,
+        alive: false,
+        delay_ms: None,
+        source: "Missing record".to_string(),
+        capabilities: ProxyCapabilities::default(),
+        unresolved: Some(ProxyMemberUnresolvedReason::Missing),
+      },
+      proxy_record_display,
+    ),
+    ProxyMemberSnapshot::Group { name } => {
+      let nested = proxy_groups(view).find(|group| group.name == *name);
+      ProxyDisplayItem {
+        name: name.clone(),
+        kind: nested.map_or_else(|| "Group".to_string(), |group| group.kind.clone()),
+        record_id: None,
+        alive: nested.is_none_or(|group| group.alive),
+        delay_ms: nested.and_then(|group| group.delay_ms),
+        source: "Nested group".to_string(),
+        capabilities: nested.map_or_else(ProxyCapabilities::default, |group| {
+          group.capabilities.clone()
+        }),
+        unresolved: None,
+      }
+    },
+    ProxyMemberSnapshot::Unresolved { name, reason } => ProxyDisplayItem {
+      name: name.clone(),
+      kind: "Unresolved".to_string(),
+      record_id: None,
+      alive: false,
+      delay_ms: None,
+      source: "Unresolved member".to_string(),
+      capabilities: ProxyCapabilities::default(),
+      unresolved: Some(*reason),
+    },
+  }
+}
+
+fn proxy_record_display(record: &ProxyNodeSnapshot) -> ProxyDisplayItem {
+  let source = match record.source.as_ref() {
+    Some(ProxyNodeSource::Core { .. }) => "Core".to_string(),
+    Some(ProxyNodeSource::Provider { provider_name, .. }) => {
+      format!("Provider: {provider_name}")
+    },
+    None => "Unknown source".to_string(),
+  };
+  ProxyDisplayItem {
+    name: record.name.clone(),
+    kind: record.kind.clone(),
+    record_id: Some(record.record_id.clone()),
+    alive: record.alive,
+    delay_ms: record.delay_ms,
+    source,
+    capabilities: record.capabilities.clone(),
+    unresolved: None,
+  }
+}
+
+fn proxy_item_matches(
+  item: &ProxyDisplayItem,
+  query: &str,
+  regex: Option<&regex_lite::Regex>,
+  regex_mode: bool,
+  whole_word: bool,
+) -> bool {
+  let query = query.trim();
+  if query.is_empty() {
+    return true;
+  }
+  let fields = [item.name.as_str(), item.kind.as_str(), item.source.as_str()];
+  if regex_mode {
+    return regex.is_some_and(|regex| fields.iter().any(|field| regex.is_match(field)));
+  }
+  if whole_word {
+    fields.iter().any(|field| field.eq_ignore_ascii_case(query))
+  } else {
+    let query = query.to_ascii_lowercase();
+    fields
+      .iter()
+      .any(|field| field.to_ascii_lowercase().contains(&query))
+  }
+}
+
+fn sort_proxy_items(items: &mut [ProxyDisplayItem], sort: ProxySort) {
+  match sort {
+    ProxySort::Configuration => {},
+    ProxySort::Name => items.sort_by_cached_key(|item| item.name.to_ascii_lowercase()),
+    ProxySort::Delay => items.sort_by_key(|item| (item.delay_ms.unwrap_or(u32::MAX), !item.alive)),
+  }
+}
+
+const fn proxy_unresolved_label(reason: ProxyMemberUnresolvedReason) -> &'static str {
+  match reason {
+    ProxyMemberUnresolvedReason::Missing => "节点缺失",
+    ProxyMemberUnresolvedReason::Ambiguous => "同名 provider 节点不明确",
+    ProxyMemberUnresolvedReason::ProviderUnavailable => "provider 元数据不可用",
+  }
+}
+
+fn proxy_capability_label(capabilities: &ProxyCapabilities) -> String {
+  let mut enabled = Vec::new();
+  for (available, label) in [
+    (capabilities.udp, "UDP"),
+    (capabilities.uot, "UoT"),
+    (capabilities.xudp, "XUDP"),
+    (capabilities.tfo, "TFO"),
+    (capabilities.mptcp, "MPTCP"),
+    (capabilities.smux, "SMUX"),
+  ] {
+    if available {
+      enabled.push(label);
+    }
+  }
+  if enabled.is_empty() {
+    "无附加能力".to_string()
+  } else {
+    enabled.join(" · ")
+  }
+}
+
+fn proxy_delay_color(ui: &Ui, delay: Option<u32>, alive: bool) -> Color32 {
+  match (alive, delay) {
+    (false, _) => ui.visuals().error_fg_color,
+    (_, Some(0..=199)) => Color32::from_rgb(38, 162, 105),
+    (_, Some(200..=499)) => ui.visuals().warn_fg_color,
+    (_, Some(_)) => ui.visuals().error_fg_color,
+    _ => ui.visuals().weak_text_color(),
   }
 }
 

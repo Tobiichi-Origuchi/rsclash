@@ -3,6 +3,7 @@
 mod change;
 mod mihomo;
 mod profiles;
+mod proxy_view;
 mod runtime;
 mod system_proxy;
 
@@ -607,6 +608,22 @@ impl Coordinator {
       UiCommand::SelectProxy { group, proxy } => {
         self.dispatch_mihomo(MihomoBridgeCommand::SelectProxy { group, proxy })
       },
+      UiCommand::TestProxy { record_id } => {
+        self.dispatch_mihomo(MihomoBridgeCommand::TestProxy { record_id })
+      },
+      UiCommand::TestProxyGroup { name } => {
+        self.dispatch_mihomo(MihomoBridgeCommand::TestProxyGroup { name })
+      },
+      UiCommand::TestAllProxies => self.dispatch_mihomo(MihomoBridgeCommand::TestAllProxies),
+      UiCommand::UpdateProxyProvider { name } => {
+        self.dispatch_mihomo(MihomoBridgeCommand::UpdateProxyProvider { name })
+      },
+      UiCommand::UpdateAllProxyProviders => {
+        self.dispatch_mihomo(MihomoBridgeCommand::UpdateAllProxyProviders)
+      },
+      UiCommand::HealthcheckProxyProvider { name } => {
+        self.dispatch_mihomo(MihomoBridgeCommand::HealthcheckProxyProvider { name })
+      },
       UiCommand::SetProxyMode(mode) => self.dispatch_mihomo(MihomoBridgeCommand::SetMode(mode)),
       UiCommand::RefreshProfiles => self.dispatch_profile(ProfileBridgeCommand::Refresh),
       UiCommand::ImportLocalProfile { name, path } => {
@@ -890,7 +907,7 @@ impl Coordinator {
   fn handle_mihomo_event(&mut self, event: MihomoBridgeEvent) {
     match event {
       MihomoBridgeEvent::Snapshot(snapshot) => {
-        self.snapshot.mihomo = snapshot;
+        self.snapshot.mihomo = *snapshot;
         self.publish_snapshot();
         self.emit(AppEvent::MihomoStateChanged);
       },

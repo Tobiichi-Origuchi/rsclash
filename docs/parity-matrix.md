@@ -38,4 +38,12 @@
 
 ## P8
 
-代理、规则、连接、日志和实时指标的行会随 P8 的独立提交逐项加入本矩阵。
+| CVR 能力 | rsclash 原生实现 | 状态 | 验证或边界 |
+| --- | --- | --- | --- |
+| ProxyViewV1 | 稳定 core/provider record ID 与三类 unresolved 原因 | 完成 | 确定性和同名 provider 测试 |
+| 代理组与当前节点 | 展开、折叠、当前选择和嵌套组成员 | 完成 | Mihomo snapshot 驱动 |
+| 节点查找与布局 | 普通/详细、文本/正则/全词、名称/延迟排序 | 完成 | `regex-lite`，成员 `show_rows` |
+| 节点/组/全部测速 | 按 core/provider source 调用对应 controller API | 完成 | actor 串行化与 fake API |
+| Proxy provider 操作 | 单个/全部更新、provider/节点健康检查 | 完成 | 操作后 metadata 刷新 |
+| 节点选择记忆与连接清理 | profile 持久化、tray 同步、只关闭旧 chain | 完成 | P7 actor 端到端测试 |
+| 代理链、规则、连接、日志和实时指标 | 后续 P8 独立提交 | 进行中 | 本矩阵随提交更新 |

@@ -31,6 +31,7 @@ futures-util = { version = "0.3.32", default-features = false, features = ["sink
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 ksni = { version = "0.3.6", default-features = false, features = ["tokio"] }
 qrcode = { version = "0.14.1", default-features = false }
+regex-lite = "0.1.6"
 reqwest = { version = "0.13.3", default-features = false, features = ["json"] }
 rqrr = { version = "0.10.1", default-features = false, features = ["img"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }

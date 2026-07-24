@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use rsclash_domain::{
   CoreRunMode, CoreState, MihomoConnection, MihomoSnapshot, ProxyGroupSnapshot, ProxyMode,
-  ProxyOptionSnapshot, TrafficSnapshot,
+  ProxyNodeSource, ProxyOptionSnapshot, TrafficSnapshot,
 };
 use rsclash_mihomo::{MihomoApi, models::Connections};
 use serde_json::json;
@@ -12,9 +12,12 @@ use tokio::{
 };
 
 use crate::profiles::{ProfileRuntimeSync, StoredProxySelection};
+use crate::proxy_view::{ProxyViewBuilder, ProxyViewInput};
 
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
 const METADATA_POLL_TICKS: u8 = 5;
+const DEFAULT_DELAY_TEST_URL: &str = "https://www.gstatic.com/generate_204";
+const DEFAULT_DELAY_TIMEOUT_MS: u32 = 5_000;
 
 #[derive(Clone)]
 pub struct MihomoAccess {
@@ -47,13 +50,19 @@ pub(crate) enum MihomoBridgeCommand {
   CoreState(CoreState),
   Refresh,
   SelectProxy { group: String, proxy: String },
+  TestProxy { record_id: String },
+  TestProxyGroup { name: String },
+  TestAllProxies,
+  UpdateProxyProvider { name: String },
+  UpdateAllProxyProviders,
+  HealthcheckProxyProvider { name: String },
   SynchronizeProfile(ProfileRuntimeSync),
   CloseConnectionsForProxy { proxy: String },
   SetMode(ProxyMode),
 }
 
 pub(crate) enum MihomoBridgeEvent {
-  Snapshot(MihomoSnapshot),
+  Snapshot(Box<MihomoSnapshot>),
   ProxySelected {
     group: String,
     proxy: String,
@@ -140,6 +149,22 @@ impl MihomoWorker {
       MihomoBridgeCommand::SelectProxy { group, proxy } => {
         self.select_proxy(group, proxy).await;
       },
+      MihomoBridgeCommand::TestProxy { record_id } => {
+        self.test_proxy(record_id).await;
+      },
+      MihomoBridgeCommand::TestProxyGroup { name } => {
+        self.test_proxy_group(name).await;
+      },
+      MihomoBridgeCommand::TestAllProxies => self.test_all_proxies().await,
+      MihomoBridgeCommand::UpdateProxyProvider { name } => {
+        self.update_proxy_provider(name).await;
+      },
+      MihomoBridgeCommand::UpdateAllProxyProviders => {
+        self.update_all_proxy_providers().await;
+      },
+      MihomoBridgeCommand::HealthcheckProxyProvider { name } => {
+        self.healthcheck_proxy_provider(name).await;
+      },
       MihomoBridgeCommand::SynchronizeProfile(sync) => {
         if self.active.is_some() {
           self.synchronize_profile(sync).await;
@@ -175,14 +200,15 @@ impl MihomoWorker {
     let Some((_, client)) = self.active.clone() else {
       return;
     };
-    let (version, config, groups, proxies) = tokio::join!(
+    let (version, config, groups, proxies, providers) = tokio::join!(
       client.version(),
       client.base_config(),
       client.groups(),
       client.proxies(),
+      client.proxy_providers(),
     );
-    let result = match (version, config, groups, proxies) {
-      (Ok(version), Ok(config), Ok(groups), Ok(proxies)) => {
+    let result = match (version, config, groups, proxies, providers) {
+      (Ok(version), Ok(config), Ok(groups), Ok(proxies), providers) => {
         self.state.version = Some(version.version);
         self.state.mixed_port = (config.mixed_port > 0).then_some(config.mixed_port);
         self.state.tun_enabled = config
@@ -193,7 +219,7 @@ impl MihomoWorker {
         self.state.mode = ProxyMode::from(config.mode.as_str());
         self.state.groups = groups
           .proxies
-          .into_iter()
+          .iter()
           .map(|group| {
             let options = group
               .all
@@ -213,19 +239,28 @@ impl MihomoWorker {
               })
               .collect();
             ProxyGroupSnapshot {
-              name: group.name,
-              kind: group.kind,
-              selected: group.now.or(group.fixed),
+              name: group.name.clone(),
+              kind: group.kind.clone(),
+              selected: group.now.clone().or_else(|| group.fixed.clone()),
               options,
             }
           })
           .collect();
+        self.state.proxy_view = ProxyViewBuilder::build(ProxyViewInput {
+          runtime_group_order: groups
+            .proxies
+            .iter()
+            .map(|group| group.name.clone())
+            .collect(),
+          proxies,
+          providers: providers.ok(),
+        });
         Ok(())
       },
-      (Err(error), _, _, _)
-      | (_, Err(error), _, _)
-      | (_, _, Err(error), _)
-      | (_, _, _, Err(error)) => Err(error),
+      (Err(error), _, _, _, _)
+      | (_, Err(error), _, _, _)
+      | (_, _, Err(error), _, _)
+      | (_, _, _, Err(error), _) => Err(error),
     };
     self.finish_refresh(result).await;
   }
@@ -321,6 +356,238 @@ impl MihomoWorker {
           .await;
       },
       Err(error) => self.command_failed(error.to_string()).await,
+    }
+  }
+
+  async fn test_proxy(&mut self, record_id: String) {
+    let Some((_, client)) = self.active.clone() else {
+      self
+        .command_failed("the Mihomo controller is offline".to_string())
+        .await;
+      return;
+    };
+    let Some(record) = self.state.proxy_view.records.get(&record_id).cloned() else {
+      self
+        .command_failed(format!("proxy record {record_id} no longer exists"))
+        .await;
+      return;
+    };
+    self.set_proxy_busy(true).await;
+    let test_url = record.test_url.as_deref().unwrap_or(DEFAULT_DELAY_TEST_URL);
+    let result = match record.source.as_ref() {
+      Some(ProxyNodeSource::Core { proxy_name }) => {
+        client
+          .delay_proxy(proxy_name, test_url, DEFAULT_DELAY_TIMEOUT_MS)
+          .await
+      },
+      Some(ProxyNodeSource::Provider {
+        provider_name,
+        proxy_name,
+      }) => {
+        client
+          .healthcheck_provider_proxy(
+            provider_name,
+            proxy_name,
+            test_url,
+            DEFAULT_DELAY_TIMEOUT_MS,
+          )
+          .await
+      },
+      None => {
+        self.set_proxy_busy(false).await;
+        self
+          .command_failed(format!("proxy record {record_id} has no source"))
+          .await;
+        return;
+      },
+    };
+    match result {
+      Ok(delay) => {
+        if let Some(candidate) = self.state.proxy_view.records.get_mut(&record_id) {
+          candidate.delay_ms = (delay.delay > 0).then_some(delay.delay);
+          candidate.alive = delay.delay > 0;
+        }
+        self.state.last_error = None;
+        self.set_proxy_busy(false).await;
+      },
+      Err(error) => {
+        self.set_proxy_busy(false).await;
+        self.command_failed(error.to_string()).await;
+      },
+    }
+  }
+
+  async fn test_proxy_group(&mut self, name: String) {
+    let Some((_, client)) = self.active.clone() else {
+      self
+        .command_failed("the Mihomo controller is offline".to_string())
+        .await;
+      return;
+    };
+    let test_url = self
+      .state
+      .proxy_view
+      .groups
+      .iter()
+      .chain(self.state.proxy_view.global.iter())
+      .find(|group| group.name == name)
+      .and_then(|group| group.test_url.clone())
+      .unwrap_or_else(|| DEFAULT_DELAY_TEST_URL.to_string());
+    self.set_proxy_busy(true).await;
+    match client
+      .delay_group(&name, &test_url, DEFAULT_DELAY_TIMEOUT_MS)
+      .await
+    {
+      Ok(delays) => {
+        self.apply_proxy_delays(&delays);
+        self.state.last_error = None;
+        self.set_proxy_busy(false).await;
+      },
+      Err(error) => {
+        self.set_proxy_busy(false).await;
+        self.command_failed(error.to_string()).await;
+      },
+    }
+  }
+
+  async fn test_all_proxies(&mut self) {
+    let Some((_, client)) = self.active.clone() else {
+      self
+        .command_failed("the Mihomo controller is offline".to_string())
+        .await;
+      return;
+    };
+    self.set_proxy_busy(true).await;
+    let providers = self
+      .state
+      .proxy_view
+      .providers
+      .iter()
+      .map(|provider| provider.name.clone())
+      .collect::<Vec<_>>();
+    let groups = self
+      .state
+      .proxy_view
+      .groups
+      .iter()
+      .chain(self.state.proxy_view.global.iter())
+      .map(|group| {
+        (
+          group.name.clone(),
+          group
+            .test_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_DELAY_TEST_URL.to_string()),
+        )
+      })
+      .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    for provider in providers {
+      if let Err(error) = client.healthcheck_proxy_provider(&provider).await {
+        failures.push(format!("healthcheck provider {provider}: {error}"));
+      }
+    }
+    for (group, url) in groups {
+      match client
+        .delay_group(&group, &url, DEFAULT_DELAY_TIMEOUT_MS)
+        .await
+      {
+        Ok(delays) => self.apply_proxy_delays(&delays),
+        Err(error) => failures.push(format!("test group {group}: {error}")),
+      }
+    }
+    self.refresh_metadata().await;
+    self.set_proxy_busy(false).await;
+    if !failures.is_empty() {
+      self.command_failed(failures.join("; ")).await;
+    }
+  }
+
+  async fn update_proxy_provider(&mut self, name: String) {
+    let Some((_, client)) = self.active.clone() else {
+      self
+        .command_failed("the Mihomo controller is offline".to_string())
+        .await;
+      return;
+    };
+    self.set_proxy_busy(true).await;
+    let result = client.update_proxy_provider(&name).await;
+    if result.is_ok() {
+      self.refresh_metadata().await;
+    }
+    self.set_proxy_busy(false).await;
+    if let Err(error) = result {
+      self.command_failed(error.to_string()).await;
+    }
+  }
+
+  async fn healthcheck_proxy_provider(&mut self, name: String) {
+    let Some((_, client)) = self.active.clone() else {
+      self
+        .command_failed("the Mihomo controller is offline".to_string())
+        .await;
+      return;
+    };
+    self.set_proxy_busy(true).await;
+    let result = client.healthcheck_proxy_provider(&name).await;
+    if result.is_ok() {
+      self.refresh_metadata().await;
+    }
+    self.set_proxy_busy(false).await;
+    if let Err(error) = result {
+      self.command_failed(error.to_string()).await;
+    }
+  }
+
+  async fn update_all_proxy_providers(&mut self) {
+    let Some((_, client)) = self.active.clone() else {
+      self
+        .command_failed("the Mihomo controller is offline".to_string())
+        .await;
+      return;
+    };
+    self.set_proxy_busy(true).await;
+    let providers = self
+      .state
+      .proxy_view
+      .providers
+      .iter()
+      .map(|provider| provider.name.clone())
+      .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    for provider in providers {
+      if let Err(error) = client.update_proxy_provider(&provider).await {
+        failures.push(format!("update provider {provider}: {error}"));
+      }
+    }
+    self.refresh_metadata().await;
+    self.set_proxy_busy(false).await;
+    if !failures.is_empty() {
+      self.command_failed(failures.join("; ")).await;
+    }
+  }
+
+  fn apply_proxy_delays(&mut self, delays: &std::collections::HashMap<String, u32>) {
+    for record in self.state.proxy_view.records.values_mut() {
+      if let Some(delay) = delays.get(&record.name) {
+        record.delay_ms = (*delay > 0).then_some(*delay);
+        record.alive = *delay > 0;
+      }
+    }
+    for group in &mut self.state.groups {
+      for option in &mut group.options {
+        if let Some(delay) = delays.get(&option.name) {
+          option.delay_ms = (*delay > 0).then_some(*delay);
+          option.alive = *delay > 0;
+        }
+      }
+    }
+  }
+
+  async fn set_proxy_busy(&mut self, busy: bool) {
+    if self.state.proxy_busy != busy {
+      self.state.proxy_busy = busy;
+      self.publish().await;
     }
   }
 
@@ -449,7 +716,7 @@ impl MihomoWorker {
   async fn publish(&self) {
     let _ = self
       .event_tx
-      .send(MihomoBridgeEvent::Snapshot(self.state.clone()))
+      .send(MihomoBridgeEvent::Snapshot(Box::new(self.state.clone())))
       .await;
   }
 }
