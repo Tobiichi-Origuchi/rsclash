@@ -43,8 +43,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     viewport: egui::ViewportBuilder::default()
       .with_title("rsclash")
       .with_app_id("io.github.rsclash")
-      .with_inner_size([1080.0, 720.0])
-      .with_min_inner_size([760.0, 520.0]),
+      .with_decorations(false)
+      .with_inner_size([940.0, 700.0])
+      .with_min_inner_size([520.0, 520.0]),
     renderer: eframe::Renderer::Glow,
     persist_window: true,
     run_and_return: true,

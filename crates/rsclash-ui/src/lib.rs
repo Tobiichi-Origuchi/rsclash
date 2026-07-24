@@ -1,5 +1,6 @@
 //! Native egui presentation layer. This crate only talks to the application protocol.
 
+mod geometry;
 mod theme;
 
 use std::{
@@ -147,8 +148,6 @@ impl SettingsSection {
 }
 
 enum SettingsUiAction {
-  Apply,
-  Discard,
   ToggleSystemProxy(bool),
   InstallService,
   UninstallService,
@@ -203,6 +202,7 @@ pub struct RsClashUi {
   renaming_profile: Option<String>,
   profile_name_edits: BTreeMap<String, String>,
   pending_profile_delete: Option<String>,
+  profile_create_dialog: bool,
   profile_batch_mode: bool,
   selected_profiles: BTreeSet<String>,
   pending_batch_delete: bool,
@@ -220,10 +220,13 @@ pub struct RsClashUi {
   proxy_sort: ProxySort,
   expanded_proxy_groups: BTreeSet<String>,
   locate_proxy: Option<(String, String)>,
+  proxy_provider_dialog: bool,
+  proxy_chain_mode: bool,
   proxy_chain_group: String,
   proxy_chain_nodes: Vec<String>,
   rule_search: String,
   rule_draft: RuleDraft,
+  rule_editor_dialog: bool,
   pending_rule_append: Option<String>,
   connection_search: String,
   show_closed_connections: bool,
@@ -236,7 +239,6 @@ pub struct RsClashUi {
   log_reverse: bool,
   log_level: StreamLogLevel,
   navigation_collapsed: bool,
-  settings_section: SettingsSection,
   settings_draft: AppSettings,
   settings_dirty: bool,
 }
@@ -280,6 +282,7 @@ impl RsClashUi {
       renaming_profile: None,
       profile_name_edits: BTreeMap::new(),
       pending_profile_delete: None,
+      profile_create_dialog: false,
       profile_batch_mode: false,
       selected_profiles: BTreeSet::new(),
       pending_batch_delete: false,
@@ -297,10 +300,13 @@ impl RsClashUi {
       proxy_sort: ProxySort::default(),
       expanded_proxy_groups: BTreeSet::new(),
       locate_proxy: None,
+      proxy_provider_dialog: false,
+      proxy_chain_mode: false,
       proxy_chain_group: String::new(),
       proxy_chain_nodes: Vec::new(),
       rule_search: String::new(),
       rule_draft: RuleDraft::default(),
+      rule_editor_dialog: false,
       pending_rule_append: None,
       connection_search: String::new(),
       show_closed_connections: false,
@@ -313,7 +319,6 @@ impl RsClashUi {
       log_reverse: false,
       log_level: StreamLogLevel::Info,
       navigation_collapsed: false,
-      settings_section: SettingsSection::default(),
       settings_draft,
       settings_dirty: false,
     }
@@ -481,24 +486,33 @@ impl RsClashUi {
   }
 
   pub fn ui(&mut self, root: &mut Ui) {
-    let narrow = root.available_width() < 940.0;
-    let automatically_compact =
-      narrow || self.snapshot.settings.value.navigation_layout == NavigationLayout::Compact;
+    self.title_bar(root);
     let compact_navigation = match self.snapshot.settings.value.navigation_layout {
-      NavigationLayout::Automatic => automatically_compact || self.navigation_collapsed,
-      NavigationLayout::Expanded => narrow || self.navigation_collapsed,
+      NavigationLayout::Automatic => self.navigation_collapsed,
+      NavigationLayout::Expanded => false,
       NavigationLayout::Compact => true,
     };
     egui::Panel::left("navigation")
-      .exact_size(if compact_navigation { 76.0 } else { 220.0 })
+      .exact_size(if compact_navigation {
+        geometry::NAV_COLLAPSED_WIDTH
+      } else {
+        geometry::NAV_WIDTH
+      })
       .frame(
         Frame::side_top_panel(root.style())
           .fill(root.visuals().panel_fill)
-          .stroke(Stroke::new(1.0, theme::tokens(root).border))
-          .inner_margin(egui::Margin::symmetric(10, 14)),
+          .stroke(Stroke::NONE)
+          .inner_margin(egui::Margin::ZERO),
       )
       .show(root, |ui| {
-        self.navigation(ui, compact_navigation, automatically_compact);
+        self.navigation(ui, compact_navigation);
+        if !compact_navigation {
+          let rect = ui.max_rect();
+          ui.painter().line_segment(
+            [rect.right_top(), rect.right_bottom()],
+            Stroke::new(1.0, theme::tokens(ui).border),
+          );
+        }
       });
 
     egui::CentralPanel::default()
@@ -508,170 +522,340 @@ impl RsClashUi {
           .inner_margin(egui::Margin::same(0)),
       )
       .show(root, |ui| {
+        ui.add_space(geometry::LINUX_CONTENT_TOP);
         self.header(ui);
-        ScrollArea::vertical()
-          .auto_shrink([false, false])
-          .show(ui, |ui| {
-            ui.set_min_width(ui.available_width());
-            ui.add_space(22.0);
-            ui.with_layout(Layout::top_down(Align::Center), |ui| {
-              let content_width = ui.available_width().min(1180.0);
-              ui.allocate_ui_with_layout(
-                egui::vec2(content_width, ui.available_height()),
-                Layout::top_down(Align::Min),
-                |ui| {
-                  self.page(ui);
-                },
-              );
-            });
-            ui.add_space(32.0);
-          });
+        self.page_container(ui);
+      });
+    self.window_resize_handles(root);
+  }
+
+  fn title_bar(&self, root: &mut Ui) {
+    egui::Panel::top("cvr-title-bar")
+      .exact_size(geometry::TITLE_BAR_HEIGHT)
+      .frame(
+        Frame::new()
+          .fill(theme::tokens(root).surface)
+          .stroke(Stroke::new(1.0, theme::tokens(root).border))
+          .inner_margin(egui::Margin::symmetric(10, 3)),
+      )
+      .show(root, |ui| {
+        let maximized = ui
+          .ctx()
+          .input(|input| input.viewport().maximized.unwrap_or(false));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+          if ui
+            .add_sized(
+              [28.0, 28.0],
+              egui::Button::new(RichText::new("×").size(18.0)).frame(false),
+            )
+            .on_hover_text("关闭")
+            .clicked()
+          {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+          }
+          if ui
+            .add_sized(
+              [28.0, 28.0],
+              egui::Button::new(if maximized { "❐" } else { "□" }).frame(false),
+            )
+            .on_hover_text(if maximized { "还原" } else { "最大化" })
+            .clicked()
+          {
+            ui.ctx()
+              .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+          }
+          if ui
+            .add_sized([28.0, 28.0], egui::Button::new("−").frame(false))
+            .on_hover_text("最小化")
+            .clicked()
+          {
+            ui.ctx()
+              .send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+          }
+
+          let drag = ui.interact(
+            ui.available_rect_before_wrap(),
+            ui.id().with("window-drag-region"),
+            egui::Sense::click_and_drag(),
+          );
+          if drag.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+          }
+          if drag.double_clicked() {
+            ui.ctx()
+              .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+          }
+        });
       });
   }
 
-  fn navigation(&mut self, ui: &mut Ui, compact: bool, forced_compact: bool) {
-    let tokens = theme::tokens(ui);
-    ui.horizontal(|ui| {
-      ui.add_space(if compact { 7.0 } else { 5.0 });
-      Frame::new()
-        .fill(tokens.accent)
-        .corner_radius(10)
-        .inner_margin(egui::Margin::symmetric(9, 6))
-        .show(ui, |ui| {
-          ui.label(RichText::new("R").size(18.0).strong().color(Color32::WHITE));
-        });
-      if !compact {
-        ui.vertical(|ui| {
-          ui.label(RichText::new("rsclash").size(18.0).strong());
-          ui.label(RichText::new("Mihomo Desktop").small().weak());
-        });
-      }
-    });
-    ui.add_space(20.0);
-
-    for (title, pages) in [
-      ("概览", &[Page::Home][..]),
+  fn window_resize_handles(&self, root: &Ui) {
+    let maximized = root
+      .ctx()
+      .input(|input| input.viewport().maximized.unwrap_or(false));
+    if maximized {
+      return;
+    }
+    let rect = root.max_rect();
+    let edge = 6.0;
+    let corner = 12.0;
+    let handles = [
       (
-        "代理",
-        &[
-          Page::Proxies,
-          Page::Profiles,
-          Page::Connections,
-          Page::Rules,
-        ][..],
+        "north",
+        egui::Rect::from_min_max(
+          egui::pos2(rect.left() + corner, rect.top()),
+          egui::pos2(rect.right() - corner, rect.top() + edge),
+        ),
+        egui::ResizeDirection::North,
+        egui::CursorIcon::ResizeNorth,
       ),
-      ("诊断", &[Page::Logs][..]),
-    ] {
-      if !compact {
-        ui.add_space(6.0);
-        ui.label(
-          RichText::new(title)
-            .size(11.0)
-            .strong()
-            .color(tokens.text_muted),
-        );
-        ui.add_space(3.0);
+      (
+        "south",
+        egui::Rect::from_min_max(
+          egui::pos2(rect.left() + corner, rect.bottom() - edge),
+          egui::pos2(rect.right() - corner, rect.bottom()),
+        ),
+        egui::ResizeDirection::South,
+        egui::CursorIcon::ResizeSouth,
+      ),
+      (
+        "west",
+        egui::Rect::from_min_max(
+          egui::pos2(rect.left(), rect.top() + corner),
+          egui::pos2(rect.left() + edge, rect.bottom() - corner),
+        ),
+        egui::ResizeDirection::West,
+        egui::CursorIcon::ResizeWest,
+      ),
+      (
+        "east",
+        egui::Rect::from_min_max(
+          egui::pos2(rect.right() - edge, rect.top() + corner),
+          egui::pos2(rect.right(), rect.bottom() - corner),
+        ),
+        egui::ResizeDirection::East,
+        egui::CursorIcon::ResizeEast,
+      ),
+      (
+        "north-west",
+        egui::Rect::from_min_size(rect.left_top(), egui::Vec2::splat(corner)),
+        egui::ResizeDirection::NorthWest,
+        egui::CursorIcon::ResizeNorthWest,
+      ),
+      (
+        "north-east",
+        egui::Rect::from_min_size(
+          egui::pos2(rect.right() - corner, rect.top()),
+          egui::Vec2::splat(corner),
+        ),
+        egui::ResizeDirection::NorthEast,
+        egui::CursorIcon::ResizeNorthEast,
+      ),
+      (
+        "south-west",
+        egui::Rect::from_min_size(
+          egui::pos2(rect.left(), rect.bottom() - corner),
+          egui::Vec2::splat(corner),
+        ),
+        egui::ResizeDirection::SouthWest,
+        egui::CursorIcon::ResizeSouthWest,
+      ),
+      (
+        "south-east",
+        egui::Rect::from_min_size(
+          rect.right_bottom() - egui::Vec2::splat(corner),
+          egui::Vec2::splat(corner),
+        ),
+        egui::ResizeDirection::SouthEast,
+        egui::CursorIcon::ResizeSouthEast,
+      ),
+    ];
+    for (name, handle, direction, cursor) in handles {
+      let response = root
+        .interact(
+          handle,
+          root.id().with(("window-resize", name)),
+          egui::Sense::drag(),
+        )
+        .on_hover_cursor(cursor);
+      if response.drag_started() {
+        root
+          .ctx()
+          .send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
       }
-      for page in pages {
-        self.navigation_item(ui, *page, compact);
-      }
-      ui.add_space(if compact { 5.0 } else { 8.0 });
+    }
+  }
+
+  fn page_container(&mut self, ui: &mut Ui) {
+    if matches!(self.snapshot.page, Page::Proxies | Page::Profiles) {
+      ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+          ui.set_min_width(ui.available_width());
+          self.page(ui);
+        });
+      return;
+    }
+    let full = matches!(
+      self.snapshot.page,
+      Page::Connections | Page::Rules | Page::Logs
+    );
+    if full {
+      ui.scope(|ui| {
+        ui.set_min_size(ui.available_size());
+        self.page(ui);
+      });
+    } else {
+      ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+          ui.set_min_width(ui.available_width());
+          Frame::new()
+            .inner_margin(egui::Margin {
+              left: geometry::PAGE_CONTENT_HORIZONTAL_MARGIN as i8,
+              right: geometry::PAGE_CONTENT_HORIZONTAL_MARGIN as i8,
+              top: geometry::PAGE_CONTENT_VERTICAL_PADDING as i8,
+              bottom: geometry::PAGE_CONTENT_VERTICAL_PADDING as i8,
+            })
+            .show(ui, |ui| self.page(ui));
+        });
+    }
+  }
+
+  fn navigation(&mut self, ui: &mut Ui, compact: bool) {
+    let tokens = theme::tokens(ui);
+    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+    let logo_height = if compact {
+      geometry::NAV_LOGO_COLLAPSED_HEIGHT
+    } else {
+      geometry::NAV_LOGO_HEIGHT
+    };
+    ui.allocate_ui_with_layout(
+      egui::vec2(ui.available_width(), logo_height),
+      Layout::left_to_right(Align::Center),
+      |ui| {
+        ui.add_space(20.0);
+        Frame::new()
+          .fill(tokens.accent)
+          .corner_radius(8)
+          .inner_margin(egui::Margin::symmetric(8, 5))
+          .show(ui, |ui| {
+            ui.label(RichText::new("R").size(18.0).strong().color(Color32::WHITE));
+          });
+        if !compact {
+          ui.add_space(8.0);
+          ui.label(RichText::new("rsclash").size(20.0).strong());
+        }
+      },
+    );
+
+    let traffic_height = if compact { 0.0 } else { 158.0 };
+    let menu_height = (ui.available_height() - traffic_height - 8.0).max(0.0);
+    ScrollArea::vertical()
+      .id_salt("cvr-navigation")
+      .max_height(menu_height)
+      .auto_shrink([false, false])
+      .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+      .show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.add_space(4.0);
+        for page in Page::ALL {
+          self.navigation_item(ui, page, compact);
+        }
+      });
+
+    if !compact {
+      self.navigation_traffic(ui);
     }
 
-    ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-      self.navigation_item(ui, Page::Settings, compact);
-      if !forced_compact {
-        let label = if compact { "»" } else { "«  收起侧栏" };
-        if ui
-          .add_sized(
-            [ui.available_width(), 34.0],
-            egui::Button::new(RichText::new(label).color(tokens.text_muted)).frame(false),
-          )
-          .clicked()
-        {
-          self.navigation_collapsed = !self.navigation_collapsed;
-        }
+    let response = ui.interact(
+      ui.max_rect(),
+      ui.id().with("navigation-context"),
+      egui::Sense::hover(),
+    );
+    response.context_menu(|ui| {
+      let label = if compact {
+        "展开导航栏"
+      } else {
+        "折叠导航栏"
+      };
+      if ui.button(label).clicked() {
+        self.navigation_collapsed = !compact;
+        ui.close();
       }
-      ui.add_space(8.0);
-      Frame::new()
-        .fill(tokens.surface)
-        .stroke(Stroke::new(1.0, tokens.border))
-        .corner_radius(10)
-        .inner_margin(if compact {
-          egui::Margin::same(8)
-        } else {
-          egui::Margin::symmetric(11, 9)
-        })
-        .show(ui, |ui| {
-          let running = matches!(self.snapshot.core, CoreState::Running { .. });
-          if compact {
-            ui.vertical_centered(|ui| {
-              ui.label(RichText::new("●").color(if running {
-                tokens.success
-              } else {
-                tokens.text_muted
-              }))
-              .on_hover_text(if running {
-                "Mihomo 正在运行"
-              } else {
-                "Mihomo 未运行"
-              });
-            });
-          } else {
-            ui.horizontal(|ui| {
-              ui.label(RichText::new("●").color(if running {
-                tokens.success
-              } else {
-                tokens.text_muted
-              }));
-              ui.vertical(|ui| {
-                ui.label(
-                  RichText::new(if running {
-                    "代理服务运行中"
-                  } else {
-                    "代理服务已停止"
-                  })
-                  .strong(),
-                );
-                ui.label(
-                  RichText::new(
-                    self
-                      .snapshot
-                      .profiles
-                      .current()
-                      .map_or("尚未选择配置", |profile| profile.name.as_str()),
-                  )
-                  .small()
-                  .weak(),
-                );
-              });
-            });
-          }
-        });
-      ui.add_space(8.0);
     });
   }
 
   fn navigation_item(&mut self, ui: &mut Ui, page: Page, compact: bool) {
     let selected = self.snapshot.page == page;
     let tokens = theme::tokens(ui);
-    let label = if compact {
-      page.symbol().to_string()
+    let outer_height = if compact {
+      geometry::NAV_COLLAPSED_ITEM_SIZE + geometry::NAV_COLLAPSED_ITEM_MARGIN * 2.0
     } else {
-      format!("{}   {}", page.symbol(), page.label())
+      geometry::NAV_ITEM_OUTER_HEIGHT
     };
-    let response = ui.add_sized(
-      [ui.available_width(), 39.0],
-      egui::Button::new(RichText::new(label).size(if compact { 18.0 } else { 14.5 }))
-        .selected(selected)
-        .fill(if selected {
-          tokens.accent_soft
-        } else {
-          Color32::TRANSPARENT
-        })
-        .stroke(Stroke::NONE)
-        .corner_radius(9),
+    let (outer, _) = ui.allocate_exact_size(
+      egui::vec2(ui.available_width(), outer_height),
+      egui::Sense::hover(),
     );
+    let button = if compact {
+      egui::Rect::from_center_size(
+        outer.center(),
+        egui::Vec2::splat(geometry::NAV_COLLAPSED_ITEM_SIZE),
+      )
+    } else {
+      let vertical_margin = (geometry::NAV_ITEM_OUTER_HEIGHT - geometry::NAV_ITEM_HEIGHT) / 2.0;
+      egui::Rect::from_min_max(
+        outer.min + egui::vec2(geometry::NAV_ITEM_HORIZONTAL_MARGIN, vertical_margin),
+        outer.max - egui::vec2(geometry::NAV_ITEM_HORIZONTAL_MARGIN, vertical_margin),
+      )
+    };
+    let response = ui.interact(
+      button,
+      ui.id().with(("navigation-item", page.label())),
+      egui::Sense::click(),
+    );
+    let fill = if selected {
+      tokens.accent_soft
+    } else if response.hovered() {
+      tokens.surface_raised
+    } else {
+      Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(
+      button,
+      if compact {
+        geometry::NAV_COLLAPSED_ITEM_RADIUS
+      } else {
+        geometry::NAV_ITEM_RADIUS
+      },
+      fill,
+    );
+    let text_color = ui.visuals().text_color();
+    if compact {
+      ui.painter().text(
+        button.center(),
+        egui::Align2::CENTER_CENTER,
+        page.symbol(),
+        egui::FontId::proportional(23.0),
+        text_color,
+      );
+    } else {
+      ui.painter().text(
+        egui::pos2(button.left() + 28.0, button.center().y),
+        egui::Align2::CENTER_CENTER,
+        page.symbol(),
+        egui::FontId::proportional(22.0),
+        text_color,
+      );
+      ui.painter().text(
+        egui::pos2(button.left() + 110.0, button.center().y),
+        egui::Align2::CENTER_CENTER,
+        page.label(),
+        egui::FontId::proportional(14.0),
+        text_color,
+      );
+    }
     if response.clicked() {
       self.command(UiCommand::Navigate(page));
     }
@@ -680,61 +864,220 @@ impl RsClashUi {
     }
   }
 
+  fn navigation_traffic(&self, ui: &mut Ui) {
+    let tokens = theme::tokens(ui);
+    let width = (ui.available_width() - geometry::NAV_TRAFFIC_HORIZONTAL_PADDING * 2.0).max(0.0);
+    ui.add_space(6.0);
+    ui.allocate_ui_with_layout(
+      egui::vec2(width, geometry::NAV_TRAFFIC_GRAPH_HEIGHT),
+      Layout::top_down(Align::Min),
+      |ui| {
+        ui.set_width(width);
+        let (response, painter) = ui.allocate_painter(
+          egui::vec2(width, geometry::NAV_TRAFFIC_GRAPH_HEIGHT),
+          egui::Sense::hover(),
+        );
+        painter.line_segment(
+          [
+            egui::pos2(response.rect.left(), response.rect.bottom() - 1.0),
+            egui::pos2(response.rect.right(), response.rect.bottom() - 1.0),
+          ],
+          Stroke::new(1.0, tokens.border),
+        );
+        paint_navigation_metric(
+          &painter,
+          response.rect,
+          &self.snapshot.mihomo.metrics,
+          false,
+          tokens.accent,
+        );
+        paint_navigation_metric(
+          &painter,
+          response.rect,
+          &self.snapshot.mihomo.metrics,
+          true,
+          tokens.warning,
+        );
+      },
+    );
+    ui.add_space(6.0);
+    let traffic = &self.snapshot.mihomo.traffic;
+    navigation_metric_row(
+      ui,
+      "↑",
+      &format_rate(traffic.upload_bytes_per_second),
+      tokens.warning,
+    );
+    navigation_metric_row(
+      ui,
+      "↓",
+      &format_rate(traffic.download_bytes_per_second),
+      tokens.accent,
+    );
+    navigation_metric_row(
+      ui,
+      "▣",
+      &format_bytes(self.snapshot.mihomo.memory_bytes),
+      tokens.text_muted,
+    );
+  }
+
   fn header(&mut self, ui: &mut Ui) {
     let tokens = theme::tokens(ui);
-    Frame::new()
-      .fill(tokens.surface)
-      .stroke(Stroke::new(1.0, tokens.border))
-      .inner_margin(egui::Margin::symmetric(22, 14))
+    egui::Panel::top("cvr-page-header")
+      .exact_size(geometry::PAGE_HEADER_HEIGHT)
+      .frame(
+        Frame::new()
+          .fill(tokens.surface)
+          .stroke(Stroke::new(1.0, tokens.border))
+          .inner_margin(egui::Margin::symmetric(
+            geometry::PAGE_HEADER_HORIZONTAL_PADDING as i8,
+            0,
+          )),
+      )
       .show(ui, |ui| {
         ui.horizontal(|ui| {
-          ui.vertical(|ui| {
-            ui.label(
-              RichText::new(self.snapshot.page.label())
-                .size(20.0)
-                .strong(),
-            );
-            ui.label(
-              RichText::new(page_description(self.snapshot.page))
-                .small()
-                .color(tokens.text_muted),
-            );
-          });
+          ui.label(
+            RichText::new(self.snapshot.page.label())
+              .size(20.0)
+              .strong(),
+          );
           ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.menu_button("⋮", |ui| {
-              if self.tray_is_available() && ui.button("隐藏到托盘").clicked() {
-                self.command(UiCommand::SetWindowVisible(false));
-                ui.close();
-              }
-              if ui.button("退出 rsclash").clicked() {
-                self.command(UiCommand::Shutdown);
-                ui.close();
-              }
-            });
-            let system_proxy = self.snapshot.system_proxy.clone();
-            if ui
-              .add_enabled(
-                !system_proxy.busy
-                  && (system_proxy.enabled
-                    || (system_proxy.available
-                      && (self.snapshot.settings.value.pac_url.is_some()
-                        || (self.snapshot.mihomo.connection == MihomoConnection::Connected
-                          && self.snapshot.mihomo.mixed_port.is_some())))),
-                egui::Button::new(if system_proxy.enabled {
-                  "系统代理已开启"
-                } else {
-                  "开启系统代理"
-                })
-                .selected(system_proxy.enabled),
-              )
-              .clicked()
-            {
-              self.command(UiCommand::SetSystemProxy(!system_proxy.enabled));
-            }
-            core_status_pill(ui, &self.snapshot.core);
+            self.page_header_actions(ui);
           });
         });
       });
+  }
+
+  fn page_header_actions(&mut self, ui: &mut Ui) {
+    match self.snapshot.page {
+      Page::Home => {
+        if header_icon_button(ui, "⚙", "首页卡片设置").clicked() {
+          self.command(UiCommand::Navigate(Page::Settings));
+        }
+        header_icon_button(ui, "?", "使用说明");
+        if header_icon_button(ui, "↻", "刷新状态").clicked() {
+          self.command(UiCommand::RefreshMihomo);
+          self.command(UiCommand::RefreshSystemProxy);
+        }
+      },
+      Page::Proxies => {
+        let current = self.snapshot.mihomo.mode.clone();
+        if ui
+          .add_sized(
+            [84.0, 30.0],
+            egui::Button::new("链式代理").selected(self.proxy_chain_mode),
+          )
+          .clicked()
+        {
+          self.proxy_chain_mode = !self.proxy_chain_mode;
+        }
+        for (mode, label) in [
+          (ProxyMode::Direct, "直连"),
+          (ProxyMode::Global, "全局"),
+          (ProxyMode::Rule, "规则"),
+        ] {
+          if ui
+            .add_sized(
+              [50.0, 30.0],
+              egui::Button::new(label).selected(current == mode),
+            )
+            .clicked()
+          {
+            self.command(UiCommand::SetProxyMode(mode));
+          }
+        }
+        if ui
+          .add_sized([76.0, 30.0], egui::Button::new("代理集合"))
+          .clicked()
+        {
+          self.proxy_provider_dialog = true;
+        }
+      },
+      Page::Profiles => {
+        if header_icon_button(ui, "♨", "重新激活当前配置").clicked()
+          && let Some(profile) = self.snapshot.profiles.current()
+        {
+          self.command(UiCommand::ActivateProfile {
+            uid: profile.uid.clone(),
+          });
+        }
+        if header_icon_button(ui, "↻", "更新全部订阅").clicked() {
+          self.command(UiCommand::UpdateAllProfiles);
+        }
+        if header_icon_button(ui, "☐", "批量管理").clicked() {
+          self.profile_batch_mode = !self.profile_batch_mode;
+          self.selected_profiles.clear();
+        }
+      },
+      Page::Connections => {
+        if ui
+          .add_sized([68.0, 30.0], egui::Button::new("关闭全部"))
+          .clicked()
+        {
+          self.command(UiCommand::CloseAllConnections);
+        }
+        ui.label(format!(
+          "↑ {}  ↓ {}",
+          format_bytes(self.snapshot.mihomo.traffic.upload_total),
+          format_bytes(self.snapshot.mihomo.traffic.download_total)
+        ));
+      },
+      Page::Rules => {
+        if ui
+          .add_sized([82.0, 30.0], egui::Button::new("规则集合"))
+          .clicked()
+        {
+          self.rule_editor_dialog = true;
+        }
+      },
+      Page::Logs => {
+        if ui
+          .add_sized([50.0, 30.0], egui::Button::new("清空"))
+          .clicked()
+        {
+          self.command(UiCommand::ClearLogs);
+        }
+        if header_icon_button(ui, "⇅", "切换日志顺序").clicked() {
+          self.log_reverse = !self.log_reverse;
+        }
+        let paused = self.snapshot.mihomo.logs_paused;
+        if header_icon_button(ui, if paused { "▶" } else { "Ⅱ" }, "暂停或继续").clicked() {
+          self.command(UiCommand::SetLogsPaused(!paused));
+        }
+      },
+      Page::Settings => {
+        let busy = self.snapshot.settings.busy;
+        if ui
+          .add_enabled(
+            !busy && self.settings_dirty,
+            egui::Button::new("保存").min_size(egui::vec2(52.0, 30.0)),
+          )
+          .clicked()
+        {
+          self.command(UiCommand::ApplySettings(Box::new(
+            self.settings_draft.clone(),
+          )));
+        }
+        if ui
+          .add_enabled(
+            !busy && self.settings_dirty,
+            egui::Button::new("放弃").min_size(egui::vec2(52.0, 30.0)),
+          )
+          .clicked()
+        {
+          self.settings_draft = self.snapshot.settings.value.clone();
+          self.settings_dirty = false;
+        }
+        if header_icon_button(ui, "↻", "刷新设置").clicked() {
+          self.command(UiCommand::RefreshSettings);
+        }
+        if busy {
+          ui.spinner();
+        }
+      },
+      Page::Unlock => {},
+    }
   }
 
   fn page(&mut self, ui: &mut Ui) {
@@ -797,72 +1140,109 @@ impl RsClashUi {
     let core = self.snapshot.core.clone();
     let mihomo = self.snapshot.mihomo.clone();
     let system_proxy = self.snapshot.system_proxy.clone();
-    ui.horizontal(|ui| {
-      mihomo_connection_pill(ui, mihomo.connection);
-      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if ui.button("刷新状态").clicked() {
-          self.command(UiCommand::RefreshMihomo);
-          self.command(UiCommand::RefreshSystemProxy);
-        }
-      });
-    });
-    ui.add_space(14.0);
-
     let cards = normalized_home_cards(&self.snapshot.settings.value.home_cards);
-    for (index, item) in cards.iter().enumerate() {
-      if index > 0 {
-        ui.add_space(12.0);
+    let viewport_width = ui.ctx().content_rect().width();
+    let two_columns = geometry::home_grid_columns(geometry::breakpoint(viewport_width)) == 2;
+
+    if cards.iter().any(|card| card == "profile") || cards.iter().any(|card| card == "proxy") {
+      if two_columns {
+        ui.columns(2, |columns| {
+          self.home_profile(&mut columns[0], &core);
+          self.home_current_proxy(&mut columns[1], &mihomo);
+        });
+      } else {
+        self.home_profile(ui, &core);
+        ui.add_space(geometry::GRID_GAP);
+        self.home_current_proxy(ui, &mihomo);
       }
-      match item.as_str() {
-        "profile" => self.home_profile(ui, &core, &mihomo),
-        "proxy" => self.home_proxy(ui, &mihomo),
-        "network" => self.home_network(ui, &core, &mihomo, &system_proxy),
-        "traffic" => self.home_traffic(ui, &mihomo),
-        _ => {},
+      ui.add_space(geometry::GRID_GAP);
+    }
+
+    if cards.iter().any(|card| card == "network") {
+      if two_columns {
+        ui.columns(2, |columns| {
+          self.home_network(&mut columns[0], &core, &mihomo, &system_proxy);
+          self.home_proxy(&mut columns[1], &mihomo);
+        });
+      } else {
+        self.home_network(ui, &core, &mihomo, &system_proxy);
+        ui.add_space(geometry::GRID_GAP);
+        self.home_proxy(ui, &mihomo);
       }
+      ui.add_space(geometry::GRID_GAP);
+    }
+
+    if cards.iter().any(|card| card == "traffic") {
+      self.home_traffic(ui, &mihomo);
     }
   }
 
-  fn home_profile(&mut self, ui: &mut Ui, core: &CoreState, mihomo: &MihomoSnapshot) {
-    ui.columns(2, |columns| {
-      card(&mut columns[0], "Mihomo 核心", |ui| {
-        self.core_controls(ui, core);
-      });
-      card(&mut columns[1], "当前代理", |ui| {
+  fn home_profile(&mut self, ui: &mut Ui, core: &CoreState) {
+    enhanced_card(ui, "配置", "☷", |ui| {
+      if let Some(profile) = self.snapshot.profiles.current() {
+        ui.label(RichText::new(&profile.name).size(18.0).strong());
         ui.label(
-          RichText::new(mihomo.current_proxy().unwrap_or("尚未选择"))
-            .size(18.0)
-            .strong(),
-        );
-        ui.label(
-          RichText::new(format!(
-            "{} · {}",
-            proxy_mode_label(&mihomo.mode),
-            mihomo.version.as_deref().unwrap_or("版本未知")
-          ))
-          .weak(),
-        );
-        ui.label(
-          RichText::new(format!(
-            "配置：{}",
-            self
-              .snapshot
-              .profiles
-              .current()
-              .map_or("默认配置", |profile| profile.name.as_str())
-          ))
+          RichText::new(match profile.source {
+            ProfileSourceKind::Local => "本地配置",
+            ProfileSourceKind::Remote => "远程订阅",
+            ProfileSourceKind::Merge
+            | ProfileSourceKind::Rules
+            | ProfileSourceKind::Proxies
+            | ProfileSourceKind::Groups
+            | ProfileSourceKind::Other => "扩展配置",
+          })
           .small()
           .weak(),
         );
-      });
+      } else {
+        ui.label(RichText::new("未选择配置").size(18.0).strong());
+        ui.label(RichText::new("请先导入并激活一个订阅").small().weak());
+      }
+      ui.add_space(geometry::MUI_SPACING);
+      ui.separator();
+      ui.add_space(geometry::MUI_SPACING);
+      self.core_controls(ui, core);
+    });
+  }
+
+  fn home_current_proxy(&self, ui: &mut Ui, mihomo: &MihomoSnapshot) {
+    enhanced_card(ui, "当前代理", "◉", |ui| {
+      ui.label(
+        RichText::new(mihomo.current_proxy().unwrap_or("尚未选择"))
+          .size(18.0)
+          .strong(),
+      );
+      ui.label(
+        RichText::new(format!(
+          "{} · {}",
+          proxy_mode_label(&mihomo.mode),
+          mihomo.version.as_deref().unwrap_or("版本未知")
+        ))
+        .weak(),
+      );
+      ui.add_space(geometry::MUI_SPACING);
+      mihomo_connection_pill(ui, mihomo.connection);
     });
   }
 
   fn home_proxy(&mut self, ui: &mut Ui, mihomo: &MihomoSnapshot) {
-    card(ui, "出站模式", |ui| {
-      self.mode_controls(ui, &mihomo.mode);
+    enhanced_card(ui, "代理模式", "⑂", |ui| {
+      ui.vertical_centered(|ui| {
+        self.mode_controls(ui, &mihomo.mode);
+      });
+      ui.add_space(geometry::MUI_SPACING);
+      ui.label(
+        RichText::new(match mihomo.mode {
+          ProxyMode::Rule => "按配置规则决定每个连接使用的策略。",
+          ProxyMode::Global => "全部连接使用全局代理组。",
+          ProxyMode::Direct => "全部连接直接访问网络。",
+          ProxyMode::Unknown(_) => "当前核心返回了未知代理模式。",
+        })
+        .small()
+        .weak(),
+      );
       if let Some(error) = mihomo.last_error.as_deref() {
-        ui.add_space(8.0);
+        ui.add_space(geometry::MUI_SPACING);
         ui.label(
           RichText::new(format!("控制器暂时不可用：{error}"))
             .small()
@@ -882,90 +1262,23 @@ impl RsClashUi {
     let can_enable_system_proxy = system_proxy.available
       && (self.snapshot.settings.value.pac_url.is_some()
         || (mihomo.connection == MihomoConnection::Connected && mihomo.mixed_port.is_some()));
-    ui.columns(2, |columns| {
-      card(&mut columns[0], "系统代理", |ui| {
-        ui.horizontal(|ui| {
-          ui.vertical(|ui| {
-            ui.label(
-              RichText::new(if system_proxy.enabled {
-                "已接管系统代理"
-              } else {
-                "未接管系统代理"
-              })
-              .size(18.0)
-              .strong(),
-            );
-            let backend = system_proxy
-              .backend
-              .as_deref()
-              .unwrap_or("正在检测 Linux 后端");
-            ui.label(RichText::new(backend).small().weak());
-          });
-          ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if system_proxy.busy {
-              ui.spinner();
-            }
-            if ui
-              .add_enabled(
-                !system_proxy.busy && (system_proxy.enabled || can_enable_system_proxy),
-                egui::Button::new(if system_proxy.enabled {
-                  "关闭系统代理"
-                } else {
-                  "启用系统代理"
-                }),
-              )
-              .clicked()
-            {
-              self.command(UiCommand::SetSystemProxy(!system_proxy.enabled));
-            }
-          });
-        });
-        if !system_proxy.available {
-          ui.add_space(8.0);
-          ui.label(
-            RichText::new(
-              system_proxy
-                .detail
-                .as_deref()
-                .unwrap_or("当前桌面环境不支持系统代理控制"),
-            )
-            .small()
-            .color(ui.visuals().warn_fg_color),
-          );
-        } else if system_proxy.enabled && !system_proxy.applied {
-          ui.add_space(8.0);
-          ui.label(
-            RichText::new("系统设置已在外部发生变化；rsclash 将保留外部修改，不再覆盖它。")
-              .small()
-              .color(ui.visuals().warn_fg_color),
-          );
-        } else if !can_enable_system_proxy && !system_proxy.enabled {
-          ui.add_space(8.0);
-          ui.label(
-            RichText::new("启动 Mihomo 后即可启用系统代理。")
-              .small()
-              .weak(),
-          );
+    let (tun_status, _, tun_available) = tun_capability(core, mihomo.tun_enabled);
+    enhanced_card(ui, "网络设置", "⌁", |ui| {
+      ui.horizontal(|ui| {
+        if ui
+          .add_enabled(
+            !system_proxy.busy && (system_proxy.enabled || can_enable_system_proxy),
+            egui::Button::new("系统代理").selected(system_proxy.enabled),
+          )
+          .clicked()
+        {
+          self.command(UiCommand::SetSystemProxy(!system_proxy.enabled));
         }
-      });
-      card(&mut columns[1], "TUN 模式", |ui| {
-        let (status, detail, available) = tun_capability(core, mihomo.tun_enabled);
-        ui.label(
-          RichText::new(status)
-            .size(18.0)
-            .strong()
-            .color(if available {
-              theme::tokens(ui).success
-            } else {
-              ui.visuals().warn_fg_color
-            }),
-        );
-        ui.label(RichText::new(detail).small().weak());
         let enabled = self.snapshot.settings.value.tun_enabled;
         if ui
           .add_enabled(
-            available || enabled,
-            egui::Button::new(if enabled { "关闭 TUN" } else { "启用 TUN" }).selected(enabled),
+            tun_available || enabled,
+            egui::Button::new("TUN 模式").selected(enabled),
           )
           .clicked()
         {
@@ -973,29 +1286,64 @@ impl RsClashUi {
           settings.tun_enabled = !enabled;
           self.command(UiCommand::ApplySettings(Box::new(settings)));
         }
+        if system_proxy.busy {
+          ui.spinner();
+        }
       });
+      ui.add_space(geometry::MUI_SPACING);
+      let backend = system_proxy
+        .backend
+        .as_deref()
+        .unwrap_or("正在检测 Linux 系统代理后端");
+      ui.label(RichText::new(backend).small().weak());
+      ui.label(RichText::new(tun_status).small().weak());
+      if !system_proxy.available {
+        ui.label(
+          RichText::new(
+            system_proxy
+              .detail
+              .as_deref()
+              .unwrap_or("当前桌面环境不支持系统代理控制"),
+          )
+          .small()
+          .color(ui.visuals().warn_fg_color),
+        );
+      }
     });
   }
 
   fn home_traffic(&self, ui: &mut Ui, mihomo: &MihomoSnapshot) {
-    let memory = if self.snapshot.settings.value.memory_usage {
-      format_bytes(mihomo.memory_bytes)
-    } else {
-      "已隐藏".to_string()
-    };
-    ui.columns(2, |columns| {
-      card(&mut columns[0], "实时流量", |ui| {
+    enhanced_card(ui, "流量统计", "⇅", |ui| {
+      if !mihomo.metrics.is_empty() && self.snapshot.settings.value.traffic_graph {
+        ui.allocate_ui_with_layout(
+          egui::vec2(ui.available_width(), 130.0),
+          Layout::top_down(Align::Min),
+          |ui| metric_chart(ui, &mihomo.metrics),
+        );
+        ui.add_space(geometry::MUI_SPACING);
+      }
+      let memory = if self.snapshot.settings.value.memory_usage {
+        format_bytes(mihomo.memory_bytes)
+      } else {
+        "已隐藏".to_string()
+      };
+      ui.columns(3, |columns| {
         stat_pair(
-          ui,
+          &mut columns[0],
           "上传",
           &format_rate(mihomo.traffic.upload_bytes_per_second),
           "下载",
           &format_rate(mihomo.traffic.download_bytes_per_second),
         );
-      });
-      card(&mut columns[1], "资源使用", |ui| {
         stat_pair(
-          ui,
+          &mut columns[1],
+          "累计上传",
+          &format_bytes(mihomo.traffic.upload_total),
+          "累计下载",
+          &format_bytes(mihomo.traffic.download_total),
+        );
+        stat_pair(
+          &mut columns[2],
           "内存",
           &memory,
           "连接",
@@ -1003,57 +1351,12 @@ impl RsClashUi {
         );
       });
     });
-    if !mihomo.metrics.is_empty() && self.snapshot.settings.value.traffic_graph {
-      ui.add_space(12.0);
-      card(ui, "实时流量与内存", |ui| {
-        ui.label(
-          RichText::new(format!(
-            "固定保留最近 {} 个采样；页面隐藏后停止订阅。",
-            mihomo.metrics.len()
-          ))
-          .small()
-          .weak(),
-        );
-        metric_chart(ui, &mihomo.metrics);
-      });
-    }
   }
 
   fn proxies(&mut self, ui: &mut Ui) {
     let mihomo = self.snapshot.mihomo.clone();
     let view = Arc::clone(&mihomo.proxy_view);
-    ui.horizontal(|ui| {
-      ui.label(
-        RichText::new(format!(
-          "{} 个代理组 · {} 个节点",
-          view.groups.len() + usize::from(view.global.is_some()),
-          view.records.len()
-        ))
-        .weak(),
-      );
-      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if mihomo.proxy_busy {
-          ui.spinner();
-        }
-        if ui
-          .add_enabled(!mihomo.proxy_busy, egui::Button::new("全部测速"))
-          .clicked()
-        {
-          self.command(UiCommand::TestAllProxies);
-        }
-        if ui
-          .add_enabled(!mihomo.proxy_busy, egui::Button::new("刷新"))
-          .clicked()
-        {
-          self.command(UiCommand::RefreshMihomo);
-        }
-      });
-    });
-    ui.add_space(16.0);
-    card(ui, "出站模式", |ui| {
-      self.mode_controls(ui, &mihomo.mode)
-    });
-    ui.add_space(12.0);
+    self.proxy_provider_dialog(ui.ctx(), &view, mihomo.proxy_busy);
 
     if mihomo.connection == MihomoConnection::Offline {
       empty_state(
@@ -1061,6 +1364,10 @@ impl RsClashUi {
         "Mihomo 尚未运行",
         "启动核心后即可读取代理组并选择节点。",
       );
+      return;
+    }
+    if mihomo.mode == ProxyMode::Direct {
+      empty_state(ui, "直连模式", "直连模式不使用代理组。");
       return;
     }
     if view.groups.is_empty() && view.global.is_none() {
@@ -1072,56 +1379,19 @@ impl RsClashUi {
       return;
     }
 
-    card(ui, "查找与布局", |ui| {
-      ui.horizontal_wrapped(|ui| {
-        ui.add(
-          egui::TextEdit::singleline(&mut self.proxy_search)
-            .hint_text("搜索名称、类型或来源")
-            .desired_width(240.0),
-        );
-        ui.checkbox(&mut self.proxy_regex, "正则");
-        ui.checkbox(&mut self.proxy_whole_word, "全词");
-        ui.checkbox(&mut self.proxy_detailed, "详细");
-      });
-      ui.horizontal_wrapped(|ui| {
-        ui.label("排序");
-        for (sort, label) in [
-          (ProxySort::Configuration, "配置顺序"),
-          (ProxySort::Name, "名称"),
-          (ProxySort::Delay, "延迟"),
-        ] {
-          ui.selectable_value(&mut self.proxy_sort, sort, label);
-        }
-        if ui.button("展开全部").clicked() {
-          self
-            .expanded_proxy_groups
-            .extend(proxy_groups(&view).map(|group| group.name.clone()));
-        }
-        if ui.button("折叠全部").clicked() {
-          self.expanded_proxy_groups.clear();
-        }
-        if ui.button("定位当前").clicked()
-          && let Some((group, selected)) = proxy_groups(&view).find_map(|group| {
-            group
-              .selected
-              .clone()
-              .map(|selected| (group.name.clone(), selected))
-          })
-        {
-          self.expanded_proxy_groups.insert(group.clone());
-          self.locate_proxy = Some((group, selected));
-        }
-      });
-    });
-    ui.add_space(12.0);
-
-    self.proxy_chain_editor(
-      ui,
-      &view,
-      mihomo.proxy_busy || self.snapshot.profiles.busy,
-      mihomo.proxy_chain.connected,
-    );
-    ui.add_space(12.0);
+    if self.proxy_chain_mode {
+      Frame::new()
+        .inner_margin(egui::Margin::symmetric(8, 4))
+        .show(ui, |ui| {
+          self.proxy_chain_editor(
+            ui,
+            &view,
+            mihomo.proxy_busy || self.snapshot.profiles.busy,
+            mihomo.proxy_chain.connected,
+          );
+        });
+      ui.add_space(geometry::TOOLBAR_GAP);
+    }
 
     let regex = if self.proxy_regex && !self.proxy_search.is_empty() {
       let pattern = if self.proxy_whole_word {
@@ -1147,62 +1417,50 @@ impl RsClashUi {
       None
     };
 
-    let groups = proxy_groups(&view).collect::<Vec<_>>();
-    let requested_columns = usize::from(self.snapshot.settings.value.proxy_layout_columns.max(1));
-    let fitting_columns = ((ui.available_width() / 360.0).floor() as usize).max(1);
-    let column_count = requested_columns
-      .min(fitting_columns)
-      .min(groups.len().max(1));
-    for row in groups.chunks(column_count) {
-      ui.columns(column_count, |columns| {
-        for (column, group) in columns.iter_mut().zip(row) {
-          self.proxy_group_view(column, group, &view, regex.as_ref(), mihomo.proxy_busy);
-        }
-      });
-      ui.add_space(12.0);
+    for group in proxy_groups(&view) {
+      self.proxy_group_view(ui, group, &view, regex.as_ref(), mihomo.proxy_busy);
     }
+  }
 
-    if !view.providers.is_empty() {
-      ui.horizontal(|ui| {
-        ui.label(RichText::new("代理 Providers").size(20.0).strong());
-        if ui
-          .add_enabled(!mihomo.proxy_busy, egui::Button::new("更新全部"))
-          .clicked()
-        {
-          self.command(UiCommand::UpdateAllProxyProviders);
-        }
-      });
-      ui.add_space(8.0);
-      for provider in &view.providers {
-        card(ui, &provider.name, |ui| {
-          ui.label(
-            RichText::new(format!(
-              "{} · {} · {} 个节点",
-              provider.kind,
-              provider.vehicle_type,
-              provider.proxy_record_ids.len()
-            ))
-            .small()
-            .weak(),
-          );
-          if let Some(updated_at) = provider.updated_at.as_deref() {
-            ui.label(
-              RichText::new(format!("最近更新：{updated_at}"))
-                .small()
-                .weak(),
-            );
+  fn proxy_provider_dialog(&mut self, context: &egui::Context, view: &ProxyViewV1, busy: bool) {
+    if !self.proxy_provider_dialog {
+      return;
+    }
+    let mut open = self.proxy_provider_dialog;
+    egui::Window::new("代理集合")
+      .open(&mut open)
+      .default_width(520.0)
+      .show(context, |ui| {
+        ui.horizontal(|ui| {
+          ui.label(format!("{} 个 Provider", view.providers.len()));
+          if ui
+            .add_enabled(!busy, egui::Button::new("更新全部"))
+            .clicked()
+          {
+            self.command(UiCommand::UpdateAllProxyProviders);
           }
-          ui.horizontal(|ui| {
-            if ui
-              .add_enabled(!mihomo.proxy_busy, egui::Button::new("更新"))
-              .clicked()
-            {
+        });
+        for provider in &view.providers {
+          ui.separator();
+          ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(&provider.name).strong());
+            ui.label(
+              RichText::new(format!(
+                "{} · {} · {} 个节点",
+                provider.kind,
+                provider.vehicle_type,
+                provider.proxy_record_ids.len()
+              ))
+              .small()
+              .weak(),
+            );
+            if ui.add_enabled(!busy, egui::Button::new("更新")).clicked() {
               self.command(UiCommand::UpdateProxyProvider {
                 name: provider.name.clone(),
               });
             }
             if ui
-              .add_enabled(!mihomo.proxy_busy, egui::Button::new("健康检查"))
+              .add_enabled(!busy, egui::Button::new("健康检查"))
               .clicked()
             {
               self.command(UiCommand::HealthcheckProxyProvider {
@@ -1210,10 +1468,9 @@ impl RsClashUi {
               });
             }
           });
-        });
-        ui.add_space(10.0);
-      }
-    }
+        }
+      });
+    self.proxy_provider_dialog = open;
   }
 
   fn proxy_chain_editor(&mut self, ui: &mut Ui, view: &ProxyViewV1, busy: bool, connected: bool) {
@@ -1380,75 +1637,145 @@ impl RsClashUi {
     busy: bool,
   ) {
     let expanded = self.expanded_proxy_groups.contains(&group.name);
-    let mut toggle = false;
-    let mut test_group = false;
-    card(ui, &group.name, |ui| {
-      ui.horizontal(|ui| {
-        ui.label(RichText::new(&group.kind).small().weak());
-        if let Some(selected) = group.selected.as_deref() {
-          ui.label(RichText::new(format!("当前：{selected}")).small().weak());
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-          if ui
-            .add_enabled(!busy, egui::Button::new("测速本组"))
-            .clicked()
-          {
-            test_group = true;
-          }
-          if ui.button(if expanded { "收起" } else { "展开" }).clicked() {
-            toggle = true;
-          }
-        });
-      });
-      if expanded {
-        let mut items = group
-          .members
-          .iter()
-          .map(|member| proxy_display_item(member, view))
-          .filter(|item| {
-            proxy_item_matches(
-              item,
-              &self.proxy_search,
-              regex,
-              self.proxy_regex,
-              self.proxy_whole_word,
-            )
-          })
-          .collect::<Vec<_>>();
-        sort_proxy_items(&mut items, self.proxy_sort);
-        if items.is_empty() {
-          ui.label(RichText::new("没有符合筛选条件的成员。").small().weak());
-        } else {
-          let row_height = if self.proxy_detailed { 62.0 } else { 36.0 };
-          ScrollArea::vertical()
-            .id_salt(("proxy-members", &group.name))
-            .max_height((row_height * items.len().min(10) as f32).max(row_height))
-            .auto_shrink([false, true])
-            .show_rows(ui, row_height, items.len(), |ui, rows| {
-              for item in &items[rows] {
-                self.proxy_item_row(ui, group, item, busy);
-              }
-            });
-        }
-      } else {
-        ui.label(
-          RichText::new(format!("{} 个成员", group.members.len()))
-            .small()
-            .weak(),
-        );
-      }
-    });
-    if toggle {
+    let (outer, _) =
+      ui.allocate_exact_size(egui::vec2(ui.available_width(), 76.0), egui::Sense::hover());
+    let header = outer.shrink2(egui::vec2(8.0, 4.0));
+    let tools = egui::Rect::from_center_size(
+      egui::pos2(header.right() - 80.0, header.center().y),
+      egui::vec2(126.0, 36.0),
+    );
+    let toggle_rect =
+      egui::Rect::from_min_max(header.min, egui::pos2(tools.left() - 4.0, header.bottom()));
+    let toggle = ui.interact(
+      toggle_rect,
+      ui.id().with(("proxy-group", &group.name)),
+      egui::Sense::click(),
+    );
+    let tokens = theme::tokens(ui);
+    ui.painter()
+      .rect_filled(header, geometry::GLOBAL_RADIUS, tokens.surface);
+    if toggle.hovered() {
+      ui.painter()
+        .rect_filled(header, geometry::GLOBAL_RADIUS, tokens.surface_raised);
+    }
+    ui.painter().text(
+      egui::pos2(header.left() + 16.0, header.center().y - 11.0),
+      egui::Align2::LEFT_CENTER,
+      &group.name,
+      egui::FontId::proportional(16.0),
+      ui.visuals().text_color(),
+    );
+    ui.painter().text(
+      egui::pos2(header.left() + 16.0, header.center().y + 12.0),
+      egui::Align2::LEFT_CENTER,
+      format!(
+        "{}    {}",
+        group.kind,
+        group.selected.as_deref().unwrap_or("未选择")
+      ),
+      egui::FontId::proportional(13.0),
+      tokens.text_muted,
+    );
+    let test_rect = egui::Rect::from_center_size(
+      egui::pos2(header.right() - 80.0, header.center().y),
+      egui::vec2(72.0, 30.0),
+    );
+    let test = ui.interact(
+      test_rect,
+      ui.id().with(("test-proxy-group", &group.name)),
+      egui::Sense::click(),
+    );
+    if test.hovered() {
+      ui.painter().rect_filled(test_rect, 6.0, tokens.accent_soft);
+    }
+    ui.painter().text(
+      test_rect.center(),
+      egui::Align2::CENTER_CENTER,
+      "测速本组",
+      egui::FontId::proportional(12.0),
+      tokens.accent,
+    );
+    ui.painter().text(
+      egui::pos2(header.right() - 20.0, header.center().y),
+      egui::Align2::CENTER_CENTER,
+      if expanded { "⌃" } else { "⌄" },
+      egui::FontId::proportional(20.0),
+      ui.visuals().text_color(),
+    );
+    if toggle.clicked() {
       if expanded {
         self.expanded_proxy_groups.remove(&group.name);
       } else {
         self.expanded_proxy_groups.insert(group.name.clone());
       }
     }
-    if test_group {
+    if test.clicked() && !busy {
       self.command(UiCommand::TestProxyGroup {
         name: group.name.clone(),
       });
+    }
+    if !expanded {
+      return;
+    }
+
+    ui.allocate_ui_with_layout(
+      egui::vec2(ui.available_width(), geometry::PROFILE_CONTENT_OFFSET),
+      Layout::left_to_right(Align::Center),
+      |ui| {
+        ui.add_space(16.0);
+        ui.add_sized(
+          [(ui.available_width() - 250.0).max(100.0), 36.0],
+          egui::TextEdit::singleline(&mut self.proxy_search).hint_text("过滤"),
+        );
+        egui::ComboBox::from_id_salt(("proxy-sort", &group.name))
+          .width(92.0)
+          .selected_text(match self.proxy_sort {
+            ProxySort::Configuration => "默认排序",
+            ProxySort::Name => "名称",
+            ProxySort::Delay => "延迟",
+          })
+          .show_ui(ui, |ui| {
+            ui.selectable_value(&mut self.proxy_sort, ProxySort::Configuration, "默认排序");
+            ui.selectable_value(&mut self.proxy_sort, ProxySort::Name, "名称");
+            ui.selectable_value(&mut self.proxy_sort, ProxySort::Delay, "延迟");
+          });
+        ui.checkbox(&mut self.proxy_regex, ".*");
+      },
+    );
+
+    let mut items = group
+      .members
+      .iter()
+      .map(|member| proxy_display_item(member, view))
+      .filter(|item| {
+        proxy_item_matches(
+          item,
+          &self.proxy_search,
+          regex,
+          self.proxy_regex,
+          self.proxy_whole_word,
+        )
+      })
+      .collect::<Vec<_>>();
+    sort_proxy_items(&mut items, self.proxy_sort);
+    if items.is_empty() {
+      empty_state(ui, "没有代理", "本组没有符合过滤条件的节点。");
+      return;
+    }
+    let viewport_width = ui.ctx().content_rect().width();
+    let columns = geometry::proxy_grid_columns(
+      viewport_width,
+      self.snapshot.settings.value.proxy_layout_columns,
+    )
+    .min(items.len())
+    .max(1);
+    for row in items.chunks(columns) {
+      ui.columns(columns, |column_uis| {
+        for (column, item) in column_uis.iter_mut().zip(row) {
+          self.proxy_item_row(column, group, item, busy);
+        }
+      });
+      ui.add_space(8.0);
     }
   }
 
@@ -1460,42 +1787,84 @@ impl RsClashUi {
     busy: bool,
   ) {
     let selected = group.selected.as_deref() == Some(item.name.as_str());
-    ui.horizontal(|ui| {
-      let response = ui.add_enabled(
-        !busy && item.unresolved.is_none() && (item.alive || selected),
-        egui::Button::new(&item.name).selected(selected),
+    let (rect, response) =
+      ui.allocate_exact_size(egui::vec2(ui.available_width(), 56.0), egui::Sense::click());
+    let tokens = theme::tokens(ui);
+    ui.painter().rect_filled(
+      rect,
+      12.0,
+      if selected {
+        tokens.accent_soft
+      } else if response.hovered() {
+        tokens.surface_raised
+      } else {
+        tokens.surface
+      },
+    );
+    if selected {
+      ui.painter().rect_stroke(
+        rect,
+        12.0,
+        Stroke::new(1.0, tokens.accent),
+        egui::StrokeKind::Inside,
       );
-      if response.clicked() {
-        self.command(UiCommand::SelectProxy {
-          group: group.name.clone(),
-          proxy: item.name.clone(),
-        });
-      }
-      if self.locate_proxy.as_ref() == Some(&(group.name.clone(), item.name.clone())) {
-        response.scroll_to_me(Some(Align::Center));
-        self.locate_proxy = None;
-      }
-      ui.label(
-        RichText::new(
-          item
-            .delay_ms
-            .map_or_else(|| "—".to_string(), |delay| format!("{delay} ms")),
+    }
+    ui.painter().text(
+      egui::pos2(rect.left() + 12.0, rect.center().y - 9.0),
+      egui::Align2::LEFT_CENTER,
+      &item.name,
+      egui::FontId::proportional(14.0),
+      ui.visuals().text_color(),
+    );
+    ui.painter().text(
+      egui::pos2(rect.left() + 12.0, rect.center().y + 11.0),
+      egui::Align2::LEFT_CENTER,
+      if self.proxy_detailed {
+        format!(
+          "{} · {} · {}",
+          item.kind,
+          item.source,
+          proxy_capability_label(&item.capabilities)
         )
-        .small()
-        .color(proxy_delay_color(ui, item.delay_ms, item.alive)),
-      );
+      } else {
+        item.kind.clone()
+      },
+      egui::FontId::proportional(11.0),
+      tokens.text_muted,
+    );
+    ui.painter().text(
+      egui::pos2(rect.right() - 12.0, rect.center().y),
+      egui::Align2::RIGHT_CENTER,
+      item
+        .delay_ms
+        .map_or_else(|| "—".to_string(), |delay| format!("{delay} ms")),
+      egui::FontId::proportional(12.0),
+      proxy_delay_color(ui, item.delay_ms, item.alive),
+    );
+    if response.clicked() && !busy && item.unresolved.is_none() && (item.alive || selected) {
+      self.command(UiCommand::SelectProxy {
+        group: group.name.clone(),
+        proxy: item.name.clone(),
+      });
+    }
+    if self.locate_proxy.as_ref() == Some(&(group.name.clone(), item.name.clone())) {
+      response.scroll_to_me(Some(Align::Center));
+      self.locate_proxy = None;
+    }
+    response.context_menu(|ui| {
       if let Some(record_id) = item.record_id.as_ref()
         && ui.add_enabled(!busy, egui::Button::new("测速")).clicked()
       {
         self.command(UiCommand::TestProxy {
           record_id: record_id.clone(),
         });
+        ui.close();
       }
       if item.chain_eligible
         && ui
           .add_enabled(
             !busy && !self.snapshot.mihomo.proxy_chain.connected,
-            egui::Button::new("加入链"),
+            egui::Button::new("加入代理链"),
           )
           .clicked()
       {
@@ -1504,6 +1873,7 @@ impl RsClashUi {
         } else {
           self.proxy_chain_nodes.push(item.name.clone());
         }
+        ui.close();
       }
       if let Some(reason) = item.unresolved {
         ui.label(
@@ -1513,290 +1883,367 @@ impl RsClashUi {
         );
       }
     });
-    if self.proxy_detailed {
-      ui.label(
-        RichText::new(format!(
-          "{} · {} · {}",
-          item.kind,
-          item.source,
-          proxy_capability_label(&item.capabilities)
-        ))
-        .small()
-        .weak(),
-      );
-    }
-    ui.separator();
   }
 
   fn rules(&mut self, ui: &mut Ui) {
     let mihomo = self.snapshot.mihomo.clone();
-    ui.horizontal(|ui| {
-      ui.label(RichText::new(format!("当前加载 {} 条规则", mihomo.rules.len())).weak());
-      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if ui.button("刷新").clicked() {
-          self.command(UiCommand::RefreshMihomo);
-        }
-      });
-    });
-    ui.add_space(14.0);
-
-    card(ui, "规则生成器", |ui| {
-      ui.horizontal_wrapped(|ui| {
-        egui::ComboBox::from_id_salt("rule-draft-kind")
-          .selected_text(&self.rule_draft.kind)
-          .show_ui(ui, |ui| {
-            for kind in RULE_KINDS {
-              ui.selectable_value(&mut self.rule_draft.kind, kind.to_string(), *kind);
-            }
-          });
-        if self.rule_draft.kind != "MATCH" {
-          ui.add(
-            egui::TextEdit::singleline(&mut self.rule_draft.payload)
-              .hint_text(rule_payload_hint(&self.rule_draft.kind))
-              .desired_width(260.0),
-          );
-        }
-        ui.add(
-          egui::TextEdit::singleline(&mut self.rule_draft.target)
-            .hint_text("目标代理组或策略")
-            .desired_width(180.0),
-        );
-        if rule_supports_no_resolve(&self.rule_draft.kind) {
-          ui.checkbox(&mut self.rule_draft.no_resolve, "no-resolve");
-        }
-      });
-      ui.label(
-        RichText::new(
-          "覆盖 Domain、IP、Geo、ASN、进程、端口、网络、入站、RULE-SET、逻辑组合与 MATCH。",
-        )
-        .small()
-        .weak(),
-      );
-      if ui.button("加入当前配置的规则扩展").clicked() {
-        match build_rule_draft(&self.rule_draft) {
-          Ok(rule) => {
-            let target = self.snapshot.profiles.current().and_then(|profile| {
-              profile
-                .enhancements
-                .rules
-                .as_ref()
-                .map(|uid| (uid.clone(), format!("{} · 规则", profile.name)))
-            });
-            if let Some((uid, name)) = target {
-              self.pending_rule_append = Some(rule);
-              self.open_sequence_editor(uid, name, SequenceEditorKind::Rules);
-              self.command(UiCommand::Navigate(Page::Profiles));
-            } else {
-              self.local_error = Some("当前没有可编辑的活动 profile。".to_string());
-            }
-          },
-          Err(error) => self.local_error = Some(error),
-        }
-      }
-    });
-    ui.add_space(12.0);
-
-    if !mihomo.rule_providers.is_empty() {
-      card(ui, "Rule Providers", |ui| {
-        for provider in mihomo.rule_providers.iter() {
-          ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(&provider.name).strong());
-            ui.label(
-              RichText::new(format!(
-                "{} · {} · {} 条 · {}",
-                provider.behavior, provider.format, provider.rule_count, provider.updated_at
-              ))
-              .small()
-              .weak(),
-            );
-            if ui.button("更新").clicked() {
-              self.command(UiCommand::UpdateRuleProvider {
-                name: provider.name.clone(),
-              });
-            }
-          });
-        }
-      });
-      ui.add_space(12.0);
-    }
-
-    card(
-      ui,
-      &format!("规则列表 · {} 条", mihomo.rules.len()),
+    self.rule_tools_dialog(ui.ctx(), &mihomo);
+    ui.allocate_ui_with_layout(
+      egui::vec2(ui.available_width(), geometry::PROFILE_CONTENT_OFFSET),
+      Layout::left_to_right(Align::Center),
       |ui| {
-        ui.add(
-          egui::TextEdit::singleline(&mut self.rule_search)
-            .hint_text("搜索类型、内容或目标")
-            .desired_width(320.0),
+        ui.add_space(geometry::PAGE_CONTENT_HORIZONTAL_MARGIN);
+        ui.add_sized(
+          [
+            (ui.available_width() - geometry::PAGE_CONTENT_HORIZONTAL_MARGIN).max(120.0),
+            geometry::RULE_TOOLBAR_HEIGHT,
+          ],
+          egui::TextEdit::singleline(&mut self.rule_search).hint_text("搜索"),
         );
-        let query = self.rule_search.trim().to_ascii_lowercase();
-        let filtered = mihomo
-          .rules
-          .iter()
-          .filter(|rule| rule_matches(rule, &query))
-          .collect::<Vec<_>>();
-        let row_height = 44.0;
-        ScrollArea::vertical()
-          .id_salt("rules-list")
-          .max_height(620.0)
-          .auto_shrink([false, true])
-          .show_rows(ui, row_height, filtered.len(), |ui, rows| {
-            for rule in &filtered[rows] {
-              ui.horizontal(|ui| {
-                ui.label(RichText::new(&rule.kind).strong());
-                ui.label(&rule.payload);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                  ui.label(RichText::new(&rule.proxy).small().strong());
-                  ui.label(RichText::new(format!("#{}", rule.index)).small().weak());
-                });
-              });
-              ui.separator();
-            }
-          });
       },
     );
+
+    let query = self.rule_search.trim().to_ascii_lowercase();
+    let filtered = mihomo
+      .rules
+      .iter()
+      .filter(|rule| rule_matches(rule, &query))
+      .collect::<Vec<_>>();
+    if filtered.is_empty() {
+      empty_state(ui, "没有规则", "当前配置没有符合搜索条件的规则。");
+      return;
+    }
+
+    ScrollArea::vertical()
+      .id_salt("cvr-rules-list")
+      .auto_shrink([false, false])
+      .show_rows(ui, geometry::RULE_ROW_HEIGHT, filtered.len(), |ui, rows| {
+        for rule in &filtered[rows] {
+          let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), geometry::RULE_ROW_HEIGHT),
+            egui::Sense::click(),
+          );
+          if response.hovered() {
+            ui.painter()
+              .rect_filled(rect, 0.0, theme::tokens(ui).surface_raised);
+          }
+          ui.painter().text(
+            egui::pos2(rect.left() + 31.0, rect.center().y),
+            egui::Align2::CENTER_CENTER,
+            format!("{}", rule.index + 1),
+            egui::FontId::proportional(13.0),
+            theme::tokens(ui).text_muted,
+          );
+          ui.painter().text(
+            egui::pos2(rect.left() + 64.0, rect.center().y - 8.0),
+            egui::Align2::LEFT_CENTER,
+            if rule.payload.is_empty() {
+              "-"
+            } else {
+              &rule.payload
+            },
+            egui::FontId::proportional(14.0),
+            ui.visuals().text_color(),
+          );
+          ui.painter().text(
+            egui::pos2(rect.left() + 64.0, rect.center().y + 9.0),
+            egui::Align2::LEFT_CENTER,
+            format!("{}    {}", rule.kind, rule.proxy),
+            egui::FontId::proportional(12.0),
+            theme::tokens(ui).text_muted,
+          );
+          ui.painter().line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            Stroke::new(1.0, theme::tokens(ui).border),
+          );
+        }
+      });
+  }
+
+  fn rule_tools_dialog(&mut self, context: &egui::Context, mihomo: &MihomoSnapshot) {
+    if !self.rule_editor_dialog {
+      return;
+    }
+    let mut open = self.rule_editor_dialog;
+    egui::Window::new("规则集合")
+      .open(&mut open)
+      .default_width(560.0)
+      .show(context, |ui| {
+        ui.horizontal(|ui| {
+          ui.label(format!("当前加载 {} 条规则", mihomo.rules.len()));
+          if ui.button("刷新").clicked() {
+            self.command(UiCommand::RefreshMihomo);
+          }
+        });
+        if !mihomo.rule_providers.is_empty() {
+          ui.add_space(geometry::GRID_GAP);
+          ui.label(RichText::new("Rule Providers").strong());
+          for provider in mihomo.rule_providers.iter() {
+            ui.horizontal_wrapped(|ui| {
+              ui.label(&provider.name);
+              ui.label(
+                RichText::new(format!(
+                  "{} · {} · {} 条",
+                  provider.behavior, provider.format, provider.rule_count
+                ))
+                .small()
+                .weak(),
+              );
+              if ui.button("更新").clicked() {
+                self.command(UiCommand::UpdateRuleProvider {
+                  name: provider.name.clone(),
+                });
+              }
+            });
+          }
+        }
+        ui.add_space(geometry::GRID_GAP);
+        ui.separator();
+        ui.add_space(geometry::GRID_GAP);
+        ui.label(RichText::new("规则生成器").strong());
+        ui.horizontal_wrapped(|ui| {
+          egui::ComboBox::from_id_salt("rule-draft-kind")
+            .selected_text(&self.rule_draft.kind)
+            .show_ui(ui, |ui| {
+              for kind in RULE_KINDS {
+                ui.selectable_value(&mut self.rule_draft.kind, kind.to_string(), *kind);
+              }
+            });
+          if self.rule_draft.kind != "MATCH" {
+            ui.add(
+              egui::TextEdit::singleline(&mut self.rule_draft.payload)
+                .hint_text(rule_payload_hint(&self.rule_draft.kind)),
+            );
+          }
+          ui.add(egui::TextEdit::singleline(&mut self.rule_draft.target).hint_text("目标策略"));
+          if rule_supports_no_resolve(&self.rule_draft.kind) {
+            ui.checkbox(&mut self.rule_draft.no_resolve, "no-resolve");
+          }
+        });
+        if ui.button("加入当前配置的规则扩展").clicked() {
+          match build_rule_draft(&self.rule_draft) {
+            Ok(rule) => {
+              let target = self.snapshot.profiles.current().and_then(|profile| {
+                profile
+                  .enhancements
+                  .rules
+                  .as_ref()
+                  .map(|uid| (uid.clone(), format!("{} · 规则", profile.name)))
+              });
+              if let Some((uid, name)) = target {
+                self.pending_rule_append = Some(rule);
+                self.open_sequence_editor(uid, name, SequenceEditorKind::Rules);
+                self.command(UiCommand::Navigate(Page::Profiles));
+              } else {
+                self.local_error = Some("当前没有可编辑的活动 profile。".to_string());
+              }
+            },
+            Err(error) => self.local_error = Some(error),
+          }
+        }
+      });
+    self.rule_editor_dialog = open;
   }
 
   fn connections(&mut self, ui: &mut Ui) {
     let mihomo = self.snapshot.mihomo.clone();
-    card(ui, "连接控制", |ui| {
-      ui.horizontal_wrapped(|ui| {
-        ui.selectable_value(&mut self.show_closed_connections, false, "活动");
-        ui.selectable_value(&mut self.show_closed_connections, true, "已关闭");
-        if ui
-          .button(if mihomo.connections_paused {
-            "继续"
-          } else {
-            "暂停"
-          })
-          .clicked()
-        {
-          self.command(UiCommand::SetConnectionsPaused(!mihomo.connections_paused));
-        }
-        if ui.button("关闭全部活动连接").clicked() {
-          self.command(UiCommand::CloseAllConnections);
-        }
-        if ui.button("清空已关闭").clicked() {
-          self.command(UiCommand::ClearClosedConnections);
-        }
-      });
-      ui.horizontal_wrapped(|ui| {
-        ui.add(
-          egui::TextEdit::singleline(&mut self.connection_search)
-            .hint_text("搜索地址、进程、规则或链")
-            .desired_width(280.0),
-        );
-        ui.label("排序");
-        for (sort, label) in [
-          (ConnectionSort::Traffic, "流量"),
-          (ConnectionSort::Destination, "目标"),
-          (ConnectionSort::Process, "进程"),
-          (ConnectionSort::Started, "时间"),
-        ] {
-          ui.selectable_value(&mut self.connection_sort, sort, label);
-        }
-      });
-      ui.horizontal_wrapped(|ui| {
-        ui.label("列");
-        ui.checkbox(&mut self.connection_show_process, "进程");
-        ui.checkbox(&mut self.connection_show_rule, "规则");
-        ui.checkbox(&mut self.connection_show_chains, "链");
-      });
-    });
-    ui.add_space(12.0);
-
     let source = if self.show_closed_connections {
       mihomo.closed_connections.as_ref()
     } else {
       mihomo.connections.as_ref()
     };
+    let active_count = mihomo.connections.len();
+    let closed_count = mihomo.closed_connections.len();
+
+    ui.allocate_ui_with_layout(
+      egui::vec2(ui.available_width(), geometry::PROFILE_CONTENT_OFFSET),
+      Layout::left_to_right(Align::Center),
+      |ui| {
+        ui.add_space(geometry::PAGE_CONTENT_HORIZONTAL_MARGIN);
+        if ui
+          .add_sized(
+            [72.0, 30.0],
+            egui::Button::new(format!("活动 {active_count}"))
+              .selected(!self.show_closed_connections),
+          )
+          .clicked()
+        {
+          self.show_closed_connections = false;
+        }
+        if ui
+          .add_sized(
+            [72.0, 30.0],
+            egui::Button::new(format!("已关闭 {closed_count}"))
+              .selected(self.show_closed_connections),
+          )
+          .clicked()
+        {
+          self.show_closed_connections = true;
+        }
+        egui::ComboBox::from_id_salt("connection-order")
+          .width(90.0)
+          .selected_text(match self.connection_sort {
+            ConnectionSort::Traffic => "默认排序",
+            ConnectionSort::Destination => "目标",
+            ConnectionSort::Process => "进程",
+            ConnectionSort::Started => "时间",
+          })
+          .show_ui(ui, |ui| {
+            ui.selectable_value(
+              &mut self.connection_sort,
+              ConnectionSort::Traffic,
+              "默认排序",
+            );
+            ui.selectable_value(
+              &mut self.connection_sort,
+              ConnectionSort::Destination,
+              "目标",
+            );
+            ui.selectable_value(&mut self.connection_sort, ConnectionSort::Process, "进程");
+            ui.selectable_value(&mut self.connection_sort, ConnectionSort::Started, "时间");
+          });
+        ui.add_sized(
+          [
+            (ui.available_width() - geometry::PAGE_CONTENT_HORIZONTAL_MARGIN).max(100.0),
+            geometry::CONNECTION_TOOLBAR_MIN_HEIGHT,
+          ],
+          egui::TextEdit::singleline(&mut self.connection_search).hint_text("搜索"),
+        );
+      },
+    );
+
     let query = self.connection_search.trim().to_ascii_lowercase();
     let mut connections = source
       .iter()
       .filter(|connection| connection_matches(connection, &query))
       .collect::<Vec<_>>();
     sort_connections(&mut connections, self.connection_sort);
-    card(ui, &format!("{} 条连接", connections.len()), |ui| {
-      let row_height = 58.0;
-      ScrollArea::vertical()
-        .id_salt("connections-list")
-        .max_height(620.0)
-        .auto_shrink([false, true])
-        .show_rows(ui, row_height, connections.len(), |ui, rows| {
+    if connections.is_empty() {
+      empty_state(ui, "没有连接", "当前没有符合条件的连接。");
+      return;
+    }
+
+    ScrollArea::vertical()
+      .id_salt("cvr-connections-list")
+      .auto_shrink([false, false])
+      .show_rows(
+        ui,
+        geometry::CONNECTION_ROW_HEIGHT,
+        connections.len(),
+        |ui, rows| {
           for connection in &connections[rows] {
             self.connection_row(ui, connection, self.show_closed_connections);
           }
-        });
-    });
+        },
+      );
     if let Some(id) = self.selected_connection.as_deref()
       && let Some(connection) = source.iter().find(|connection| connection.id == id)
     {
-      ui.add_space(12.0);
-      connection_detail(ui, connection);
+      let mut open = true;
+      egui::Window::new("连接详情")
+        .open(&mut open)
+        .default_width(460.0)
+        .show(ui.ctx(), |ui| connection_detail(ui, connection));
+      if !open {
+        self.selected_connection = None;
+      }
     }
   }
 
   fn connection_row(&mut self, ui: &mut Ui, connection: &ConnectionSnapshot, closed: bool) {
-    ui.horizontal(|ui| {
-      if ui
-        .selectable_label(
-          self.selected_connection.as_deref() == Some(connection.id.as_str()),
-          &connection.destination,
-        )
-        .clicked()
-      {
-        self.selected_connection = Some(connection.id.clone());
-      }
-      ui.label(
-        RichText::new(format!(
-          "↑ {}  ↓ {}",
-          format_bytes(connection.upload),
-          format_bytes(connection.download)
-        ))
-        .small(),
+    let (rect, _) = ui.allocate_exact_size(
+      egui::vec2(ui.available_width(), geometry::CONNECTION_ROW_HEIGHT),
+      egui::Sense::hover(),
+    );
+    let content_rect =
+      egui::Rect::from_min_max(rect.min, egui::pos2(rect.right() - 48.0, rect.bottom()));
+    let response = ui.interact(
+      content_rect,
+      ui.id().with(("connection-row", &connection.id)),
+      egui::Sense::click(),
+    );
+    if response.hovered() {
+      ui.painter()
+        .rect_filled(rect, 0.0, theme::tokens(ui).surface_raised);
+    }
+    if response.clicked() {
+      self.selected_connection = Some(connection.id.clone());
+    }
+    ui.painter().text(
+      egui::pos2(rect.left() + 12.0, rect.center().y - 9.0),
+      egui::Align2::LEFT_CENTER,
+      &connection.destination,
+      egui::FontId::proportional(14.0),
+      ui.visuals().text_color(),
+    );
+    let mut tags = vec![connection.network.clone()];
+    if self.connection_show_process && !connection.process.is_empty() {
+      tags.push(connection.process.clone());
+    }
+    if self.connection_show_rule && !connection.rule.is_empty() {
+      tags.push(format!("{} {}", connection.rule, connection.rule_payload));
+    }
+    if self.connection_show_chains && !connection.chains.is_empty() {
+      tags.push(
+        connection
+          .chains
+          .iter()
+          .rev()
+          .cloned()
+          .collect::<Vec<_>>()
+          .join(" → "),
       );
-      if !closed && ui.button("关闭").clicked() {
+    }
+    tags.push(format!(
+      "↑ {} / ↓ {}",
+      format_bytes(connection.upload),
+      format_bytes(connection.download)
+    ));
+    ui.painter().text(
+      egui::pos2(rect.left() + 12.0, rect.center().y + 11.0),
+      egui::Align2::LEFT_CENTER,
+      tags.join("   "),
+      egui::FontId::proportional(10.0),
+      theme::tokens(ui).text_muted,
+    );
+    if !closed {
+      let close_rect = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 24.0, rect.center().y),
+        egui::vec2(32.0, 32.0),
+      );
+      let close = ui.interact(
+        close_rect,
+        ui.id().with(("close-connection", &connection.id)),
+        egui::Sense::click(),
+      );
+      if close.clicked() {
         self.command(UiCommand::CloseConnection {
           id: connection.id.clone(),
         });
       }
-    });
-    ui.horizontal_wrapped(|ui| {
-      ui.label(RichText::new(&connection.network).small().weak());
-      if self.connection_show_process && !connection.process.is_empty() {
-        ui.label(RichText::new(&connection.process).small().weak());
-      }
-      if self.connection_show_rule && !connection.rule.is_empty() {
-        ui.label(
-          RichText::new(format!("{} {}", connection.rule, connection.rule_payload))
-            .small()
-            .weak(),
-        );
-      }
-      if self.connection_show_chains && !connection.chains.is_empty() {
-        ui.label(
-          RichText::new(
-            connection
-              .chains
-              .iter()
-              .rev()
-              .cloned()
-              .collect::<Vec<_>>()
-              .join(" → "),
-          )
-          .small()
-          .weak(),
-        );
-      }
-    });
-    ui.separator();
+      ui.painter().text(
+        close_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "×",
+        egui::FontId::proportional(18.0),
+        ui.visuals().text_color(),
+      );
+    }
+    ui.painter().line_segment(
+      [rect.left_bottom(), rect.right_bottom()],
+      Stroke::new(1.0, theme::tokens(ui).border),
+    );
   }
 
   fn logs(&mut self, ui: &mut Ui) {
     let mihomo = self.snapshot.mihomo.clone();
-    card(ui, "日志控制", |ui| {
-      ui.horizontal_wrapped(|ui| {
+    ui.allocate_ui_with_layout(
+      egui::vec2(ui.available_width(), geometry::PROFILE_CONTENT_OFFSET),
+      Layout::left_to_right(Align::Center),
+      |ui| {
+        ui.add_space(geometry::PAGE_CONTENT_HORIZONTAL_MARGIN);
         egui::ComboBox::from_id_salt("log-level")
+          .width(88.0)
           .selected_text(stream_log_level_label(self.log_level))
           .show_ui(ui, |ui| {
             for level in [
@@ -1814,182 +2261,59 @@ impl RsClashUi {
               }
             }
           });
-        ui.add(
-          egui::TextEdit::singleline(&mut self.log_search)
-            .hint_text("搜索等级或内容")
-            .desired_width(300.0),
+        ui.add_sized(
+          [
+            (ui.available_width() - geometry::PAGE_CONTENT_HORIZONTAL_MARGIN).max(120.0),
+            geometry::LOG_TOOLBAR_HEIGHT,
+          ],
+          egui::TextEdit::singleline(&mut self.log_search).hint_text("搜索"),
         );
-        ui.checkbox(&mut self.log_reverse, "最新在前");
-        if ui
-          .button(if mihomo.logs_paused {
-            "继续"
-          } else {
-            "暂停"
-          })
-          .clicked()
-        {
-          self.command(UiCommand::SetLogsPaused(!mihomo.logs_paused));
-        }
-        if ui.button("清空").clicked() {
-          self.command(UiCommand::ClearLogs);
-        }
-      });
-    });
-    ui.add_space(12.0);
+      },
+    );
+
     let query = self.log_search.trim().to_ascii_lowercase();
     let filtered = mihomo
       .logs
       .iter()
       .filter(|log| log_matches(log, &query))
       .collect::<Vec<_>>();
-    card(ui, &format!("日志 · {} 条", filtered.len()), |ui| {
-      let row_height = 34.0;
-      ScrollArea::vertical()
-        .id_salt("logs-list")
-        .max_height(680.0)
-        .stick_to_bottom(!self.log_reverse && query.is_empty())
-        .auto_shrink([false, true])
-        .show_rows(ui, row_height, filtered.len(), |ui, rows| {
-          for visual_index in rows {
-            let index = if self.log_reverse {
-              filtered.len() - 1 - visual_index
-            } else {
-              visual_index
-            };
-            log_row(ui, filtered[index]);
-          }
-        });
-    });
+    if filtered.is_empty() {
+      empty_state(ui, "没有日志", "Mihomo 尚未产生符合条件的日志。");
+      return;
+    }
+    ScrollArea::vertical()
+      .id_salt("cvr-logs-list")
+      .stick_to_bottom(!self.log_reverse && query.is_empty())
+      .auto_shrink([false, false])
+      .show_rows(ui, geometry::LOG_ROW_HEIGHT, filtered.len(), |ui, rows| {
+        for visual_index in rows {
+          let index = if self.log_reverse {
+            filtered.len() - 1 - visual_index
+          } else {
+            visual_index
+          };
+          log_row(ui, filtered[index]);
+        }
+      });
   }
 
   fn profiles(&mut self, ui: &mut Ui) {
     let profiles = self.snapshot.profiles.clone();
-    let has_remote = profiles
-      .items
-      .iter()
-      .any(|profile| profile.source == ProfileSourceKind::Remote);
-    ui.horizontal(|ui| {
-      ui.label(RichText::new(format!("{} 个配置来源", profiles.items.len())).weak());
-      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        if profiles.busy {
-          ui.spinner();
-        } else if ui.button("刷新列表").clicked() {
-          self.command(UiCommand::RefreshProfiles);
-        }
-        if ui
-          .add_enabled(!profiles.busy && has_remote, egui::Button::new("更新全部"))
-          .clicked()
-        {
-          self.command(UiCommand::UpdateAllProfiles);
-        }
-        if !profiles.items.is_empty()
-          && ui
-            .add_enabled(
-              !profiles.busy,
-              egui::Button::new(if self.profile_batch_mode {
-                "完成批量管理"
-              } else {
-                "批量管理"
-              }),
-            )
-            .clicked()
-        {
-          self.profile_batch_mode = !self.profile_batch_mode;
-          self.selected_profiles.clear();
-          self.pending_batch_delete = false;
-        }
-      });
-    });
-    ui.add_space(16.0);
-
-    profile_diagnostics_card(ui, &profiles.diagnostics);
-    ui.add_space(16.0);
+    self.profile_import_toolbar(ui, profiles.busy);
+    self.profile_create_dialog(ui.ctx(), profiles.busy);
 
     if self.profile_editor.is_some() {
       self.profile_yaml_editor(ui, profiles.busy);
-      ui.add_space(16.0);
+      ui.add_space(geometry::GRID_GAP);
     }
     if self.sequence_editor.is_some() {
       self.profile_sequence_editor(ui, profiles.busy);
-      ui.add_space(16.0);
+      ui.add_space(geometry::GRID_GAP);
     }
     if self.profile_qr.is_some() {
       self.profile_qr_viewer(ui);
-      ui.add_space(16.0);
+      ui.add_space(geometry::GRID_GAP);
     }
-
-    ui.columns(2, |columns| {
-      card(&mut columns[0], "导入本地配置", |ui| {
-        ui.add(egui::TextEdit::singleline(&mut self.local_profile_name).hint_text("配置名称"));
-        ui.add(
-          egui::TextEdit::singleline(&mut self.local_profile_path)
-            .hint_text("/path/to/profile.yaml"),
-        );
-        if ui
-          .add_enabled(!profiles.busy, egui::Button::new("导入本地文件"))
-          .clicked()
-        {
-          self.command(UiCommand::ImportLocalProfile {
-            name: self.local_profile_name.trim().to_string(),
-            path: self.local_profile_path.trim().to_string(),
-          });
-        }
-      });
-      card(&mut columns[1], "添加远程订阅", |ui| {
-        ui.add(egui::TextEdit::singleline(&mut self.remote_profile_name).hint_text("订阅名称"));
-        let url_edit = ui.add(
-          egui::TextEdit::singleline(&mut self.remote_profile_url)
-            .password(true)
-            .hint_text("HTTP(S) URL 或 clash:// 深链"),
-        );
-        if ui.button("从剪贴板粘贴").clicked() {
-          url_edit.request_focus();
-          ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
-        }
-        ui.collapsing("下载选项", |ui| {
-          remote_profile_options_editor(ui, &mut self.remote_profile_options);
-        });
-        if ui
-          .add_enabled(!profiles.busy, egui::Button::new("下载并导入"))
-          .clicked()
-        {
-          self.command(UiCommand::ImportRemoteProfile {
-            name: self.remote_profile_name.trim().to_string(),
-            url: self.remote_profile_url.trim().to_string(),
-            options: self.remote_profile_options.clone(),
-          });
-        }
-      });
-    });
-    ui.add_space(12.0);
-    card(ui, "文件、拖放与二维码", |ui| {
-      ui.label(
-        RichText::new("可将 YAML 或 PNG/JPEG 二维码直接拖入窗口；也可以输入二维码图片路径。")
-          .small()
-          .weak(),
-      );
-      ui.horizontal(|ui| {
-        ui.add(
-          egui::TextEdit::singleline(&mut self.qr_profile_name).hint_text("订阅名称（可留空）"),
-        );
-        ui.add(
-          egui::TextEdit::singleline(&mut self.qr_profile_path)
-            .hint_text("/path/to/subscription-qr.png"),
-        );
-        if ui
-          .add_enabled(!profiles.busy, egui::Button::new("识别并导入"))
-          .clicked()
-        {
-          self.command(UiCommand::ImportProfileQr {
-            name: self.qr_profile_name.trim().to_string(),
-            path: self.qr_profile_path.trim().to_string(),
-            options: self.remote_profile_options.clone(),
-          });
-        }
-      });
-    });
-    ui.add_space(16.0);
 
     if profiles.items.is_empty() {
       empty_state(
@@ -2057,302 +2381,416 @@ impl RsClashUi {
       ui.add_space(10.0);
     }
 
-    for (profile_index, profile) in profiles.items.iter().enumerate() {
-      card(ui, &profile.name, |ui| {
-        ui.horizontal(|ui| {
-          if self.profile_batch_mode {
-            let mut selected = self.selected_profiles.contains(&profile.uid);
-            if ui.checkbox(&mut selected, "").changed() {
-              if selected {
-                self.selected_profiles.insert(profile.uid.clone());
-              } else {
-                self.selected_profiles.remove(&profile.uid);
+    let viewport_width = ui.ctx().content_rect().width();
+    let column_count = geometry::profile_grid_columns(geometry::breakpoint(viewport_width)).max(1);
+    for (row_index, row) in profiles.items.chunks(column_count).enumerate() {
+      ui.columns(column_count, |columns| {
+        for (offset, (column, profile)) in columns.iter_mut().zip(row).enumerate() {
+          let profile_index = row_index * column_count + offset;
+          card(column, &profile.name, |ui| {
+            ui.horizontal(|ui| {
+              if self.profile_batch_mode {
+                let mut selected = self.selected_profiles.contains(&profile.uid);
+                if ui.checkbox(&mut selected, "").changed() {
+                  if selected {
+                    self.selected_profiles.insert(profile.uid.clone());
+                  } else {
+                    self.selected_profiles.remove(&profile.uid);
+                  }
+                  self.pending_batch_delete = false;
+                }
               }
-              self.pending_batch_delete = false;
-            }
-          }
-          let source = match profile.source {
-            ProfileSourceKind::Local => "本地",
-            ProfileSourceKind::Remote => "远程订阅",
-            ProfileSourceKind::Merge => "合并配置",
-            ProfileSourceKind::Rules => "规则扩展",
-            ProfileSourceKind::Proxies => "代理扩展",
-            ProfileSourceKind::Groups => "代理组扩展",
-            ProfileSourceKind::Other => "扩展配置",
-          };
-          ui.label(RichText::new(source).small().weak());
-          if profile.active {
-            ui.label(
-              RichText::new("当前使用")
+              let source = match profile.source {
+                ProfileSourceKind::Local => "本地",
+                ProfileSourceKind::Remote => "远程订阅",
+                ProfileSourceKind::Merge => "合并配置",
+                ProfileSourceKind::Rules => "规则扩展",
+                ProfileSourceKind::Proxies => "代理扩展",
+                ProfileSourceKind::Groups => "代理组扩展",
+                ProfileSourceKind::Other => "扩展配置",
+              };
+              ui.label(RichText::new(source).small().weak());
+              if profile.active {
+                ui.label(
+                  RichText::new("当前使用")
+                    .small()
+                    .strong()
+                    .color(Color32::from_rgb(38, 162, 105)),
+                );
+              }
+            });
+            if let Some(usage) = profile.usage {
+              let used = usage.upload.saturating_add(usage.download);
+              ui.label(
+                RichText::new(format!(
+                  "流量：{} / {} · 到期时间：{}",
+                  format_bytes(used),
+                  format_bytes(usage.total),
+                  if usage.expire == 0 {
+                    "未提供".to_string()
+                  } else {
+                    usage.expire.to_string()
+                  }
+                ))
                 .small()
-                .strong()
-                .color(Color32::from_rgb(38, 162, 105)),
-            );
-          }
-        });
-        if let Some(usage) = profile.usage {
-          let used = usage.upload.saturating_add(usage.download);
-          ui.label(
-            RichText::new(format!(
-              "流量：{} / {} · 到期时间：{}",
-              format_bytes(used),
-              format_bytes(usage.total),
-              if usage.expire == 0 {
-                "未提供".to_string()
-              } else {
-                usage.expire.to_string()
-              }
-            ))
-            .small()
-            .weak(),
-          );
-        }
-        if let Some(updated_at) = profile.updated_at {
-          ui.label(
-            RichText::new(format!("最近更新：{}", format_update_age(updated_at)))
-              .small()
-              .weak(),
-          );
-        }
-        if let Some(home_page) = profile.home_page.as_deref() {
-          ui.label(
-            RichText::new(format!("订阅主页：{home_page}"))
-              .small()
-              .weak(),
-          );
-        }
-        if self.profile_batch_mode {
-          return;
-        }
-
-        if self.renaming_profile.as_deref() == Some(profile.uid.as_str()) {
-          let edit = self
-            .profile_name_edits
-            .entry(profile.uid.clone())
-            .or_insert_with(|| profile.name.clone());
-          let mut save = false;
-          let mut cancel = false;
-          ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(edit).hint_text("配置名称"));
-            save = ui
-              .add_enabled(!profiles.busy, egui::Button::new("保存"))
-              .clicked();
-            cancel = ui.button("取消").clicked();
-          });
-          if save {
-            let name = self
-              .profile_name_edits
-              .get(&profile.uid)
-              .cloned()
-              .unwrap_or_default();
-            self.command(UiCommand::RenameProfile {
-              uid: profile.uid.clone(),
-              name,
-            });
-            self.renaming_profile = None;
-          } else if cancel {
-            self.renaming_profile = None;
-          }
-        }
-
-        if self.editing_profile_options.as_deref() == Some(profile.uid.as_str())
-          && let Some(original) = profile.remote_options.as_ref()
-        {
-          let edit = self
-            .profile_options_edits
-            .entry(profile.uid.clone())
-            .or_insert_with(|| original.clone());
-          remote_profile_options_editor(ui, edit);
-          let mut save = false;
-          let mut cancel = false;
-          ui.horizontal(|ui| {
-            save = ui
-              .add_enabled(!profiles.busy, egui::Button::new("保存下载设置"))
-              .clicked();
-            cancel = ui.button("取消").clicked();
-          });
-          if save {
-            let options = self
-              .profile_options_edits
-              .get(&profile.uid)
-              .cloned()
-              .unwrap_or_default();
-            self.command(UiCommand::SetRemoteProfileOptions {
-              uid: profile.uid.clone(),
-              options,
-            });
-            self.editing_profile_options = None;
-          } else if cancel {
-            self.editing_profile_options = None;
-          }
-        }
-
-        ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
-          let source_profile = matches!(
-            profile.source,
-            ProfileSourceKind::Local | ProfileSourceKind::Remote
-          );
-          if ui
-            .add_enabled(
-              !profiles.busy && source_profile && !profile.active,
-              egui::Button::new(if profile.active {
-                "已激活"
-              } else {
-                "激活"
-              }),
-            )
-            .clicked()
-          {
-            self.command(UiCommand::ActivateProfile {
-              uid: profile.uid.clone(),
-            });
-          }
-          if profile.source == ProfileSourceKind::Remote
-            && ui
-              .add_enabled(!profiles.busy, egui::Button::new("更新"))
-              .clicked()
-          {
-            self.command(UiCommand::UpdateProfile {
-              uid: profile.uid.clone(),
-            });
-          }
-          if let Some(options) = profile.remote_options.as_ref()
-            && ui
-              .add_enabled(!profiles.busy, egui::Button::new("下载设置"))
-              .clicked()
-          {
-            self
-              .profile_options_edits
-              .insert(profile.uid.clone(), options.clone());
-            self.editing_profile_options = Some(profile.uid.clone());
-          }
-          if profile.source == ProfileSourceKind::Remote
-            && ui
-              .add_enabled(!profiles.busy, egui::Button::new("分享二维码"))
-              .clicked()
-          {
-            self.command(UiCommand::RequestProfileQr {
-              uid: profile.uid.clone(),
-            });
-          }
-          if ui
-            .add_enabled(
-              !profiles.busy && profile.source != ProfileSourceKind::Other,
-              egui::Button::new("编辑 YAML"),
-            )
-            .clicked()
-          {
-            self.open_profile_editor(profile.uid.clone(), profile.name.clone());
-          }
-          if let Some(uid) = profile.enhancements.merge.as_deref()
-            && ui
-              .add_enabled(!profiles.busy, egui::Button::new("扩展配置"))
-              .clicked()
-          {
-            self.open_profile_editor(uid.to_string(), format!("{} · 合并配置", profile.name));
-          }
-          for (label, uid, kind) in [
-            (
-              "编辑规则",
-              profile.enhancements.rules.as_deref(),
-              SequenceEditorKind::Rules,
-            ),
-            (
-              "编辑代理",
-              profile.enhancements.proxies.as_deref(),
-              SequenceEditorKind::Proxies,
-            ),
-            (
-              "编辑代理组",
-              profile.enhancements.groups.as_deref(),
-              SequenceEditorKind::Groups,
-            ),
-          ] {
-            if let Some(uid) = uid
-              && ui
-                .add_enabled(!profiles.busy, egui::Button::new(label))
-                .clicked()
-            {
-              self.open_sequence_editor(
-                uid.to_string(),
-                format!("{} · {}", profile.name, kind.label()),
-                kind,
+                .weak(),
               );
             }
-          }
-          if ui
-            .add_enabled(
-              !profiles.busy && profile.source != ProfileSourceKind::Other,
-              egui::Button::new("复制"),
-            )
-            .clicked()
-          {
-            self.command(UiCommand::DuplicateProfile {
-              uid: profile.uid.clone(),
-            });
-          }
-          if ui
-            .add_enabled(!profiles.busy, egui::Button::new("重命名"))
-            .clicked()
-          {
-            self
-              .profile_name_edits
-              .insert(profile.uid.clone(), profile.name.clone());
-            self.renaming_profile = Some(profile.uid.clone());
-          }
-          if ui
-            .add_enabled(
-              !profiles.busy && profile_index > 0,
-              egui::Button::new("上移"),
-            )
-            .clicked()
-          {
-            self.command(UiCommand::ReorderProfile {
-              uid: profile.uid.clone(),
-              new_index: profile_index - 1,
-            });
-          }
-          if ui
-            .add_enabled(
-              !profiles.busy && profile_index + 1 < profiles.items.len(),
-              egui::Button::new("下移"),
-            )
-            .clicked()
-          {
-            self.command(UiCommand::ReorderProfile {
-              uid: profile.uid.clone(),
-              new_index: profile_index + 1,
-            });
-          }
-          let delete_pending = self.pending_profile_delete.as_deref() == Some(profile.uid.as_str());
-          if ui
-            .add_enabled(
-              !profiles.busy,
-              egui::Button::new(if delete_pending {
-                "确认删除"
-              } else {
-                "删除"
-              }),
-            )
-            .clicked()
-          {
-            if delete_pending {
-              self.command(UiCommand::DeleteProfiles {
-                uids: vec![profile.uid.clone()],
-              });
-              self.pending_profile_delete = None;
-            } else {
-              self.pending_profile_delete = Some(profile.uid.clone());
+            if let Some(updated_at) = profile.updated_at {
+              ui.label(
+                RichText::new(format!("最近更新：{}", format_update_age(updated_at)))
+                  .small()
+                  .weak(),
+              );
             }
-          }
-          if delete_pending && ui.button("取消删除").clicked() {
-            self.pending_profile_delete = None;
-          }
-        });
+            if let Some(home_page) = profile.home_page.as_deref() {
+              ui.label(
+                RichText::new(format!("订阅主页：{home_page}"))
+                  .small()
+                  .weak(),
+              );
+            }
+            if self.profile_batch_mode {
+              return;
+            }
+
+            if self.renaming_profile.as_deref() == Some(profile.uid.as_str()) {
+              let edit = self
+                .profile_name_edits
+                .entry(profile.uid.clone())
+                .or_insert_with(|| profile.name.clone());
+              let mut save = false;
+              let mut cancel = false;
+              ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(edit).hint_text("配置名称"));
+                save = ui
+                  .add_enabled(!profiles.busy, egui::Button::new("保存"))
+                  .clicked();
+                cancel = ui.button("取消").clicked();
+              });
+              if save {
+                let name = self
+                  .profile_name_edits
+                  .get(&profile.uid)
+                  .cloned()
+                  .unwrap_or_default();
+                self.command(UiCommand::RenameProfile {
+                  uid: profile.uid.clone(),
+                  name,
+                });
+                self.renaming_profile = None;
+              } else if cancel {
+                self.renaming_profile = None;
+              }
+            }
+
+            if self.editing_profile_options.as_deref() == Some(profile.uid.as_str())
+              && let Some(original) = profile.remote_options.as_ref()
+            {
+              let edit = self
+                .profile_options_edits
+                .entry(profile.uid.clone())
+                .or_insert_with(|| original.clone());
+              remote_profile_options_editor(ui, edit);
+              let mut save = false;
+              let mut cancel = false;
+              ui.horizontal(|ui| {
+                save = ui
+                  .add_enabled(!profiles.busy, egui::Button::new("保存下载设置"))
+                  .clicked();
+                cancel = ui.button("取消").clicked();
+              });
+              if save {
+                let options = self
+                  .profile_options_edits
+                  .get(&profile.uid)
+                  .cloned()
+                  .unwrap_or_default();
+                self.command(UiCommand::SetRemoteProfileOptions {
+                  uid: profile.uid.clone(),
+                  options,
+                });
+                self.editing_profile_options = None;
+              } else if cancel {
+                self.editing_profile_options = None;
+              }
+            }
+
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+              let source_profile = matches!(
+                profile.source,
+                ProfileSourceKind::Local | ProfileSourceKind::Remote
+              );
+              if ui
+                .add_enabled(
+                  !profiles.busy && source_profile && !profile.active,
+                  egui::Button::new(if profile.active {
+                    "已激活"
+                  } else {
+                    "激活"
+                  }),
+                )
+                .clicked()
+              {
+                self.command(UiCommand::ActivateProfile {
+                  uid: profile.uid.clone(),
+                });
+              }
+              if profile.source == ProfileSourceKind::Remote
+                && ui
+                  .add_enabled(!profiles.busy, egui::Button::new("更新"))
+                  .clicked()
+              {
+                self.command(UiCommand::UpdateProfile {
+                  uid: profile.uid.clone(),
+                });
+              }
+              if let Some(options) = profile.remote_options.as_ref()
+                && ui
+                  .add_enabled(!profiles.busy, egui::Button::new("下载设置"))
+                  .clicked()
+              {
+                self
+                  .profile_options_edits
+                  .insert(profile.uid.clone(), options.clone());
+                self.editing_profile_options = Some(profile.uid.clone());
+              }
+              if profile.source == ProfileSourceKind::Remote
+                && ui
+                  .add_enabled(!profiles.busy, egui::Button::new("分享二维码"))
+                  .clicked()
+              {
+                self.command(UiCommand::RequestProfileQr {
+                  uid: profile.uid.clone(),
+                });
+              }
+              if ui
+                .add_enabled(
+                  !profiles.busy && profile.source != ProfileSourceKind::Other,
+                  egui::Button::new("编辑 YAML"),
+                )
+                .clicked()
+              {
+                self.open_profile_editor(profile.uid.clone(), profile.name.clone());
+              }
+              if let Some(uid) = profile.enhancements.merge.as_deref()
+                && ui
+                  .add_enabled(!profiles.busy, egui::Button::new("扩展配置"))
+                  .clicked()
+              {
+                self.open_profile_editor(uid.to_string(), format!("{} · 合并配置", profile.name));
+              }
+              for (label, uid, kind) in [
+                (
+                  "编辑规则",
+                  profile.enhancements.rules.as_deref(),
+                  SequenceEditorKind::Rules,
+                ),
+                (
+                  "编辑代理",
+                  profile.enhancements.proxies.as_deref(),
+                  SequenceEditorKind::Proxies,
+                ),
+                (
+                  "编辑代理组",
+                  profile.enhancements.groups.as_deref(),
+                  SequenceEditorKind::Groups,
+                ),
+              ] {
+                if let Some(uid) = uid
+                  && ui
+                    .add_enabled(!profiles.busy, egui::Button::new(label))
+                    .clicked()
+                {
+                  self.open_sequence_editor(
+                    uid.to_string(),
+                    format!("{} · {}", profile.name, kind.label()),
+                    kind,
+                  );
+                }
+              }
+              if ui
+                .add_enabled(
+                  !profiles.busy && profile.source != ProfileSourceKind::Other,
+                  egui::Button::new("复制"),
+                )
+                .clicked()
+              {
+                self.command(UiCommand::DuplicateProfile {
+                  uid: profile.uid.clone(),
+                });
+              }
+              if ui
+                .add_enabled(!profiles.busy, egui::Button::new("重命名"))
+                .clicked()
+              {
+                self
+                  .profile_name_edits
+                  .insert(profile.uid.clone(), profile.name.clone());
+                self.renaming_profile = Some(profile.uid.clone());
+              }
+              if ui
+                .add_enabled(
+                  !profiles.busy && profile_index > 0,
+                  egui::Button::new("上移"),
+                )
+                .clicked()
+              {
+                self.command(UiCommand::ReorderProfile {
+                  uid: profile.uid.clone(),
+                  new_index: profile_index - 1,
+                });
+              }
+              if ui
+                .add_enabled(
+                  !profiles.busy && profile_index + 1 < profiles.items.len(),
+                  egui::Button::new("下移"),
+                )
+                .clicked()
+              {
+                self.command(UiCommand::ReorderProfile {
+                  uid: profile.uid.clone(),
+                  new_index: profile_index + 1,
+                });
+              }
+              let delete_pending =
+                self.pending_profile_delete.as_deref() == Some(profile.uid.as_str());
+              if ui
+                .add_enabled(
+                  !profiles.busy,
+                  egui::Button::new(if delete_pending {
+                    "确认删除"
+                  } else {
+                    "删除"
+                  }),
+                )
+                .clicked()
+              {
+                if delete_pending {
+                  self.command(UiCommand::DeleteProfiles {
+                    uids: vec![profile.uid.clone()],
+                  });
+                  self.pending_profile_delete = None;
+                } else {
+                  self.pending_profile_delete = Some(profile.uid.clone());
+                }
+              }
+              if delete_pending && ui.button("取消删除").clicked() {
+                self.pending_profile_delete = None;
+              }
+            });
+          });
+        }
       });
-      ui.add_space(10.0);
+      ui.add_space(geometry::TOOLBAR_GAP);
     }
+  }
+
+  fn profile_import_toolbar(&mut self, ui: &mut Ui, busy: bool) {
+    ui.allocate_ui_with_layout(
+      egui::vec2(ui.available_width(), geometry::PROFILE_CONTENT_OFFSET),
+      Layout::left_to_right(Align::Center),
+      |ui| {
+        ui.add_space(geometry::PAGE_CONTENT_HORIZONTAL_MARGIN);
+        let field_width = (ui.available_width() - 132.0).max(120.0);
+        ui.add_sized(
+          [field_width, geometry::PROFILE_TOOLBAR_HEIGHT],
+          egui::TextEdit::singleline(&mut self.remote_profile_url)
+            .password(true)
+            .hint_text("订阅链接"),
+        );
+        if ui
+          .add_enabled(
+            !busy && !self.remote_profile_url.trim().is_empty(),
+            egui::Button::new("导入").min_size(egui::vec2(52.0, 30.0)),
+          )
+          .clicked()
+        {
+          let name = if self.remote_profile_name.trim().is_empty() {
+            "Remote profile".to_string()
+          } else {
+            self.remote_profile_name.trim().to_string()
+          };
+          self.command(UiCommand::ImportRemoteProfile {
+            name,
+            url: self.remote_profile_url.trim().to_string(),
+            options: self.remote_profile_options.clone(),
+          });
+          self.remote_profile_url.clear();
+        }
+        if ui
+          .add_enabled(
+            !busy,
+            egui::Button::new("新建").min_size(egui::vec2(52.0, 30.0)),
+          )
+          .clicked()
+        {
+          self.profile_create_dialog = true;
+        }
+      },
+    );
+  }
+
+  fn profile_create_dialog(&mut self, context: &egui::Context, busy: bool) {
+    if !self.profile_create_dialog {
+      return;
+    }
+    let mut open = self.profile_create_dialog;
+    let mut close = false;
+    egui::Window::new("新建配置")
+      .open(&mut open)
+      .collapsible(false)
+      .default_width(460.0)
+      .show(context, |ui| {
+        ui.label(RichText::new("本地配置").strong());
+        ui.add(egui::TextEdit::singleline(&mut self.local_profile_name).hint_text("配置名称"));
+        ui.add(
+          egui::TextEdit::singleline(&mut self.local_profile_path)
+            .hint_text("/path/to/profile.yaml"),
+        );
+        if ui
+          .add_enabled(
+            !busy && !self.local_profile_path.trim().is_empty(),
+            egui::Button::new("导入本地文件"),
+          )
+          .clicked()
+        {
+          self.command(UiCommand::ImportLocalProfile {
+            name: self.local_profile_name.trim().to_string(),
+            path: self.local_profile_path.trim().to_string(),
+          });
+          close = true;
+        }
+        ui.add_space(geometry::GRID_GAP);
+        ui.separator();
+        ui.add_space(geometry::GRID_GAP);
+        ui.label(RichText::new("订阅二维码").strong());
+        ui.add(egui::TextEdit::singleline(&mut self.qr_profile_name).hint_text("订阅名称"));
+        ui.add(
+          egui::TextEdit::singleline(&mut self.qr_profile_path)
+            .hint_text("/path/to/subscription-qr.png"),
+        );
+        if ui
+          .add_enabled(
+            !busy && !self.qr_profile_path.trim().is_empty(),
+            egui::Button::new("识别并导入"),
+          )
+          .clicked()
+        {
+          self.command(UiCommand::ImportProfileQr {
+            name: self.qr_profile_name.trim().to_string(),
+            path: self.qr_profile_path.trim().to_string(),
+            options: self.remote_profile_options.clone(),
+          });
+          close = true;
+        }
+        ui.add_space(geometry::GRID_GAP);
+        ui.separator();
+        ui.add_space(geometry::GRID_GAP);
+        profile_diagnostics_card(ui, &self.snapshot.profiles.diagnostics);
+      });
+    self.profile_create_dialog = open && !close;
   }
 
   fn profile_yaml_editor(&mut self, ui: &mut Ui, busy: bool) {
@@ -2689,108 +3127,44 @@ impl RsClashUi {
     let state = self.snapshot.settings.clone();
     let mut draft = self.settings_draft.clone();
     let mut action = None;
-    let tokens = theme::tokens(ui);
-
-    Frame::new()
-      .fill(tokens.surface)
-      .stroke(Stroke::new(1.0, tokens.border))
-      .corner_radius(12)
-      .inner_margin(egui::Margin::symmetric(16, 11))
-      .show(ui, |ui| {
-        ui.horizontal(|ui| {
-          if state.busy {
-            ui.spinner();
-            ui.label("正在验证并应用设置…");
-          } else if self.settings_dirty {
-            ui.label(
-              RichText::new("有未保存的更改")
-                .strong()
-                .color(tokens.warning),
-            );
-          } else if let Some(summary) = state.last_applied.as_deref() {
-            ui.label(RichText::new(summary).color(tokens.success));
-          } else {
-            ui.label(RichText::new("设置已同步").weak());
-          }
-          ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui
-              .add_enabled(
-                !state.busy && self.settings_dirty,
-                egui::Button::new("保存并应用"),
-              )
-              .clicked()
-            {
-              action = Some(SettingsUiAction::Apply);
-            }
-            if ui
-              .add_enabled(
-                !state.busy && self.settings_dirty,
-                egui::Button::new("放弃更改"),
-              )
-              .clicked()
-            {
-              action = Some(SettingsUiAction::Discard);
-            }
-            if ui
-              .add_enabled(!state.busy, egui::Button::new("刷新"))
-              .clicked()
-            {
-              self.command(UiCommand::RefreshSettings);
-            }
-          });
-        });
-      });
-    ui.add_space(14.0);
-
-    let narrow = ui.available_width() < 760.0;
-    if narrow {
-      ScrollArea::horizontal()
-        .id_salt("settings-tabs")
-        .show(ui, |ui| {
-          ui.horizontal(|ui| {
-            for section in SettingsSection::ALL {
-              ui.selectable_value(&mut self.settings_section, section, section.label());
-            }
-          });
-        });
-      ui.add_space(12.0);
-      settings_section(
-        ui,
-        self.settings_section,
-        &mut draft,
-        &self.snapshot,
-        &mut action,
-      );
-    } else {
-      ui.horizontal_top(|ui| {
-        ui.vertical(|ui| {
-          ui.set_width(160.0);
-          for section in SettingsSection::ALL {
-            if ui
-              .add_sized(
-                [ui.available_width(), 38.0],
-                egui::Button::new(section.label())
-                  .selected(self.settings_section == section)
-                  .frame(self.settings_section == section),
-              )
-              .clicked()
-            {
-              self.settings_section = section;
-            }
-          }
-        });
-        ui.separator();
-        ui.vertical(|ui| {
-          ui.set_min_width((ui.available_width() - 8.0).max(400.0));
+    let viewport_width = ui.ctx().content_rect().width();
+    let two_columns = geometry::settings_grid_columns(geometry::breakpoint(viewport_width)) == 2;
+    if two_columns {
+      ui.columns(2, |columns| {
+        for section in [
+          SettingsSection::General,
+          SettingsSection::Proxy,
+          SettingsSection::Mihomo,
+        ] {
           settings_section(
-            ui,
-            self.settings_section,
+            &mut columns[0],
+            section,
             &mut draft,
             &self.snapshot,
             &mut action,
           );
-        });
+          columns[0].add_space(geometry::GRID_GAP);
+        }
+        for section in [
+          SettingsSection::DnsTun,
+          SettingsSection::Interface,
+          SettingsSection::Maintenance,
+        ] {
+          settings_section(
+            &mut columns[1],
+            section,
+            &mut draft,
+            &self.snapshot,
+            &mut action,
+          );
+          columns[1].add_space(geometry::GRID_GAP);
+        }
       });
+    } else {
+      for section in SettingsSection::ALL {
+        settings_section(ui, section, &mut draft, &self.snapshot, &mut action);
+        ui.add_space(geometry::GRID_GAP);
+      }
     }
 
     if draft != self.settings_draft {
@@ -2798,15 +3172,6 @@ impl RsClashUi {
       self.settings_dirty = self.settings_draft != state.value;
     }
     match action {
-      Some(SettingsUiAction::Apply) => {
-        self.command(UiCommand::ApplySettings(Box::new(
-          self.settings_draft.clone(),
-        )));
-      },
-      Some(SettingsUiAction::Discard) => {
-        self.settings_draft = state.value;
-        self.settings_dirty = false;
-      },
       Some(SettingsUiAction::ToggleSystemProxy(enabled)) => {
         self.command(UiCommand::SetSystemProxy(enabled));
       },
@@ -4192,21 +4557,48 @@ fn log_matches(log: &LogSnapshot, query: &str) -> bool {
 }
 
 fn log_row(ui: &mut Ui, log: &LogSnapshot) {
-  ui.horizontal(|ui| {
-    let color = match log.level.to_ascii_lowercase().as_str() {
-      "error" => ui.visuals().error_fg_color,
-      "warning" | "warn" => ui.visuals().warn_fg_color,
-      "debug" => ui.visuals().weak_text_color(),
-      _ => ui.visuals().text_color(),
-    };
-    ui.label(
-      RichText::new(log.level.to_ascii_uppercase())
-        .small()
-        .color(color),
-    );
-    ui.label(&log.payload);
-  });
-  ui.separator();
+  let color = match log.level.to_ascii_lowercase().as_str() {
+    "error" => ui.visuals().error_fg_color,
+    "warning" | "warn" => ui.visuals().warn_fg_color,
+    "debug" => ui.visuals().weak_text_color(),
+    _ => ui.visuals().text_color(),
+  };
+  let (rect, response) = ui.allocate_exact_size(
+    egui::vec2(ui.available_width(), geometry::LOG_ROW_HEIGHT),
+    egui::Sense::click(),
+  );
+  if response.hovered() {
+    ui.painter()
+      .rect_filled(rect, 0.0, theme::tokens(ui).surface_raised);
+  }
+  ui.painter().text(
+    egui::pos2(rect.left() + 12.0, rect.top() + 13.0),
+    egui::Align2::LEFT_CENTER,
+    format!("#{}", log.sequence),
+    egui::FontId::proportional(12.0),
+    theme::tokens(ui).text_muted,
+  );
+  ui.painter().text(
+    egui::pos2(rect.left() + 62.0, rect.top() + 13.0),
+    egui::Align2::LEFT_CENTER,
+    log.level.to_ascii_uppercase(),
+    egui::FontId::proportional(12.0),
+    color,
+  );
+  ui.painter().text(
+    egui::pos2(rect.left() + 12.0, rect.top() + 34.0),
+    egui::Align2::LEFT_CENTER,
+    &log.payload,
+    egui::FontId::proportional(14.0),
+    ui.visuals().text_color(),
+  );
+  ui.painter().line_segment(
+    [
+      egui::pos2(rect.left() + 12.0, rect.bottom()),
+      egui::pos2(rect.right() - 12.0, rect.bottom()),
+    ],
+    Stroke::new(1.0, theme::tokens(ui).border),
+  );
 }
 
 const fn stream_log_level_label(level: StreamLogLevel) -> &'static str {
@@ -4387,45 +4779,13 @@ fn format_update_age(updated_at: u64) -> String {
   }
 }
 
-const fn page_description(page: Page) -> &'static str {
-  match page {
-    Page::Home => "运行状态与快捷控制",
-    Page::Proxies => "选择节点、测速与代理链",
-    Page::Profiles => "管理订阅和本地配置",
-    Page::Connections => "检查并控制实时连接",
-    Page::Rules => "查看运行规则与规则集",
-    Page::Logs => "查看 Mihomo 实时日志",
-    Page::Unlock => "检查流媒体与站点可用性",
-    Page::Settings => "配置应用、网络与 Mihomo",
-  }
-}
-
-fn core_status_pill(ui: &mut Ui, state: &CoreState) {
-  let tokens = theme::tokens(ui);
-  let (text, color) = match state {
-    CoreState::Stopped => ("已停止", tokens.text_muted),
-    CoreState::Starting => ("启动中", tokens.warning),
-    CoreState::Running { .. } => ("运行中", tokens.success),
-    CoreState::Reloading => ("加载中", tokens.warning),
-    CoreState::Stopping => ("停止中", tokens.warning),
-    CoreState::Failed { .. } => ("异常", tokens.danger),
-  };
-
-  Frame::new()
-    .fill(color.gamma_multiply(0.14))
-    .corner_radius(20)
-    .inner_margin(egui::Margin::symmetric(10, 5))
-    .show(ui, |ui| {
-      ui.label(RichText::new(text).small().strong().color(color));
-    });
-}
-
 fn mihomo_connection_pill(ui: &mut Ui, connection: MihomoConnection) {
+  let tokens = theme::tokens(ui);
   let (text, color) = match connection {
-    MihomoConnection::Offline => ("核心离线", Color32::from_rgb(119, 118, 123)),
-    MihomoConnection::Connecting => ("正在连接", Color32::from_rgb(196, 121, 0)),
-    MihomoConnection::Connected => ("代理运行中", Color32::from_rgb(38, 162, 105)),
-    MihomoConnection::Degraded => ("连接异常", Color32::from_rgb(192, 28, 40)),
+    MihomoConnection::Offline => ("核心离线", tokens.text_muted),
+    MihomoConnection::Connecting => ("正在连接", tokens.warning),
+    MihomoConnection::Connected => ("代理运行中", tokens.success),
+    MihomoConnection::Degraded => ("连接异常", tokens.danger),
   };
   Frame::new()
     .fill(color.gamma_multiply(0.14))
@@ -4585,17 +4945,124 @@ fn metric_chart(ui: &mut Ui, metrics: &[MetricPoint]) {
   }
 }
 
+fn header_icon_button(ui: &mut Ui, symbol: &str, tooltip: &str) -> egui::Response {
+  ui.add_sized(
+    [32.0, 32.0],
+    egui::Button::new(RichText::new(symbol).size(17.0)).frame(false),
+  )
+  .on_hover_text(tooltip)
+}
+
+fn paint_navigation_metric(
+  painter: &egui::Painter,
+  rect: egui::Rect,
+  metrics: &[MetricPoint],
+  upload: bool,
+  color: Color32,
+) {
+  let values = metrics
+    .iter()
+    .rev()
+    .take(60)
+    .map(|point| {
+      if upload {
+        point.upload_bytes_per_second
+      } else {
+        point.download_bytes_per_second
+      }
+    })
+    .collect::<Vec<_>>();
+  if values.len() < 2 {
+    return;
+  }
+  let max = values.iter().copied().max().unwrap_or(0).max(1) as f32;
+  let width_step = rect.width() / (values.len() - 1) as f32;
+  let points = values
+    .iter()
+    .rev()
+    .enumerate()
+    .map(|(index, value)| {
+      egui::pos2(
+        rect.left() + index as f32 * width_step,
+        rect.bottom() - 2.0 - (*value as f32 / max) * (rect.height() - 5.0),
+      )
+    })
+    .collect::<Vec<_>>();
+  painter.add(egui::Shape::line(points, Stroke::new(1.5, color)));
+}
+
+fn navigation_metric_row(ui: &mut Ui, symbol: &str, value: &str, color: Color32) {
+  ui.allocate_ui_with_layout(
+    egui::vec2(ui.available_width(), 24.0),
+    Layout::left_to_right(Align::Center),
+    |ui| {
+      ui.add_space(geometry::NAV_TRAFFIC_HORIZONTAL_PADDING);
+      ui.label(RichText::new(symbol).color(color));
+      ui.add_space(8.0);
+      ui.label(RichText::new(value).color(color));
+    },
+  );
+}
+
+fn enhanced_card(ui: &mut Ui, title: &str, symbol: &str, contents: impl FnOnce(&mut Ui)) {
+  let tokens = theme::tokens(ui);
+  let width = ui.available_width();
+  Frame::new()
+    .fill(tokens.surface)
+    .corner_radius(geometry::GLOBAL_RADIUS)
+    .show(ui, |ui| {
+      ui.set_width(width);
+      ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+      ui.allocate_ui_with_layout(
+        egui::vec2(width, 54.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+          ui.add_space(16.0);
+          Frame::new()
+            .fill(tokens.accent_soft)
+            .corner_radius(6)
+            .show(ui, |ui| {
+              ui.allocate_ui_with_layout(
+                egui::Vec2::splat(38.0),
+                Layout::centered_and_justified(egui::Direction::LeftToRight),
+                |ui| {
+                  ui.label(RichText::new(symbol).size(20.0).color(tokens.accent));
+                },
+              );
+            });
+          ui.add_space(12.0);
+          ui.label(RichText::new(title).size(18.0).strong());
+        },
+      );
+      ui.painter().line_segment(
+        [
+          egui::pos2(ui.min_rect().left(), ui.cursor().top()),
+          egui::pos2(ui.min_rect().right(), ui.cursor().top()),
+        ],
+        Stroke::new(1.0, tokens.border),
+      );
+      Frame::new()
+        .inner_margin(egui::Margin::same(16))
+        .show(ui, |ui| {
+          ui.set_min_width((width - 32.0).max(0.0));
+          ui.set_min_height(104.0);
+          ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+          contents(ui);
+        });
+    });
+}
+
 fn card(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui)) {
   let tokens = theme::tokens(ui);
   Frame::new()
     .fill(tokens.surface)
-    .stroke(Stroke::new(1.0, tokens.border))
-    .corner_radius(12)
-    .inner_margin(egui::Margin::symmetric(18, 16))
+    .stroke(Stroke::NONE)
+    .corner_radius(geometry::GLOBAL_RADIUS)
+    .inner_margin(egui::Margin::symmetric(16, 8))
     .show(ui, |ui| {
       ui.set_min_width((ui.available_width() - 1.0).max(240.0));
-      ui.label(RichText::new(title).size(14.5).strong());
-      ui.add_space(8.0);
+      ui.label(RichText::new(title).size(16.0).strong());
+      ui.add_space(geometry::MUI_SPACING);
       contents(ui);
     });
 }
