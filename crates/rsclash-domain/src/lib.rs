@@ -280,6 +280,13 @@ pub struct ProxyViewV1 {
   pub providers: Vec<ProxyProviderView>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProxyChainSnapshot {
+  pub group: Option<String>,
+  pub nodes: Vec<String>,
+  pub connected: bool,
+}
+
 impl Default for ProxyViewV1 {
   fn default() -> Self {
     Self {
@@ -309,6 +316,7 @@ pub struct MihomoSnapshot {
   pub groups: Vec<ProxyGroupSnapshot>,
   pub proxy_view: ProxyViewV1,
   pub proxy_busy: bool,
+  pub proxy_chain: ProxyChainSnapshot,
   pub last_error: Option<String>,
 }
 
@@ -527,6 +535,10 @@ pub enum UiCommand {
   UpdateAllProxyProviders,
   HealthcheckProxyProvider {
     name: String,
+  },
+  SetProxyChain {
+    group: String,
+    nodes: Vec<String>,
   },
   SetProxyMode(ProxyMode),
   RefreshProfiles,

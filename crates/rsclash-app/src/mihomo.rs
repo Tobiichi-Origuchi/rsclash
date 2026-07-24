@@ -56,6 +56,7 @@ pub(crate) enum MihomoBridgeCommand {
   UpdateProxyProvider { name: String },
   UpdateAllProxyProviders,
   HealthcheckProxyProvider { name: String },
+  ProxyChainChanged { group: String, nodes: Vec<String> },
   SynchronizeProfile(ProfileRuntimeSync),
   CloseConnectionsForProxy { proxy: String },
   SetMode(ProxyMode),
@@ -164,6 +165,12 @@ impl MihomoWorker {
       },
       MihomoBridgeCommand::HealthcheckProxyProvider { name } => {
         self.healthcheck_proxy_provider(name).await;
+      },
+      MihomoBridgeCommand::ProxyChainChanged { group, nodes } => {
+        self.state.proxy_chain.group = (!nodes.is_empty()).then_some(group);
+        self.state.proxy_chain.connected = !nodes.is_empty();
+        self.state.proxy_chain.nodes = nodes;
+        self.publish().await;
       },
       MihomoBridgeCommand::SynchronizeProfile(sync) => {
         if self.active.is_some() {

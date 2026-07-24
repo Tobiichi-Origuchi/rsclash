@@ -624,6 +624,9 @@ impl Coordinator {
       UiCommand::HealthcheckProxyProvider { name } => {
         self.dispatch_mihomo(MihomoBridgeCommand::HealthcheckProxyProvider { name })
       },
+      UiCommand::SetProxyChain { group, nodes } => {
+        self.dispatch_profile(ProfileBridgeCommand::SetProxyChain { group, nodes })
+      },
       UiCommand::SetProxyMode(mode) => self.dispatch_mihomo(MihomoBridgeCommand::SetMode(mode)),
       UiCommand::RefreshProfiles => self.dispatch_profile(ProfileBridgeCommand::Refresh),
       UiCommand::ImportLocalProfile { name, path } => {
@@ -970,6 +973,11 @@ impl Coordinator {
       },
       ProfileBridgeEvent::QrReady(qr) => {
         self.emit(AppEvent::ProfileQrReady(qr));
+      },
+      ProfileBridgeEvent::ProxyChainChanged { group, nodes } => {
+        if let Some(command_tx) = &self.mihomo_command_tx {
+          let _ = command_tx.try_send(MihomoBridgeCommand::ProxyChainChanged { group, nodes });
+        }
       },
       ProfileBridgeEvent::CommandFailed(message) => {
         self.snapshot.last_error = Some(ErrorView {

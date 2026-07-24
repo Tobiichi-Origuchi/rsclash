@@ -89,6 +89,10 @@ pub(crate) enum ProfileBridgeCommand {
   Update(ProfileUpdateCommand),
   Content(ProfileContentCommand),
   Qr(ProfileQrCommand),
+  SetProxyChain {
+    group: String,
+    nodes: Vec<String>,
+  },
 }
 
 #[derive(Clone, Debug)]
@@ -168,6 +172,10 @@ pub(crate) enum ProfileBridgeEvent {
     uid: String,
   },
   QrReady(ProfileQrCode),
+  ProxyChainChanged {
+    group: String,
+    nodes: Vec<String>,
+  },
   CommandFailed(String),
 }
 
@@ -272,6 +280,19 @@ impl ProfileWorker {
         self.handle_content(command).await;
       },
       ProfileBridgeCommand::Qr(command) => self.handle_qr(command).await,
+      ProfileBridgeCommand::SetProxyChain { group, nodes } => {
+        self.set_busy(true).await;
+        let result = self.set_proxy_chain(&group, &nodes).await;
+        if result.is_ok() {
+          let _ = self
+            .event_tx
+            .send(ProfileBridgeEvent::ProxyChainChanged { group, nodes })
+            .await;
+        }
+        self
+          .finish_operation(ProfileOperationKind::Manage, result)
+          .await;
+      },
     }
   }
 
@@ -735,6 +756,48 @@ impl ProfileWorker {
         )),
       };
     }
+    let _ = self
+      .event_tx
+      .send(ProfileBridgeEvent::RuntimeChanged(sync))
+      .await;
+    Ok(())
+  }
+
+  async fn set_proxy_chain(&self, group: &str, nodes: &[String]) -> Result<(), String> {
+    let store = self.access.store.clone();
+    let group = group.to_string();
+    let nodes = nodes.to_vec();
+    let prepared = spawn_blocking(move || {
+      let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+      let uid = catalog
+        .current
+        .as_deref()
+        .ok_or_else(|| "no active profile is available for proxy chain mode".to_string())?;
+      let mut prepared = prepare_activation(&store, uid)?;
+      apply_proxy_chain(&mut prepared.next_runtime, &nodes)?;
+      let mut sync = profile_runtime_sync(&store, uid, true)?;
+      if let Some(exit) = nodes.last() {
+        sync.selections.retain(|selection| selection.group != group);
+        sync.selections.push(StoredProxySelection {
+          group,
+          proxy: exit.clone(),
+        });
+      }
+      Ok::<_, String>((prepared, sync))
+    })
+    .await
+    .map_err(|error| format!("proxy chain preparation task failed: {error}"))??;
+    let (prepared, sync) = prepared;
+    let runtime_store =
+      RuntimeStore::open(&prepared.runtime_path).map_err(|error| error.to_string())?;
+    RuntimeDeployer::new(
+      &runtime_store,
+      self.access.validator.as_ref(),
+      self.activator.as_ref(),
+    )
+    .deploy(&prepared.next_runtime)
+    .await
+    .map_err(|error| format!("deploy proxy chain runtime: {error}"))?;
     let _ = self
       .event_tx
       .send(ProfileBridgeEvent::RuntimeChanged(sync))
@@ -1822,6 +1885,50 @@ fn prepare_activation(store: &ProfileStore, uid: &str) -> Result<PreparedActivat
   })
 }
 
+fn apply_proxy_chain(runtime: &mut MihomoConfig, nodes: &[String]) -> Result<(), String> {
+  let proxies = runtime
+    .mapping_mut()
+    .get_mut("proxies")
+    .and_then(Value::as_sequence_mut)
+    .ok_or_else(|| "runtime config has no proxy sequence".to_string())?;
+  for proxy in proxies.iter_mut().filter_map(Value::as_mapping_mut) {
+    proxy.remove("dialer-proxy");
+  }
+  if nodes.is_empty() {
+    return Ok(());
+  }
+  if nodes.len() < 2 {
+    return Err("proxy chain mode requires at least two nodes".to_string());
+  }
+  let mut unique = BTreeSet::new();
+  for node in nodes {
+    if node.trim().is_empty() || !unique.insert(node.as_str()) {
+      return Err("proxy chain nodes must be non-empty and unique".to_string());
+    }
+    let exists = proxies.iter().any(|proxy| {
+      proxy
+        .as_mapping()
+        .and_then(|proxy| proxy.get("name"))
+        .and_then(Value::as_str)
+        == Some(node.as_str())
+    });
+    if !exists {
+      return Err(format!("proxy chain node {node} is not a core proxy"));
+    }
+  }
+  for pair in nodes.windows(2) {
+    let entry = Value::String(pair[0].clone());
+    let exit = pair[1].as_str();
+    let proxy = proxies
+      .iter_mut()
+      .filter_map(Value::as_mapping_mut)
+      .find(|proxy| proxy.get("name").and_then(Value::as_str) == Some(exit))
+      .ok_or_else(|| format!("proxy chain node {exit} disappeared"))?;
+    proxy.insert("dialer-proxy".into(), entry);
+  }
+  Ok(())
+}
+
 struct ProfileEnhancements {
   sequence: SequenceLayers,
   global: ManualLayer,
@@ -2200,7 +2307,7 @@ mod tests {
   };
 
   use image::{GrayImage, Luma};
-  use rsclash_config::initialize_default_runtime;
+  use rsclash_config::{MihomoConfig, initialize_default_runtime};
   use rsclash_config::{Result as ConfigResult, RuntimeActivator, RuntimeValidator};
   use rsclash_domain::ProfileDiagnosticStage;
   use serde_yaml_ng::Value;
@@ -2211,10 +2318,10 @@ mod tests {
   };
 
   use super::{
-    DownloadedProfile, ProfileAccess, ProfileWorker, classify_profile_error, decode_profile_qr,
-    delete_profiles, due_remote_profile_uids, duplicate_profile, generate_profile_qr,
-    import_content, import_local, load_snapshot, persist_profile_selection, prepare_activation,
-    profile_diagnostics, profile_runtime_sync, rename_profile, reorder_profile,
+    DownloadedProfile, ProfileAccess, ProfileWorker, apply_proxy_chain, classify_profile_error,
+    decode_profile_qr, delete_profiles, due_remote_profile_uids, duplicate_profile,
+    generate_profile_qr, import_content, import_local, load_snapshot, persist_profile_selection,
+    prepare_activation, profile_diagnostics, profile_runtime_sync, rename_profile, reorder_profile,
     resolve_remote_input, set_current_profile, set_remote_options,
   };
 
@@ -2233,6 +2340,49 @@ mod tests {
     let diagnostics = profile_diagnostics();
     assert!(!diagnostics.native_transforms.is_empty());
     assert!(diagnostics.pipeline_order.len() >= 8);
+  }
+
+  #[test]
+  fn proxy_chain_injection_is_reversible_and_ordered() {
+    let mut runtime = MihomoConfig::parse(
+      "proxies:\n  - {name: Entry, type: direct, dialer-proxy: stale}\n  - {name: Hop, type: direct}\n  - {name: Exit, type: direct}\n",
+    )
+    .expect("the runtime should parse");
+    apply_proxy_chain(
+      &mut runtime,
+      &["Entry".to_string(), "Hop".to_string(), "Exit".to_string()],
+    )
+    .expect("the proxy chain should apply");
+    let proxies = runtime
+      .get("proxies")
+      .and_then(Value::as_sequence)
+      .expect("proxies should remain a sequence");
+    assert_eq!(
+      proxies[1]
+        .as_mapping()
+        .and_then(|proxy| proxy.get("dialer-proxy"))
+        .and_then(Value::as_str),
+      Some("Entry")
+    );
+    assert_eq!(
+      proxies[2]
+        .as_mapping()
+        .and_then(|proxy| proxy.get("dialer-proxy"))
+        .and_then(Value::as_str),
+      Some("Hop")
+    );
+
+    apply_proxy_chain(&mut runtime, &[]).expect("disconnect should remove the chain");
+    assert!(
+      runtime
+        .get("proxies")
+        .and_then(Value::as_sequence)
+        .expect("proxies should remain a sequence")
+        .iter()
+        .all(|proxy| proxy
+          .as_mapping()
+          .is_none_or(|proxy| !proxy.contains_key("dialer-proxy")))
+    );
   }
 
   #[test]

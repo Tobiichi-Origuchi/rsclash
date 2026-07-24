@@ -87,6 +87,18 @@ struct ProxyDisplayItem {
   source: String,
   capabilities: ProxyCapabilities,
   unresolved: Option<ProxyMemberUnresolvedReason>,
+  chain_eligible: bool,
+}
+
+#[derive(Clone)]
+struct ProxyChainDrag(usize);
+
+#[derive(Clone, Copy)]
+enum ProxyChainAction {
+  MoveUp(usize),
+  MoveDown(usize),
+  Remove(usize),
+  Drop { from: usize, to: usize },
 }
 
 #[derive(Default)]
@@ -133,6 +145,8 @@ pub struct RsClashUi {
   proxy_sort: ProxySort,
   expanded_proxy_groups: BTreeSet<String>,
   locate_proxy: Option<(String, String)>,
+  proxy_chain_group: String,
+  proxy_chain_nodes: Vec<String>,
 }
 
 impl RsClashUi {
@@ -177,12 +191,26 @@ impl RsClashUi {
       proxy_sort: ProxySort::default(),
       expanded_proxy_groups: BTreeSet::new(),
       locate_proxy: None,
+      proxy_chain_group: String::new(),
+      proxy_chain_nodes: Vec::new(),
     }
   }
 
   /// Synchronize background state without painting. This is called even when the root viewport is hidden.
   pub fn logic(&mut self, context: &egui::Context) {
     if let Some(snapshot) = self.client.take_snapshot_if_changed() {
+      let was_chain_connected = self.snapshot.mihomo.proxy_chain.connected;
+      if snapshot.mihomo.proxy_chain.connected {
+        self.proxy_chain_group = snapshot
+          .mihomo
+          .proxy_chain
+          .group
+          .clone()
+          .unwrap_or_default();
+        self.proxy_chain_nodes = snapshot.mihomo.proxy_chain.nodes.clone();
+      } else if was_chain_connected {
+        self.proxy_chain_nodes.clear();
+      }
       self.snapshot = snapshot;
     }
 
@@ -713,6 +741,14 @@ impl RsClashUi {
     });
     ui.add_space(12.0);
 
+    self.proxy_chain_editor(
+      ui,
+      &view,
+      mihomo.proxy_busy || self.snapshot.profiles.busy,
+      mihomo.proxy_chain.connected,
+    );
+    ui.add_space(12.0);
+
     let regex = if self.proxy_regex && !self.proxy_search.is_empty() {
       let pattern = if self.proxy_whole_word {
         format!("^(?:{})$", self.proxy_search)
@@ -793,6 +829,161 @@ impl RsClashUi {
         });
         ui.add_space(10.0);
       }
+    }
+  }
+
+  fn proxy_chain_editor(&mut self, ui: &mut Ui, view: &ProxyViewV1, busy: bool, connected: bool) {
+    if self.proxy_chain_group.is_empty()
+      && let Some(group) = proxy_groups(view).next()
+    {
+      self.proxy_chain_group = group.name.clone();
+    }
+    let mut connect = false;
+    let mut disconnect = false;
+    let mut action = None;
+    let node_count = self.proxy_chain_nodes.len();
+    card(ui, "代理链", |ui| {
+      ui.label(
+        RichText::new(
+          "链按入口→出口排列；仅接受 runtime 中可修改的 core 节点，连接和断开都会重新校验并原子部署。",
+        )
+        .small()
+        .weak(),
+      );
+      ui.horizontal(|ui| {
+        ui.label("目标代理组");
+        egui::ComboBox::from_id_salt("proxy-chain-group")
+          .selected_text(if self.proxy_chain_group.is_empty() {
+            "选择代理组"
+          } else {
+            &self.proxy_chain_group
+          })
+          .show_ui(ui, |ui| {
+            for group in proxy_groups(view) {
+              ui.selectable_value(&mut self.proxy_chain_group, group.name.clone(), &group.name);
+            }
+          });
+        if connected {
+          ui.label(
+            RichText::new("已连接")
+              .strong()
+              .color(Color32::from_rgb(38, 162, 105)),
+          );
+        }
+      });
+      ui.add_space(6.0);
+      if self.proxy_chain_nodes.is_empty() {
+        ui.label(RichText::new("从下方代理组成员中加入至少两个 core 节点。").weak());
+      }
+      for (index, node) in self.proxy_chain_nodes.iter().enumerate() {
+        let (_, dropped) = ui.dnd_drop_zone::<ProxyChainDrag, _>(
+          Frame::group(ui.style()).inner_margin(egui::Margin::symmetric(8, 5)),
+          |ui| {
+            ui.horizontal(|ui| {
+              ui.dnd_drag_source(
+                egui::Id::new(("proxy-chain-drag", index)),
+                ProxyChainDrag(index),
+                |ui| {
+                  ui.label("⠿");
+                },
+              );
+              ui.label(if index == 0 {
+                format!("入口 · {node}")
+              } else if index + 1 == node_count {
+                format!("出口 · {node}")
+              } else {
+                format!("跳点 {} · {node}", index)
+              });
+              ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                  .add_enabled(!busy && !connected, egui::Button::new("删除"))
+                  .clicked()
+                {
+                  action = Some(ProxyChainAction::Remove(index));
+                }
+                if ui
+                  .add_enabled(
+                    !busy && !connected && index + 1 < node_count,
+                    egui::Button::new("↓"),
+                  )
+                  .clicked()
+                {
+                  action = Some(ProxyChainAction::MoveDown(index));
+                }
+                if ui
+                  .add_enabled(!busy && !connected && index > 0, egui::Button::new("↑"))
+                  .clicked()
+                {
+                  action = Some(ProxyChainAction::MoveUp(index));
+                }
+              });
+            });
+          },
+        );
+        if let Some(payload) = dropped {
+          action = Some(ProxyChainAction::Drop {
+            from: payload.0,
+            to: index,
+          });
+        }
+      }
+      ui.horizontal(|ui| {
+        if connected {
+          disconnect = ui
+            .add_enabled(!busy, egui::Button::new("断开并恢复原配置"))
+            .clicked();
+        } else {
+          connect = ui
+            .add_enabled(
+              !busy && self.proxy_chain_nodes.len() >= 2 && !self.proxy_chain_group.is_empty(),
+              egui::Button::new("连接代理链"),
+            )
+            .clicked();
+        }
+        ui.label(
+          RichText::new(format!("{} 个节点", self.proxy_chain_nodes.len()))
+            .small()
+            .weak(),
+        );
+        if busy {
+          ui.spinner();
+        }
+      });
+    });
+    match action {
+      Some(ProxyChainAction::MoveUp(index)) => {
+        self.proxy_chain_nodes.swap(index, index - 1);
+      },
+      Some(ProxyChainAction::Drop { from, to }) => {
+        if from < node_count && to < node_count {
+          self.proxy_chain_nodes.swap(from, to);
+        }
+      },
+      Some(ProxyChainAction::MoveDown(index)) => {
+        self.proxy_chain_nodes.swap(index, index + 1);
+      },
+      Some(ProxyChainAction::Remove(index)) => {
+        self.proxy_chain_nodes.remove(index);
+      },
+      None => {},
+    }
+    if connect {
+      self.command(UiCommand::SetProxyChain {
+        group: self.proxy_chain_group.clone(),
+        nodes: self.proxy_chain_nodes.clone(),
+      });
+    } else if disconnect {
+      let group = self
+        .snapshot
+        .mihomo
+        .proxy_chain
+        .group
+        .clone()
+        .unwrap_or_else(|| self.proxy_chain_group.clone());
+      self.command(UiCommand::SetProxyChain {
+        group,
+        nodes: Vec::new(),
+      });
     }
   }
 
@@ -915,6 +1106,20 @@ impl RsClashUi {
         self.command(UiCommand::TestProxy {
           record_id: record_id.clone(),
         });
+      }
+      if item.chain_eligible
+        && ui
+          .add_enabled(
+            !busy && !self.snapshot.mihomo.proxy_chain.connected,
+            egui::Button::new("加入链"),
+          )
+          .clicked()
+      {
+        if self.proxy_chain_nodes.contains(&item.name) {
+          self.local_error = Some(format!("代理链中已经包含节点 {}。", item.name));
+        } else {
+          self.proxy_chain_nodes.push(item.name.clone());
+        }
       }
       if let Some(reason) = item.unresolved {
         ui.label(
@@ -2165,6 +2370,7 @@ fn proxy_display_item(member: &ProxyMemberSnapshot, view: &ProxyViewV1) -> Proxy
         source: "Missing record".to_string(),
         capabilities: ProxyCapabilities::default(),
         unresolved: Some(ProxyMemberUnresolvedReason::Missing),
+        chain_eligible: false,
       },
       proxy_record_display,
     ),
@@ -2181,6 +2387,7 @@ fn proxy_display_item(member: &ProxyMemberSnapshot, view: &ProxyViewV1) -> Proxy
           group.capabilities.clone()
         }),
         unresolved: None,
+        chain_eligible: false,
       }
     },
     ProxyMemberSnapshot::Unresolved { name, reason } => ProxyDisplayItem {
@@ -2192,6 +2399,7 @@ fn proxy_display_item(member: &ProxyMemberSnapshot, view: &ProxyViewV1) -> Proxy
       source: "Unresolved member".to_string(),
       capabilities: ProxyCapabilities::default(),
       unresolved: Some(*reason),
+      chain_eligible: false,
     },
   }
 }
@@ -2204,6 +2412,7 @@ fn proxy_record_display(record: &ProxyNodeSnapshot) -> ProxyDisplayItem {
     },
     None => "Unknown source".to_string(),
   };
+  let chain_eligible = matches!(record.source.as_ref(), Some(ProxyNodeSource::Core { .. }));
   ProxyDisplayItem {
     name: record.name.clone(),
     kind: record.kind.clone(),
@@ -2213,6 +2422,7 @@ fn proxy_record_display(record: &ProxyNodeSnapshot) -> ProxyDisplayItem {
     source,
     capabilities: record.capabilities.clone(),
     unresolved: None,
+    chain_eligible,
   }
 }
 

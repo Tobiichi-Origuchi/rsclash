@@ -46,4 +46,5 @@
 | 节点/组/全部测速 | 按 core/provider source 调用对应 controller API | 完成 | actor 串行化与 fake API |
 | Proxy provider 操作 | 单个/全部更新、provider/节点健康检查 | 完成 | 操作后 metadata 刷新 |
 | 节点选择记忆与连接清理 | profile 持久化、tray 同步、只关闭旧 chain | 完成 | P7 actor 端到端测试 |
-| 代理链、规则、连接、日志和实时指标 | 后续 P8 独立提交 | 进行中 | 本矩阵随提交更新 |
+| 代理链 | 至少两 core 节点、原生拖放、可逆 runtime 注入 | 完成 | 注入顺序与断开清理测试 |
+| 规则、连接、日志和实时指标 | 后续 P8 独立提交 | 进行中 | 本矩阵随提交更新 |
