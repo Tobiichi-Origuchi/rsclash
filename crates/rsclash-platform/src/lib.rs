@@ -20,7 +20,7 @@ mod linux_proxy;
 #[cfg(target_os = "linux")]
 pub use linux_proxy::LinuxSystemProxyBackend;
 
-const RECOVERY_VERSION: u8 = 1;
+const RECOVERY_VERSION: u8 = 2;
 const TEMP_PREFIX: &str = ".rsclash-recovery-";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +33,7 @@ pub enum RecoveryReason {
 pub enum RecoveryOutcome {
   NothingPending,
   Restored,
+  ExternalChangePreserved,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -53,6 +54,7 @@ pub struct SystemProxySnapshot {
 pub struct PendingSystemRecovery {
   pub version: u8,
   pub system_proxy: Option<SystemProxySnapshot>,
+  pub system_proxy_target: Option<SystemProxySnapshot>,
   pub tun_enabled_by_app: bool,
 }
 
@@ -67,6 +69,7 @@ impl Default for PendingSystemRecovery {
     Self {
       version: RECOVERY_VERSION,
       system_proxy: None,
+      system_proxy_target: None,
       tun_enabled_by_app: false,
     }
   }
@@ -202,6 +205,7 @@ impl SystemProxyService {
       .recovery
       .mark_pending(&PendingSystemRecovery {
         system_proxy: Some(original.clone()),
+        system_proxy_target: Some(target.clone()),
         ..PendingSystemRecovery::default()
       })
       .await?;
@@ -225,10 +229,7 @@ impl SystemProxyService {
 
   pub async fn disable(&self) -> Result<RecoveryOutcome> {
     let _guard = self.gate.lock().await;
-    let outcome = self
-      .recovery
-      .restore_pending(RecoveryReason::CleanShutdown)
-      .await?;
+    let outcome = self.restore_if_owned(RecoveryReason::CleanShutdown).await?;
     *self.target.lock().await = None;
     Ok(outcome)
   }
@@ -236,13 +237,26 @@ impl SystemProxyService {
   pub async fn pending(&self) -> Result<Option<PendingSystemRecovery>> {
     self.recovery.pending().await
   }
+
+  async fn restore_if_owned(&self, reason: RecoveryReason) -> Result<RecoveryOutcome> {
+    let Some(pending) = self.recovery.pending().await? else {
+      return Ok(RecoveryOutcome::NothingPending);
+    };
+    if let Some(target) = pending.system_proxy_target.as_ref()
+      && self.backend.current().await? != *target
+    {
+      self.recovery.clear_pending().await?;
+      return Ok(RecoveryOutcome::ExternalChangePreserved);
+    }
+    self.recovery.restore_pending(reason).await
+  }
 }
 
 #[async_trait]
 impl SystemStateRecovery for SystemProxyService {
   async fn restore_pending(&self, reason: RecoveryReason) -> Result<RecoveryOutcome> {
     let _guard = self.gate.lock().await;
-    let outcome = self.recovery.restore_pending(reason).await?;
+    let outcome = self.restore_if_owned(reason).await?;
     *self.target.lock().await = None;
     Ok(outcome)
   }
@@ -277,6 +291,11 @@ impl RecoveryManager {
   pub async fn pending(&self) -> Result<Option<PendingSystemRecovery>> {
     let _guard = self.gate.lock().await;
     self.store.load()
+  }
+
+  pub async fn clear_pending(&self) -> Result<()> {
+    let _guard = self.gate.lock().await;
+    self.store.clear()
   }
 
   async fn restore(&self) -> Result<RecoveryOutcome> {
@@ -618,6 +637,46 @@ mod tests {
     assert_eq!(
       backend.current().await.expect("proxy should read"),
       original
+    );
+    assert!(matches!(service.pending().await, Ok(None)));
+  }
+
+  #[tokio::test]
+  async fn system_proxy_service_preserves_external_changes() {
+    let directory = TestDirectory::new();
+    let original = SystemProxySnapshot {
+      backend: Some("fake".to_string()),
+      mode: Some("none".to_string()),
+      ..SystemProxySnapshot::default()
+    };
+    let backend = Arc::new(FakeProxyBackend::new(original));
+    let service = SystemProxyService::new(
+      directory.path.join("recovery.json"),
+      Arc::<FakeProxyBackend>::clone(&backend),
+    );
+    service
+      .enable("127.0.0.1", 17_897, Vec::new())
+      .await
+      .expect("system proxy should enable");
+    let external = SystemProxySnapshot {
+      enabled: true,
+      backend: Some("fake".to_string()),
+      mode: Some("manual".to_string()),
+      http_proxy: Some("external.example:8080".to_string()),
+      ..SystemProxySnapshot::default()
+    };
+    backend
+      .apply(&external)
+      .await
+      .expect("external settings should apply");
+
+    assert_eq!(
+      service.disable().await.ok(),
+      Some(RecoveryOutcome::ExternalChangePreserved)
+    );
+    assert_eq!(
+      backend.current().await.expect("proxy should read"),
+      external
     );
     assert!(matches!(service.pending().await, Ok(None)));
   }

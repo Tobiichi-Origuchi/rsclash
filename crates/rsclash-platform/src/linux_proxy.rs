@@ -197,6 +197,11 @@ impl SystemRecoveryBackend for LinuxSystemProxyBackend {
       ));
     }
     if let Some(snapshot) = &pending.system_proxy {
+      if let Some(target) = pending.system_proxy_target.as_ref()
+        && self.current().await? != *target
+      {
+        return Ok(());
+      }
       self.apply(snapshot).await?;
     }
     Ok(())
