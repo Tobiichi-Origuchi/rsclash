@@ -273,6 +273,14 @@ pub struct ProfilesSnapshot {
   pub busy: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProfileQrCode {
+  pub uid: String,
+  pub name: String,
+  pub width: usize,
+  pub modules: Vec<bool>,
+}
+
 impl ProfilesSnapshot {
   pub fn current(&self) -> Option<&ProfileSummary> {
     self.items.iter().find(|profile| profile.active)
@@ -351,6 +359,14 @@ pub enum UiCommand {
     url: String,
     options: RemoteProfileOptions,
   },
+  ImportProfileQr {
+    name: String,
+    path: String,
+    options: RemoteProfileOptions,
+  },
+  RequestProfileQr {
+    uid: String,
+  },
   ActivateProfile {
     uid: String,
   },
@@ -413,6 +429,7 @@ pub enum AppEvent {
   ProfileContentSaved {
     uid: String,
   },
+  ProfileQrReady(ProfileQrCode),
   SystemProxyChanged,
   NavigationChanged(Page),
   ThemeChanged(ThemeMode),

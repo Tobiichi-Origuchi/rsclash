@@ -7,9 +7,10 @@ mod tray;
 use std::{error::Error, time::Duration};
 
 use eframe::egui;
-use rsclash_app::{BackendHandle, WakeHandle};
+use rsclash_app::{AppClient, BackendHandle, WakeHandle};
 #[cfg(target_os = "linux")]
-use rsclash_domain::{CoreChannel, UiCommand};
+use rsclash_domain::CoreChannel;
+use rsclash_domain::{RemoteProfileOptions, UiCommand};
 use rsclash_ui::RsClashUi;
 use tokio::runtime::{Builder, Runtime};
 use tracing::{error, info};
@@ -47,6 +48,7 @@ fn main() -> Result<(), Box<dyn Error>> {
       let wake = WakeHandle::new(move || repaint_context.request_repaint());
       let backend = create_backend(&runtime, wake);
       let client = backend.client();
+      queue_initial_imports(&client);
 
       #[cfg(all(feature = "tray", target_os = "linux"))]
       let tray = match tray::TrayHandle::new(client.clone(), runtime.handle()) {
@@ -107,6 +109,43 @@ fn create_backend(runtime: &Runtime, wake: WakeHandle) -> BackendHandle {
 #[cfg(not(target_os = "linux"))]
 fn create_backend(runtime: &Runtime, wake: WakeHandle) -> BackendHandle {
   BackendHandle::spawn(runtime.handle(), wake)
+}
+
+fn queue_initial_imports(client: &AppClient) {
+  for argument in std::env::args_os().skip(1) {
+    let value = argument.to_string_lossy();
+    if value.starts_with("http://")
+      || value.starts_with("https://")
+      || value.starts_with("clash://")
+      || value.starts_with("clash-verge://")
+    {
+      if let Err(error) = client.try_command(UiCommand::ImportRemoteProfile {
+        name: String::new(),
+        url: value.into_owned(),
+        options: RemoteProfileOptions::default(),
+      }) {
+        error!(%error, "failed to queue command-line subscription import");
+      }
+      continue;
+    }
+    let path = std::path::Path::new(value.as_ref());
+    if matches!(
+      path.extension().and_then(|extension| extension.to_str()),
+      Some("yaml" | "yml")
+    ) {
+      let name = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("Imported profile")
+        .to_string();
+      if let Err(error) = client.try_command(UiCommand::ImportLocalProfile {
+        name,
+        path: value.into_owned(),
+      }) {
+        error!(%error, "failed to queue command-line profile import");
+      }
+    }
+  }
 }
 
 struct DesktopApp {

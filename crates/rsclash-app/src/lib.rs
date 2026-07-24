@@ -35,7 +35,7 @@ pub use system_proxy::SystemProxyAccess;
 use mihomo::{MihomoBridgeCommand, MihomoBridgeEvent, run_mihomo_worker};
 use profiles::{
   ProfileBridgeCommand, ProfileBridgeEvent, ProfileContentCommand, ProfileImportCommand,
-  ProfileMutationCommand, ProfileUpdateCommand, run_profile_worker,
+  ProfileMutationCommand, ProfileQrCommand, ProfileUpdateCommand, run_profile_worker,
 };
 use system_proxy::{SystemProxyBridgeCommand, SystemProxyBridgeEvent, run_system_proxy_worker};
 
@@ -622,6 +622,18 @@ impl Coordinator {
           options,
         }))
       },
+      UiCommand::ImportProfileQr {
+        name,
+        path,
+        options,
+      } => self.dispatch_profile(ProfileBridgeCommand::Import(ProfileImportCommand::Qr {
+        name,
+        path,
+        options,
+      })),
+      UiCommand::RequestProfileQr { uid } => {
+        self.dispatch_profile(ProfileBridgeCommand::Qr(ProfileQrCommand::Share { uid }))
+      },
       UiCommand::ActivateProfile { uid } => {
         self.dispatch_profile(ProfileBridgeCommand::Activate { uid })
       },
@@ -938,6 +950,9 @@ impl Coordinator {
       },
       ProfileBridgeEvent::ContentSaved { uid } => {
         self.emit(AppEvent::ProfileContentSaved { uid });
+      },
+      ProfileBridgeEvent::QrReady(qr) => {
+        self.emit(AppEvent::ProfileQrReady(qr));
       },
       ProfileBridgeEvent::CommandFailed(message) => {
         self.snapshot.last_error = Some(ErrorView {

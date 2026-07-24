@@ -7,12 +7,15 @@ publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+image.workspace = true
+qrcode.workspace = true
 rsclash-config.workspace = true
 rsclash-core.workspace = true
 rsclash-domain.workspace = true
 rsclash-mihomo = { workspace = true, features = ["rustls-ring"] }
 rsclash-platform.workspace = true
 reqwest = { workspace = true, features = ["rustls-no-provider"] }
+rqrr.workspace = true
 rustls.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true

@@ -9,6 +9,8 @@ use std::{
   time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use image::ImageReader;
+use qrcode::{Color as QrColor, QrCode};
 use reqwest::{Client, Proxy, Url, header::HeaderMap, redirect::Policy};
 use rsclash_config::{
   ApplicationLayer, EnhancementInput, EnhancementPipeline, ListenerPolicy, ManualLayer,
@@ -18,7 +20,7 @@ use rsclash_config::{
   extract_control_plane,
 };
 use rsclash_domain::{
-  ProfileDownloadProxy, ProfileEnhancementRefs, ProfileSourceKind, ProfileSummary,
+  ProfileDownloadProxy, ProfileEnhancementRefs, ProfileQrCode, ProfileSourceKind, ProfileSummary,
   ProfilesSnapshot, RemoteProfileOptions, SensitiveString, SubscriptionUsage,
 };
 use rsclash_platform::SystemProxyBackend;
@@ -30,6 +32,7 @@ use tokio::{
 };
 
 const MAX_PROFILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_QR_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_PROFILE_NAME_CHARS: usize = 128;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTO_UPDATE_POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -84,6 +87,7 @@ pub(crate) enum ProfileBridgeCommand {
   Mutate(ProfileMutationCommand),
   Update(ProfileUpdateCommand),
   Content(ProfileContentCommand),
+  Qr(ProfileQrCommand),
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +99,11 @@ pub(crate) enum ProfileImportCommand {
   Remote {
     name: String,
     url: String,
+    options: RemoteProfileOptions,
+  },
+  Qr {
+    name: String,
+    path: String,
     options: RemoteProfileOptions,
   },
 }
@@ -138,6 +147,11 @@ pub(crate) enum ProfileContentCommand {
   },
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum ProfileQrCommand {
+  Share { uid: String },
+}
+
 pub(crate) enum ProfileBridgeEvent {
   Snapshot(ProfilesSnapshot),
   RuntimeChanged(ProfileRuntimeSync),
@@ -152,6 +166,7 @@ pub(crate) enum ProfileBridgeEvent {
   ContentSaved {
     uid: String,
   },
+  QrReady(ProfileQrCode),
   CommandFailed(String),
 }
 
@@ -242,28 +257,44 @@ impl ProfileWorker {
         self.finish_operation(result).await;
       },
       ProfileBridgeCommand::Content(command) => {
-        self.set_busy(true).await;
-        let result = self.content(command).await;
-        if let Ok(event) = &result {
-          match event {
-            ProfileContentResult::Loaded { uid, content } => {
-              let _ = self
-                .event_tx
-                .send(ProfileBridgeEvent::ContentLoaded {
-                  uid: uid.clone(),
-                  content: content.clone(),
-                })
-                .await;
-            },
-            ProfileContentResult::Saved { uid } => {
-              let _ = self
-                .event_tx
-                .send(ProfileBridgeEvent::ContentSaved { uid: uid.clone() })
-                .await;
-            },
-          }
+        self.handle_content(command).await;
+      },
+      ProfileBridgeCommand::Qr(command) => self.handle_qr(command).await,
+    }
+  }
+
+  async fn handle_content(&mut self, command: ProfileContentCommand) {
+    self.set_busy(true).await;
+    let result = self.content(command).await;
+    if let Ok(event) = &result {
+      let event = match event {
+        ProfileContentResult::Loaded { uid, content } => ProfileBridgeEvent::ContentLoaded {
+          uid: uid.clone(),
+          content: content.clone(),
+        },
+        ProfileContentResult::Saved { uid } => {
+          ProfileBridgeEvent::ContentSaved { uid: uid.clone() }
+        },
+      };
+      let _ = self.event_tx.send(event).await;
+    }
+    self.finish_operation(result.map(|_| ())).await;
+  }
+
+  async fn handle_qr(&self, command: ProfileQrCommand) {
+    match command {
+      ProfileQrCommand::Share { uid } => {
+        let store = self.access.store.clone();
+        let result = spawn_blocking(move || generate_profile_qr(&store, &uid))
+          .await
+          .map_err(|error| format!("profile QR task failed: {error}"))
+          .and_then(|result| result);
+        match result {
+          Ok(qr) => {
+            let _ = self.event_tx.send(ProfileBridgeEvent::QrReady(qr)).await;
+          },
+          Err(error) => self.fail(error).await,
         }
-        self.finish_operation(result.map(|_| ())).await;
       },
     }
   }
@@ -339,6 +370,16 @@ impl ProfileWorker {
       ProfileImportCommand::Remote { name, url, options } => {
         self.import_remote(name, url, options).await
       },
+      ProfileImportCommand::Qr {
+        name,
+        path,
+        options,
+      } => {
+        let decoded = spawn_blocking(move || decode_profile_qr(Path::new(&path)))
+          .await
+          .map_err(|error| format!("profile QR decode task failed: {error}"))??;
+        self.import_remote(name, decoded, options).await
+      },
     }
   }
 
@@ -362,13 +403,14 @@ impl ProfileWorker {
   async fn import_remote(
     &self,
     name: String,
-    url: String,
+    input: String,
     mut options: RemoteProfileOptions,
   ) -> Result<(), String> {
-    validate_profile_name(&name)?;
+    let resolved = resolve_remote_input(&name, &input)?;
+    validate_profile_name(&resolved.name)?;
     normalize_remote_options(&mut options);
     validate_remote_options(&options)?;
-    let download = self.download_remote(&url, &options).await?;
+    let download = self.download_remote(&resolved.url, &options).await?;
     if options.update_interval_minutes.is_none() {
       options.update_interval_minutes = download.suggested_update_interval_minutes;
     }
@@ -376,9 +418,9 @@ impl ProfileWorker {
     spawn_blocking(move || {
       import_content(
         &store,
-        &name,
+        &resolved.name,
         ProfileKind::Remote,
-        Some(url),
+        Some(resolved.url),
         Some(options),
         download,
       )
@@ -853,6 +895,120 @@ fn new_profile_enhancements(
     ));
   }
   (linked, refs)
+}
+
+struct ResolvedRemoteInput {
+  name: String,
+  url: String,
+}
+
+fn resolve_remote_input(name: &str, input: &str) -> Result<ResolvedRemoteInput, String> {
+  let parsed = Url::parse(input.trim())
+    .map_err(|error| format!("invalid subscription or deep link: {error}"))?;
+  let (url, deep_link_name) = match parsed.scheme() {
+    "http" | "https" => (parsed, None),
+    "clash" | "clash-verge" => {
+      let mut url = None;
+      let mut deep_link_name = None;
+      for (key, value) in parsed.query_pairs() {
+        match key.as_ref() {
+          "url" if url.is_none() => {
+            url = Some(
+              Url::parse(value.as_ref())
+                .map_err(|error| format!("invalid nested subscription URL: {error}"))?,
+            );
+          },
+          "name" if deep_link_name.is_none() => deep_link_name = Some(value.into_owned()),
+          _ => {},
+        }
+      }
+      (
+        url.ok_or_else(|| "deep link has no subscription URL".to_string())?,
+        deep_link_name,
+      )
+    },
+    _ => return Err("subscription input must use HTTP(S), clash, or clash-verge".to_string()),
+  };
+  if !matches!(url.scheme(), "http" | "https") {
+    return Err("nested subscription URL must use HTTP(S)".to_string());
+  }
+  let name = [Some(name.trim().to_string()), deep_link_name]
+    .into_iter()
+    .flatten()
+    .find(|name| !name.trim().is_empty())
+    .or_else(|| {
+      url
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+    })
+    .unwrap_or_else(|| "Imported subscription".to_string());
+  Ok(ResolvedRemoteInput {
+    name: name.trim().to_string(),
+    url: url.to_string(),
+  })
+}
+
+fn decode_profile_qr(path: &Path) -> Result<String, String> {
+  let metadata =
+    fs::symlink_metadata(path).map_err(|error| format!("inspect QR image: {error}"))?;
+  if metadata.file_type().is_symlink() || !metadata.is_file() {
+    return Err("QR image must be a regular, non-symlink file".to_string());
+  }
+  if metadata.len() > MAX_QR_IMAGE_BYTES {
+    return Err(format!(
+      "QR image exceeds the {} MiB limit",
+      MAX_QR_IMAGE_BYTES / 1024 / 1024
+    ));
+  }
+  let image = ImageReader::open(path)
+    .map_err(|error| format!("open QR image: {error}"))?
+    .with_guessed_format()
+    .map_err(|error| format!("detect QR image format: {error}"))?
+    .decode()
+    .map_err(|error| format!("decode QR image: {error}"))?;
+  let mut prepared = rqrr::PreparedImage::prepare(image.to_luma8());
+  let grids = prepared.detect_grids();
+  if grids.is_empty() {
+    return Err("the image contains no detectable QR code".to_string());
+  }
+  let mut failures = Vec::new();
+  for grid in grids {
+    match grid.decode() {
+      Ok((_, content)) if !content.trim().is_empty() => return Ok(content),
+      Ok(_) => failures.push("empty QR payload".to_string()),
+      Err(error) => failures.push(error.to_string()),
+    }
+  }
+  Err(format!("decode QR payload: {}", failures.join("; ")))
+}
+
+fn generate_profile_qr(store: &ProfileStore, uid: &str) -> Result<ProfileQrCode, String> {
+  let catalog = store.load_catalog().map_err(|error| error.to_string())?;
+  let item = catalog
+    .get(uid)
+    .ok_or_else(|| format!("profile {uid} does not exist"))?;
+  if item.kind != Some(ProfileKind::Remote) {
+    return Err(format!("profile {uid} is not a remote subscription"));
+  }
+  let url = item
+    .url
+    .as_deref()
+    .filter(|url| !url.is_empty())
+    .ok_or_else(|| format!("remote profile {uid} has no subscription URL"))?;
+  let code = QrCode::new(url.as_bytes()).map_err(|error| format!("encode QR code: {error}"))?;
+  let width = code.width();
+  let modules = code
+    .to_colors()
+    .into_iter()
+    .map(|color| color == QrColor::Dark)
+    .collect();
+  Ok(ProfileQrCode {
+    uid: uid.to_string(),
+    name: item.name.clone().unwrap_or_else(|| uid.to_string()),
+    width,
+    modules,
+  })
 }
 
 struct RemoteProfile {
@@ -1946,6 +2102,7 @@ mod tests {
     },
   };
 
+  use image::{GrayImage, Luma};
   use rsclash_config::initialize_default_runtime;
   use rsclash_config::{Result as ConfigResult, RuntimeActivator, RuntimeValidator};
   use serde_yaml_ng::Value;
@@ -1956,10 +2113,10 @@ mod tests {
   };
 
   use super::{
-    DownloadedProfile, ProfileAccess, ProfileWorker, delete_profiles, due_remote_profile_uids,
-    duplicate_profile, import_content, import_local, load_snapshot, persist_profile_selection,
-    prepare_activation, profile_runtime_sync, rename_profile, reorder_profile, set_current_profile,
-    set_remote_options,
+    DownloadedProfile, ProfileAccess, ProfileWorker, decode_profile_qr, delete_profiles,
+    due_remote_profile_uids, duplicate_profile, generate_profile_qr, import_content, import_local,
+    load_snapshot, persist_profile_selection, prepare_activation, profile_runtime_sync,
+    rename_profile, reorder_profile, resolve_remote_input, set_current_profile, set_remote_options,
   };
 
   static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -2247,6 +2404,74 @@ mod tests {
       !profile_runtime_sync(&store, &uid, true)
         .expect("the disabled cleanup policy should load")
         .close_connections
+    );
+  }
+
+  #[test]
+  fn remote_inputs_accept_urls_and_percent_encoded_deep_links() {
+    let direct =
+      resolve_remote_input("", "https://sub.example.com/config").expect("URL should resolve");
+    assert_eq!(direct.name, "sub.example.com");
+    assert_eq!(direct.url, "https://sub.example.com/config");
+
+    let deep_link = resolve_remote_input(
+      "",
+      "clash://install-config?url=https%3A%2F%2Fsub.example.com%2Fconfig%3Ftoken%3Dsecret&name=Work",
+    )
+    .expect("deep link should resolve");
+    assert_eq!(deep_link.name, "Work");
+    assert_eq!(deep_link.url, "https://sub.example.com/config?token=secret");
+    assert!(
+      resolve_remote_input("Invalid", "file:///tmp/profile.yaml").is_err(),
+      "non-network schemes must be rejected"
+    );
+  }
+
+  #[test]
+  fn remote_profile_qr_round_trips_without_exposing_the_url_in_snapshots() {
+    let directory = TestDirectory::new();
+    let store =
+      initialize_default_runtime(&directory.root).expect("the default runtime should initialize");
+    import_content(
+      &store,
+      "QR profile",
+      rsclash_config::ProfileKind::Remote,
+      Some("https://sub.example.com/config?token=secret".to_string()),
+      Some(rsclash_domain::RemoteProfileOptions::default()),
+      DownloadedProfile::from_content(
+        b"mode: rule\nproxies: []\nproxy-groups: []\nrules: []\n".to_vec(),
+      ),
+    )
+    .expect("the profile should import");
+    let uid = store
+      .load_catalog()
+      .expect("the catalog should load")
+      .items()
+      .iter()
+      .find(|item| item.is_source())
+      .and_then(|item| item.uid.as_deref())
+      .expect("the source profile should have a UID")
+      .to_string();
+    let qr = generate_profile_qr(&store, &uid).expect("QR code should generate");
+    assert!(!format!("{qr:?}").contains("token=secret"));
+    let scale = 8_u32;
+    let quiet = 4_u32;
+    let side = (u32::try_from(qr.width).expect("QR width should fit") + quiet * 2) * scale;
+    let mut image = GrayImage::from_pixel(side, side, Luma([255]));
+    for (index, _) in qr.modules.iter().enumerate().filter(|(_, dark)| **dark) {
+      let x = u32::try_from(index % qr.width).expect("QR x should fit") + quiet;
+      let y = u32::try_from(index / qr.width).expect("QR y should fit") + quiet;
+      for dy in 0..scale {
+        for dx in 0..scale {
+          image.put_pixel(x * scale + dx, y * scale + dy, Luma([0]));
+        }
+      }
+    }
+    let path = directory.root.join("subscription.png");
+    image.save(&path).expect("QR image should save");
+    assert_eq!(
+      decode_profile_qr(&path).expect("QR image should decode"),
+      "https://sub.example.com/config?token=secret"
     );
   }
 

@@ -28,8 +28,11 @@ eframe = { version = "0.35.0", default-features = false, features = [
 ] }
 egui = { version = "0.35.0", default-features = false }
 futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 ksni = { version = "0.3.6", default-features = false, features = ["tokio"] }
+qrcode = { version = "0.14.1", default-features = false }
 reqwest = { version = "0.13.3", default-features = false, features = ["json"] }
+rqrr = { version = "0.10.1", default-features = false, features = ["img"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 rustix = { version = "1.1.4", default-features = false, features = ["fs", "process", "std"] }
 serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }

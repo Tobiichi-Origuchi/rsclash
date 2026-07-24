@@ -5,6 +5,7 @@ mod theme;
 use std::{
   collections::{BTreeMap, BTreeSet},
   hash::{DefaultHasher, Hash as _, Hasher as _},
+  path::PathBuf,
   sync::Arc,
   time::{SystemTime, UNIX_EPOCH},
 };
@@ -13,8 +14,8 @@ use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, Stroke, Ui};
 use rsclash_app::{AppClient, AppEventReceiver, ClientError};
 use rsclash_domain::{
   AppEvent, AppSnapshot, AppStatus, CoreChannel, CoreRunMode, CoreState, MihomoConnection, Page,
-  ProfileDownloadProxy, ProfileSourceKind, ProxyGroupSnapshot, ProxyMode, RemoteProfileOptions,
-  SensitiveString, ThemeMode, UiCommand,
+  ProfileDownloadProxy, ProfileQrCode, ProfileSourceKind, ProxyGroupSnapshot, ProxyMode,
+  RemoteProfileOptions, SensitiveString, ThemeMode, UiCommand,
 };
 
 struct ProfileEditor {
@@ -46,6 +47,9 @@ pub struct RsClashUi {
   remote_profile_name: String,
   remote_profile_url: String,
   remote_profile_options: RemoteProfileOptions,
+  qr_profile_name: String,
+  qr_profile_path: String,
+  profile_qr: Option<ProfileQrCode>,
   renaming_profile: Option<String>,
   profile_name_edits: BTreeMap<String, String>,
   pending_profile_delete: Option<String>,
@@ -78,6 +82,9 @@ impl RsClashUi {
       remote_profile_name: String::new(),
       remote_profile_url: String::new(),
       remote_profile_options: RemoteProfileOptions::default(),
+      qr_profile_name: String::new(),
+      qr_profile_path: String::new(),
+      profile_qr: None,
       renaming_profile: None,
       profile_name_edits: BTreeMap::new(),
       pending_profile_delete: None,
@@ -134,7 +141,24 @@ impl RsClashUi {
             editor.dirty = false;
           }
         },
+        AppEvent::ProfileQrReady(qr) => {
+          self.profile_qr = Some(qr);
+        },
         _ => {},
+      }
+    }
+
+    if self.snapshot.page == Page::Profiles {
+      let dropped = context.input(|input| {
+        input
+          .raw
+          .dropped_files
+          .iter()
+          .filter_map(|file| file.path.clone())
+          .collect::<Vec<_>>()
+      });
+      for path in dropped {
+        self.import_dropped_profile(path);
       }
     }
 
@@ -610,6 +634,10 @@ impl RsClashUi {
       self.profile_yaml_editor(ui, profiles.busy);
       ui.add_space(16.0);
     }
+    if self.profile_qr.is_some() {
+      self.profile_qr_viewer(ui);
+      ui.add_space(16.0);
+    }
 
     ui.columns(2, |columns| {
       card(&mut columns[0], "导入本地配置", |ui| {
@@ -630,11 +658,16 @@ impl RsClashUi {
       });
       card(&mut columns[1], "添加远程订阅", |ui| {
         ui.add(egui::TextEdit::singleline(&mut self.remote_profile_name).hint_text("订阅名称"));
-        ui.add(
+        let url_edit = ui.add(
           egui::TextEdit::singleline(&mut self.remote_profile_url)
             .password(true)
-            .hint_text("https://example.com/subscription"),
+            .hint_text("HTTP(S) URL 或 clash:// 深链"),
         );
+        if ui.button("从剪贴板粘贴").clicked() {
+          url_edit.request_focus();
+          ui.ctx()
+            .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+        }
         ui.collapsing("下载选项", |ui| {
           remote_profile_options_editor(ui, &mut self.remote_profile_options);
         });
@@ -645,6 +678,33 @@ impl RsClashUi {
           self.command(UiCommand::ImportRemoteProfile {
             name: self.remote_profile_name.trim().to_string(),
             url: self.remote_profile_url.trim().to_string(),
+            options: self.remote_profile_options.clone(),
+          });
+        }
+      });
+    });
+    ui.add_space(12.0);
+    card(ui, "文件、拖放与二维码", |ui| {
+      ui.label(
+        RichText::new("可将 YAML 或 PNG/JPEG 二维码直接拖入窗口；也可以输入二维码图片路径。")
+          .small()
+          .weak(),
+      );
+      ui.horizontal(|ui| {
+        ui.add(
+          egui::TextEdit::singleline(&mut self.qr_profile_name).hint_text("订阅名称（可留空）"),
+        );
+        ui.add(
+          egui::TextEdit::singleline(&mut self.qr_profile_path)
+            .hint_text("/path/to/subscription-qr.png"),
+        );
+        if ui
+          .add_enabled(!profiles.busy, egui::Button::new("识别并导入"))
+          .clicked()
+        {
+          self.command(UiCommand::ImportProfileQr {
+            name: self.qr_profile_name.trim().to_string(),
+            path: self.qr_profile_path.trim().to_string(),
             options: self.remote_profile_options.clone(),
           });
         }
@@ -888,6 +948,15 @@ impl RsClashUi {
               .insert(profile.uid.clone(), options.clone());
             self.editing_profile_options = Some(profile.uid.clone());
           }
+          if profile.source == ProfileSourceKind::Remote
+            && ui
+              .add_enabled(!profiles.busy, egui::Button::new("分享二维码"))
+              .clicked()
+          {
+            self.command(UiCommand::RequestProfileQr {
+              uid: profile.uid.clone(),
+            });
+          }
           if ui
             .add_enabled(
               !profiles.busy && profile.source != ProfileSourceKind::Other,
@@ -1087,6 +1156,52 @@ impl RsClashUi {
     }
   }
 
+  fn profile_qr_viewer(&mut self, ui: &mut Ui) {
+    let Some(qr) = self.profile_qr.as_ref() else {
+      return;
+    };
+    let mut close = false;
+    card(ui, &format!("订阅二维码 · {}", qr.name), |ui| {
+      ui.label(
+        RichText::new("二维码仅在内存中生成；订阅 URL 不会进入应用状态快照。")
+          .small()
+          .weak(),
+      );
+      let side = ui.available_width().min(320.0);
+      let (response, painter) = ui.allocate_painter(egui::Vec2::splat(side), egui::Sense::hover());
+      painter.rect_filled(response.rect, 4.0, Color32::WHITE);
+      let quiet_zone = 4_usize;
+      let grid_width = qr.width.saturating_add(quiet_zone * 2);
+      if qr.width > 0 && qr.modules.len() == qr.width.saturating_mul(qr.width) {
+        let module_side = side / grid_width as f32;
+        for (index, _) in qr.modules.iter().enumerate().filter(|(_, dark)| **dark) {
+          let x = index % qr.width + quiet_zone;
+          let y = index / qr.width + quiet_zone;
+          let min = response.rect.min + egui::vec2(x as f32 * module_side, y as f32 * module_side);
+          painter.rect_filled(
+            egui::Rect::from_min_size(min, egui::Vec2::splat(module_side.ceil())),
+            0.0,
+            Color32::BLACK,
+          );
+        }
+      } else {
+        painter.text(
+          response.rect.center(),
+          egui::Align2::CENTER_CENTER,
+          "二维码数据无效",
+          egui::FontId::proportional(14.0),
+          Color32::RED,
+        );
+      }
+      if ui.button("关闭二维码").clicked() {
+        close = true;
+      }
+    });
+    if close {
+      self.profile_qr = None;
+    }
+  }
+
   fn mode_controls(&mut self, ui: &mut Ui, current: &ProxyMode) {
     ui.horizontal(|ui| {
       for (mode, label) in [
@@ -1224,6 +1339,34 @@ impl RsClashUi {
   fn open_profile_editor(&mut self, uid: String, name: String) {
     self.pending_profile_editor_name = Some((uid.clone(), name));
     self.command(UiCommand::LoadProfileContent { uid });
+  }
+
+  fn import_dropped_profile(&mut self, path: PathBuf) {
+    let extension = path
+      .extension()
+      .and_then(|extension| extension.to_str())
+      .map(str::to_ascii_lowercase);
+    let name = path
+      .file_stem()
+      .and_then(|name| name.to_str())
+      .unwrap_or("Imported profile")
+      .to_string();
+    let path = path.to_string_lossy().into_owned();
+    match extension.as_deref() {
+      Some("yaml" | "yml") => {
+        self.command(UiCommand::ImportLocalProfile { name, path });
+      },
+      Some("png" | "jpg" | "jpeg") => {
+        self.command(UiCommand::ImportProfileQr {
+          name,
+          path,
+          options: self.remote_profile_options.clone(),
+        });
+      },
+      _ => {
+        self.local_error = Some("仅支持拖入 YAML 配置或 PNG/JPEG 二维码图片。".to_string());
+      },
+    }
   }
 }
 
