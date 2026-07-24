@@ -17,11 +17,11 @@ use rsclash_domain::{
   AppEvent, AppSettings, AppSnapshot, AppStatus, ApplicationDirectory, ConnectionSnapshot,
   CoreChannel, CoreRunMode, CoreState, DnsEnhancedMode, LogSnapshot, MetricPoint, MihomoConnection,
   MihomoSnapshot, NavigationLayout, Page, ProfileDiagnosticStage, ProfileDiagnostics,
-  ProfileDownloadProxy, ProfileOperationKind, ProfileQrCode, ProfileSourceKind, ProxyCapabilities,
-  ProxyGroupLayout, ProxyGroupView, ProxyMemberSnapshot, ProxyMemberUnresolvedReason, ProxyMode,
-  ProxyNodeSnapshot, ProxyNodeSource, ProxyViewV1, RemoteProfileOptions, RuleSnapshot,
-  SensitiveString, StreamLogLevel, SystemProxyView, ThemeMode, TrayClickAction, TunStack,
-  UiCommand,
+  ProfileDownloadProxy, ProfileOperationKind, ProfileQrCode, ProfileSourceKind, ProfileSummary,
+  ProxyCapabilities, ProxyGroupLayout, ProxyGroupView, ProxyMemberSnapshot,
+  ProxyMemberUnresolvedReason, ProxyMode, ProxyNodeSnapshot, ProxyNodeSource, ProxyViewV1,
+  RemoteProfileOptions, RuleSnapshot, SensitiveString, StreamLogLevel, SystemProxyView, ThemeMode,
+  TrayClickAction, TunStack, UiCommand,
 };
 
 struct ProfileEditor {
@@ -182,6 +182,7 @@ pub struct RsClashUi {
   applied_window_visibility: Option<bool>,
   local_error: Option<String>,
   close_to_tray: bool,
+  home_settings_dialog: bool,
   local_profile_name: String,
   local_profile_path: String,
   remote_profile_name: String,
@@ -263,6 +264,7 @@ impl RsClashUi {
       applied_window_visibility: None,
       local_error: None,
       close_to_tray,
+      home_settings_dialog: false,
       local_profile_name: String::new(),
       local_profile_path: String::new(),
       remote_profile_name: String::new(),
@@ -479,18 +481,17 @@ impl RsClashUi {
   }
 
   pub fn ui(&mut self, root: &mut Ui) {
-    self.title_bar(root);
     let compact_navigation = match self.snapshot.settings.value.navigation_layout {
       NavigationLayout::Automatic => self.navigation_collapsed,
       NavigationLayout::Expanded => false,
       NavigationLayout::Compact => true,
     };
+    let shell = geometry::shell_layout(root.max_rect().size(), compact_navigation);
+    debug_assert!(shell.content_width >= 0.0);
+    debug_assert!(shell.main_height >= shell.page_body_height);
+    self.title_bar(root, shell.title_bar_height);
     egui::Panel::left("navigation")
-      .exact_size(if compact_navigation {
-        geometry::NAV_COLLAPSED_WIDTH
-      } else {
-        geometry::NAV_WIDTH
-      })
+      .exact_size(shell.nav_width)
       .frame(
         Frame::side_top_panel(root.style())
           .fill(root.visuals().panel_fill)
@@ -515,20 +516,20 @@ impl RsClashUi {
           .inner_margin(egui::Margin::same(0)),
       )
       .show(root, |ui| {
-        ui.add_space(geometry::LINUX_CONTENT_TOP);
-        self.header(ui);
+        ui.add_space(shell.content_top);
+        self.header(ui, shell.page_header_height);
         self.page_container(ui);
       });
     self.window_resize_handles(root);
   }
 
-  fn title_bar(&self, root: &mut Ui) {
-    egui::Panel::top("cvr-title-bar")
-      .exact_size(geometry::TITLE_BAR_HEIGHT)
+  fn title_bar(&self, root: &mut Ui, height: f32) {
+    let panel = egui::Panel::top("cvr-title-bar")
+      .exact_size(height)
       .frame(
         Frame::new()
           .fill(theme::tokens(root).surface)
-          .stroke(Stroke::new(1.0, theme::tokens(root).border))
+          .stroke(Stroke::NONE)
           .inner_margin(egui::Margin::symmetric(10, 3)),
       )
       .show(root, |ui| {
@@ -580,6 +581,13 @@ impl RsClashUi {
           }
         });
       });
+    root.painter().line_segment(
+      [
+        panel.response.rect.left_bottom(),
+        panel.response.rect.right_bottom(),
+      ],
+      Stroke::new(1.0, theme::tokens(root).border),
+    );
   }
 
   fn window_resize_handles(&self, root: &Ui) {
@@ -680,7 +688,7 @@ impl RsClashUi {
   }
 
   fn page_container(&mut self, ui: &mut Ui) {
-    if matches!(self.snapshot.page, Page::Proxies | Page::Profiles) {
+    if self.snapshot.page == Page::Proxies {
       ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -727,22 +735,29 @@ impl RsClashUi {
       egui::vec2(ui.available_width(), logo_height),
       Layout::left_to_right(Align::Center),
       |ui| {
-        ui.add_space(20.0);
-        Frame::new()
-          .fill(tokens.accent)
-          .corner_radius(8)
-          .inner_margin(egui::Margin::symmetric(8, 5))
-          .show(ui, |ui| {
-            ui.label(RichText::new("R").size(18.0).strong().color(Color32::WHITE));
-          });
+        ui.add_space(if compact { 18.0 } else { 20.0 });
+        let (logo, _) = ui.allocate_exact_size(egui::Vec2::splat(36.0), egui::Sense::hover());
+        ui.painter()
+          .rect_filled(logo, geometry::GLOBAL_RADIUS, tokens.accent);
+        ui.painter().text(
+          logo.center(),
+          egui::Align2::CENTER_CENTER,
+          "R",
+          egui::FontId::proportional(18.0),
+          Color32::WHITE,
+        );
         if !compact {
-          ui.add_space(8.0);
+          ui.add_space(5.0);
           ui.label(RichText::new("rsclash").size(20.0).strong());
         }
       },
     );
 
-    let traffic_height = if compact { 0.0 } else { 158.0 };
+    let traffic_height = if compact {
+      0.0
+    } else {
+      geometry::NAV_TRAFFIC_HEIGHT
+    };
     let menu_height = (ui.available_height() - traffic_height - 8.0).max(0.0);
     ScrollArea::vertical()
       .id_salt("cvr-navigation")
@@ -826,19 +841,12 @@ impl RsClashUi {
     );
     let text_color = ui.visuals().text_color();
     if compact {
-      ui.painter().text(
-        button.center(),
-        egui::Align2::CENTER_CENTER,
-        page.symbol(),
-        egui::FontId::proportional(23.0),
-        text_color,
-      );
+      paint_navigation_icon(ui.painter(), page, button.center(), text_color);
     } else {
-      ui.painter().text(
+      paint_navigation_icon(
+        ui.painter(),
+        page,
         egui::pos2(button.left() + 28.0, button.center().y),
-        egui::Align2::CENTER_CENTER,
-        page.symbol(),
-        egui::FontId::proportional(22.0),
         text_color,
       );
       ui.painter().text(
@@ -915,43 +923,57 @@ impl RsClashUi {
     );
   }
 
-  fn header(&mut self, ui: &mut Ui) {
+  fn header(&mut self, ui: &mut Ui, height: f32) {
     let tokens = theme::tokens(ui);
-    egui::Panel::top("cvr-page-header")
-      .exact_size(geometry::PAGE_HEADER_HEIGHT)
+    let panel = egui::Panel::top("cvr-page-header")
+      .exact_size(height)
       .frame(
         Frame::new()
           .fill(tokens.surface)
-          .stroke(Stroke::new(1.0, tokens.border))
+          .stroke(Stroke::NONE)
           .inner_margin(egui::Margin::symmetric(
             geometry::PAGE_HEADER_HORIZONTAL_PADDING as i8,
             0,
           )),
       )
       .show(ui, |ui| {
-        ui.horizontal(|ui| {
-          ui.label(
-            RichText::new(self.snapshot.page.label())
-              .size(20.0)
-              .strong(),
-          );
-          ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            self.page_header_actions(ui);
-          });
-        });
+        ui.allocate_ui_with_layout(
+          egui::vec2(ui.available_width(), height),
+          Layout::left_to_right(Align::Center),
+          |ui| {
+            ui.label(
+              RichText::new(self.snapshot.page.label())
+                .size(20.0)
+                .strong(),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+              self.page_header_actions(ui);
+            });
+          },
+        );
       });
+    ui.painter().line_segment(
+      [
+        panel.response.rect.left_bottom(),
+        panel.response.rect.right_bottom(),
+      ],
+      Stroke::new(1.0, tokens.border),
+    );
   }
 
   fn page_header_actions(&mut self, ui: &mut Ui) {
     match self.snapshot.page {
       Page::Home => {
         if header_icon_button(ui, "⚙", "首页卡片设置").clicked() {
-          self.command(UiCommand::Navigate(Page::Settings));
+          self.home_settings_dialog = true;
         }
         header_icon_button(ui, "?", "使用说明");
-        if header_icon_button(ui, "↻", "刷新状态").clicked() {
-          self.command(UiCommand::RefreshMihomo);
-          self.command(UiCommand::RefreshSystemProxy);
+        if header_icon_button(ui, "♧", "轻量模式").clicked() {
+          if self.tray_is_available() {
+            self.command(UiCommand::SetWindowVisible(false));
+          } else {
+            self.local_error = Some("当前桌面没有可用的系统托盘。".to_string());
+          }
         }
       },
       Page::Proxies => {
@@ -987,22 +1009,7 @@ impl RsClashUi {
           self.proxy_provider_dialog = true;
         }
       },
-      Page::Profiles => {
-        if header_icon_button(ui, "♨", "重新激活当前配置").clicked()
-          && let Some(profile) = self.snapshot.profiles.current()
-        {
-          self.command(UiCommand::ActivateProfile {
-            uid: profile.uid.clone(),
-          });
-        }
-        if header_icon_button(ui, "↻", "更新全部订阅").clicked() {
-          self.command(UiCommand::UpdateAllProfiles);
-        }
-        if header_icon_button(ui, "☐", "批量管理").clicked() {
-          self.profile_batch_mode = !self.profile_batch_mode;
-          self.selected_profiles.clear();
-        }
-      },
+      Page::Profiles => self.profile_header_actions(ui),
       Page::Connections => {
         if ui
           .add_sized([68.0, 30.0], egui::Button::new("关闭全部"))
@@ -1069,53 +1076,87 @@ impl RsClashUi {
           ui.spinner();
         }
       },
-      Page::Unlock => {},
+      Page::Unlock => {
+        if ui
+          .add_sized([92.0, 30.0], egui::Button::new("↻  全部测试"))
+          .clicked()
+        {
+          self.local_error = Some("流媒体解锁检测将在 P11 接入网络探测后可用。".to_string());
+        }
+      },
+    }
+  }
+
+  fn profile_header_actions(&mut self, ui: &mut Ui) {
+    if self.profile_batch_mode {
+      ui.label(format!("已选择 {} 项", self.selected_profiles.len()));
+      if ui
+        .add_sized([52.0, 30.0], egui::Button::new("完成"))
+        .clicked()
+      {
+        self.profile_batch_mode = false;
+        self.selected_profiles.clear();
+        self.pending_batch_delete = false;
+      }
+      let delete_label = if self.pending_batch_delete {
+        "确认"
+      } else {
+        "删除"
+      };
+      if ui
+        .add_enabled(
+          !self.selected_profiles.is_empty(),
+          egui::Button::new(delete_label).min_size(egui::vec2(52.0, 30.0)),
+        )
+        .clicked()
+      {
+        if self.pending_batch_delete {
+          self.command(UiCommand::DeleteProfiles {
+            uids: self.selected_profiles.iter().cloned().collect(),
+          });
+          self.profile_batch_mode = false;
+          self.selected_profiles.clear();
+          self.pending_batch_delete = false;
+        } else {
+          self.pending_batch_delete = true;
+        }
+      }
+      if header_icon_button(ui, "☑", "全选或取消全选").clicked() {
+        if self.selected_profiles.len() == self.snapshot.profiles.items.len() {
+          self.selected_profiles.clear();
+        } else {
+          self.selected_profiles = self
+            .snapshot
+            .profiles
+            .items
+            .iter()
+            .map(|profile| profile.uid.clone())
+            .collect();
+        }
+      }
+      return;
+    }
+    if header_icon_button(ui, "♨", "重新激活当前配置").clicked()
+      && let Some(profile) = self.snapshot.profiles.current()
+    {
+      self.command(UiCommand::ActivateProfile {
+        uid: profile.uid.clone(),
+      });
+    }
+    if header_icon_button(ui, "▤", "查看运行时配置").clicked() {
+      self.local_error = Some("运行时配置查看器尚未接入原生编辑器。".to_string());
+    }
+    if header_icon_button(ui, "↻", "更新全部订阅").clicked() {
+      self.command(UiCommand::UpdateAllProfiles);
+    }
+    if header_icon_button(ui, "☐", "批量管理").clicked() {
+      self.profile_batch_mode = true;
+      self.selected_profiles.clear();
     }
   }
 
   fn page(&mut self, ui: &mut Ui) {
-    if let Some(error) = self.snapshot.last_error.clone() {
-      Frame::new()
-        .fill(ui.visuals().error_fg_color.gamma_multiply(0.08))
-        .stroke(Stroke::new(
-          1.0,
-          ui.visuals().error_fg_color.gamma_multiply(0.35),
-        ))
-        .corner_radius(10)
-        .inner_margin(14)
-        .show(ui, |ui| {
-          ui.label(
-            RichText::new(error.title)
-              .strong()
-              .color(ui.visuals().error_fg_color),
-          );
-          ui.label(RichText::new(error.detail).color(ui.visuals().error_fg_color));
-          if ui.button("关闭").clicked() {
-            self.command(UiCommand::ClearError);
-          }
-        });
-      ui.add_space(14.0);
-    }
-
-    if let Some(error) = self.local_error.clone() {
-      Frame::new()
-        .fill(ui.visuals().error_fg_color.gamma_multiply(0.08))
-        .stroke(Stroke::new(
-          1.0,
-          ui.visuals().error_fg_color.gamma_multiply(0.35),
-        ))
-        .corner_radius(10)
-        .inner_margin(14)
-        .show(ui, |ui| {
-          ui.horizontal(|ui| {
-            ui.label(RichText::new(error).color(ui.visuals().error_fg_color));
-            if ui.button("关闭").clicked() {
-              self.local_error = None;
-            }
-          });
-        });
-      ui.add_space(14.0);
-    }
+    self.error_notices(ui.ctx());
 
     match self.snapshot.page {
       Page::Home => self.home(ui),
@@ -1124,12 +1165,37 @@ impl RsClashUi {
       Page::Connections => self.connections(ui),
       Page::Rules => self.rules(ui),
       Page::Logs => self.logs(ui),
+      Page::Unlock => self.unlock(ui),
       Page::Settings => self.settings(ui),
-      page => self.placeholder(ui, page),
     }
   }
 
+  fn error_notices(&mut self, context: &egui::Context) {
+    let backend_error = self.snapshot.last_error.clone();
+    let local_error = self.local_error.clone();
+    if backend_error.is_none() && local_error.is_none() {
+      return;
+    }
+    egui::Area::new(egui::Id::new("cvr-error-notices"))
+      .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+      .order(egui::Order::Foreground)
+      .show(context, |ui| {
+        ui.set_max_width(420.0);
+        if let Some(error) = backend_error {
+          notice_frame(ui, &error.title, &error.detail, || {
+            self.command(UiCommand::ClearError);
+          });
+        }
+        if let Some(error) = local_error {
+          notice_frame(ui, "操作未完成", &error, || {
+            self.local_error = None;
+          });
+        }
+      });
+  }
+
   fn home(&mut self, ui: &mut Ui) {
+    self.home_settings_dialog(ui.ctx());
     let core = self.snapshot.core.clone();
     let mihomo = self.snapshot.mihomo.clone();
     let system_proxy = self.snapshot.system_proxy.clone();
@@ -1139,9 +1205,12 @@ impl RsClashUi {
 
     if cards.iter().any(|card| card == "profile") || cards.iter().any(|card| card == "proxy") {
       if two_columns {
-        ui.columns(2, |columns| {
-          self.home_profile(&mut columns[0], &core);
-          self.home_current_proxy(&mut columns[1], &mihomo);
+        ui.scope(|ui| {
+          ui.spacing_mut().item_spacing.x = geometry::GRID_GAP;
+          ui.columns(2, |columns| {
+            self.home_profile(&mut columns[0], &core);
+            self.home_current_proxy(&mut columns[1], &mihomo);
+          });
         });
       } else {
         self.home_profile(ui, &core);
@@ -1153,9 +1222,12 @@ impl RsClashUi {
 
     if cards.iter().any(|card| card == "network") {
       if two_columns {
-        ui.columns(2, |columns| {
-          self.home_network(&mut columns[0], &core, &mihomo, &system_proxy);
-          self.home_proxy(&mut columns[1], &mihomo);
+        ui.scope(|ui| {
+          ui.spacing_mut().item_spacing.x = geometry::GRID_GAP;
+          ui.columns(2, |columns| {
+            self.home_network(&mut columns[0], &core, &mihomo, &system_proxy);
+            self.home_proxy(&mut columns[1], &mihomo);
+          });
         });
       } else {
         self.home_network(ui, &core, &mihomo, &system_proxy);
@@ -1168,6 +1240,39 @@ impl RsClashUi {
     if cards.iter().any(|card| card == "traffic") {
       self.home_traffic(ui, &mihomo);
     }
+  }
+
+  fn home_settings_dialog(&mut self, context: &egui::Context) {
+    if !self.home_settings_dialog {
+      return;
+    }
+    let mut open = self.home_settings_dialog;
+    let mut cards = self.snapshot.settings.value.home_cards.clone();
+    let mut save = false;
+    egui::Window::new("首页设置")
+      .open(&mut open)
+      .default_width(360.0)
+      .show(context, |ui| {
+        for (key, label) in [
+          ("profile", "当前配置"),
+          ("proxy", "当前代理"),
+          ("network", "网络设置与代理模式"),
+          ("traffic", "流量统计"),
+        ] {
+          setting_membership_checkbox(ui, &mut cards, key, label);
+        }
+        ui.add_space(geometry::MUI_SPACING);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+          save = ui.button("保存").clicked();
+        });
+      });
+    if save {
+      let mut settings = self.snapshot.settings.value.clone();
+      settings.home_cards = cards;
+      self.command(UiCommand::ApplySettings(Box::new(settings)));
+      open = false;
+    }
+    self.home_settings_dialog = open;
   }
 
   fn home_profile(&mut self, ui: &mut Ui, core: &CoreState) {
@@ -1785,7 +1890,7 @@ impl RsClashUi {
     let tokens = theme::tokens(ui);
     ui.painter().rect_filled(
       rect,
-      12.0,
+      6.0,
       if selected {
         tokens.accent_soft
       } else if response.hovered() {
@@ -1797,7 +1902,7 @@ impl RsClashUi {
     if selected {
       ui.painter().rect_stroke(
         rect,
-        12.0,
+        6.0,
         Stroke::new(1.0, tokens.accent),
         egui::StrokeKind::Inside,
       );
@@ -2097,7 +2202,7 @@ impl RsClashUi {
           });
         ui.add_sized(
           [
-            (ui.available_width() - geometry::PAGE_CONTENT_HORIZONTAL_MARGIN).max(100.0),
+            (ui.available_width() - geometry::PAGE_CONTENT_HORIZONTAL_MARGIN).max(40.0),
             geometry::CONNECTION_TOOLBAR_MIN_HEIGHT,
           ],
           egui::TextEdit::singleline(&mut self.connection_search).hint_text("搜索"),
@@ -2294,389 +2399,597 @@ impl RsClashUi {
     let profiles = self.snapshot.profiles.clone();
     self.profile_import_toolbar(ui, profiles.busy);
     self.profile_create_dialog(ui.ctx(), profiles.busy);
+    self.profile_metadata_dialogs(ui.ctx(), profiles.busy);
 
-    if self.profile_editor.is_some() {
-      self.profile_yaml_editor(ui, profiles.busy);
-      ui.add_space(geometry::GRID_GAP);
-    }
-    if self.sequence_editor.is_some() {
-      self.profile_sequence_editor(ui, profiles.busy);
-      ui.add_space(geometry::GRID_GAP);
-    }
-    if self.profile_qr.is_some() {
-      self.profile_qr_viewer(ui);
-      ui.add_space(geometry::GRID_GAP);
-    }
-
-    if profiles.items.is_empty() {
-      empty_state(
-        ui,
-        "还没有配置",
-        "从本地文件或 HTTPS 订阅导入第一个 Mihomo 配置。",
-      );
-      return;
-    }
-
-    if self.profile_batch_mode {
-      card(ui, "批量管理", |ui| {
-        ui.horizontal_wrapped(|ui| {
-          ui.label(format!(
-            "已选择 {} / {} 项",
-            self.selected_profiles.len(),
-            profiles.items.len()
-          ));
-          if ui
-            .add_enabled(!profiles.busy, egui::Button::new("全选"))
-            .clicked()
-          {
-            self
-              .selected_profiles
-              .extend(profiles.items.iter().map(|profile| profile.uid.clone()));
-          }
-          if ui
-            .add_enabled(
-              !profiles.busy && !self.selected_profiles.is_empty(),
-              egui::Button::new("清除选择"),
-            )
-            .clicked()
-          {
-            self.selected_profiles.clear();
-            self.pending_batch_delete = false;
-          }
-          let delete_label = if self.pending_batch_delete {
-            "确认删除选中项"
-          } else {
-            "删除选中项"
-          };
-          if ui
-            .add_enabled(
-              !profiles.busy && !self.selected_profiles.is_empty(),
-              egui::Button::new(delete_label),
-            )
-            .clicked()
-          {
-            if self.pending_batch_delete {
-              self.command(UiCommand::DeleteProfiles {
-                uids: self.selected_profiles.iter().cloned().collect(),
-              });
-              self.selected_profiles.clear();
-              self.pending_batch_delete = false;
-              self.profile_batch_mode = false;
-            } else {
-              self.pending_batch_delete = true;
+    ScrollArea::vertical()
+      .id_salt("cvr-profiles-content")
+      .auto_shrink([false, false])
+      .show(ui, |ui| {
+        ui.set_min_width(ui.available_width());
+        Frame::new()
+          .inner_margin(egui::Margin {
+            left: geometry::PAGE_CONTENT_HORIZONTAL_MARGIN as i8,
+            right: geometry::PAGE_CONTENT_HORIZONTAL_MARGIN as i8,
+            top: 0,
+            bottom: geometry::PAGE_CONTENT_VERTICAL_PADDING as i8,
+          })
+          .show(ui, |ui| {
+            if self.profile_editor.is_some() {
+              self.profile_yaml_editor(ui, profiles.busy);
+              ui.add_space(geometry::GRID_GAP);
             }
-          }
-        });
-        if self.pending_batch_delete {
-          ui.label(RichText::new("此操作会同时删除所选配置文件，无法撤销。").weak());
-        }
-      });
-      ui.add_space(10.0);
-    }
+            if self.sequence_editor.is_some() {
+              self.profile_sequence_editor(ui, profiles.busy);
+              ui.add_space(geometry::GRID_GAP);
+            }
+            if self.profile_qr.is_some() {
+              self.profile_qr_viewer(ui);
+              ui.add_space(geometry::GRID_GAP);
+            }
 
-    let viewport_width = ui.ctx().content_rect().width();
-    let column_count = geometry::profile_grid_columns(geometry::breakpoint(viewport_width)).max(1);
-    for (row_index, row) in profiles.items.chunks(column_count).enumerate() {
-      ui.columns(column_count, |columns| {
-        for (offset, (column, profile)) in columns.iter_mut().zip(row).enumerate() {
-          let profile_index = row_index * column_count + offset;
-          card(column, &profile.name, |ui| {
-            ui.horizontal(|ui| {
-              if self.profile_batch_mode {
-                let mut selected = self.selected_profiles.contains(&profile.uid);
-                if ui.checkbox(&mut selected, "").changed() {
-                  if selected {
-                    self.selected_profiles.insert(profile.uid.clone());
-                  } else {
-                    self.selected_profiles.remove(&profile.uid);
-                  }
-                  self.pending_batch_delete = false;
-                }
-              }
-              let source = match profile.source {
-                ProfileSourceKind::Local => "本地",
-                ProfileSourceKind::Remote => "远程订阅",
-                ProfileSourceKind::Merge => "合并配置",
-                ProfileSourceKind::Rules => "规则扩展",
-                ProfileSourceKind::Proxies => "代理扩展",
-                ProfileSourceKind::Groups => "代理组扩展",
-                ProfileSourceKind::Other => "扩展配置",
-              };
-              ui.label(RichText::new(source).small().weak());
-              if profile.active {
-                ui.label(
-                  RichText::new("当前使用")
-                    .small()
-                    .strong()
-                    .color(Color32::from_rgb(38, 162, 105)),
-                );
-              }
-            });
-            if let Some(usage) = profile.usage {
-              let used = usage.upload.saturating_add(usage.download);
-              ui.label(
-                RichText::new(format!(
-                  "流量：{} / {} · 到期时间：{}",
-                  format_bytes(used),
-                  format_bytes(usage.total),
-                  if usage.expire == 0 {
-                    "未提供".to_string()
-                  } else {
-                    usage.expire.to_string()
-                  }
-                ))
-                .small()
-                .weak(),
+            if profiles.items.is_empty() {
+              empty_state(
+                ui,
+                "还没有配置",
+                "从本地文件或 HTTPS 订阅导入第一个 Mihomo 配置。",
               );
-            }
-            if let Some(updated_at) = profile.updated_at {
-              ui.label(
-                RichText::new(format!("最近更新：{}", format_update_age(updated_at)))
-                  .small()
-                  .weak(),
-              );
-            }
-            if let Some(home_page) = profile.home_page.as_deref() {
-              ui.label(
-                RichText::new(format!("订阅主页：{home_page}"))
-                  .small()
-                  .weak(),
-              );
-            }
-            if self.profile_batch_mode {
               return;
             }
 
-            if self.renaming_profile.as_deref() == Some(profile.uid.as_str()) {
-              let edit = self
-                .profile_name_edits
-                .entry(profile.uid.clone())
-                .or_insert_with(|| profile.name.clone());
-              let mut save = false;
-              let mut cancel = false;
-              ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(edit).hint_text("配置名称"));
-                save = ui
-                  .add_enabled(!profiles.busy, egui::Button::new("保存"))
-                  .clicked();
-                cancel = ui.button("取消").clicked();
-              });
-              if save {
-                let name = self
-                  .profile_name_edits
-                  .get(&profile.uid)
-                  .cloned()
-                  .unwrap_or_default();
-                self.command(UiCommand::RenameProfile {
-                  uid: profile.uid.clone(),
-                  name,
+            let viewport_width = ui.ctx().content_rect().width();
+            let column_count =
+              geometry::profile_grid_columns(geometry::breakpoint(viewport_width)).max(1);
+            for (row_index, row) in profiles.items.chunks(column_count).enumerate() {
+              ui.scope(|ui| {
+                ui.spacing_mut().item_spacing.x = geometry::MUI_SPACING;
+                ui.columns(column_count, |columns| {
+                  for (offset, (column, profile)) in columns.iter_mut().zip(row).enumerate() {
+                    let profile_index = row_index * column_count + offset;
+                    self.profile_card(
+                      column,
+                      profile,
+                      profile_index,
+                      profiles.items.len(),
+                      profiles.busy,
+                    );
+                  }
                 });
-                self.renaming_profile = None;
-              } else if cancel {
-                self.renaming_profile = None;
-              }
+              });
+              ui.add_space(geometry::MUI_SPACING);
             }
 
-            if self.editing_profile_options.as_deref() == Some(profile.uid.as_str())
-              && let Some(original) = profile.remote_options.as_ref()
-            {
-              let edit = self
-                .profile_options_edits
-                .entry(profile.uid.clone())
-                .or_insert_with(|| original.clone());
-              remote_profile_options_editor(ui, edit);
-              let mut save = false;
-              let mut cancel = false;
-              ui.horizontal(|ui| {
-                save = ui
-                  .add_enabled(!profiles.busy, egui::Button::new("保存下载设置"))
-                  .clicked();
-                cancel = ui.button("取消").clicked();
-              });
-              if save {
-                let options = self
-                  .profile_options_edits
-                  .get(&profile.uid)
-                  .cloned()
-                  .unwrap_or_default();
-                self.command(UiCommand::SetRemoteProfileOptions {
-                  uid: profile.uid.clone(),
-                  options,
-                });
-                self.editing_profile_options = None;
-              } else if cancel {
-                self.editing_profile_options = None;
-              }
-            }
-
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-              let source_profile = matches!(
-                profile.source,
-                ProfileSourceKind::Local | ProfileSourceKind::Remote
-              );
-              if ui
-                .add_enabled(
-                  !profiles.busy && source_profile && !profile.active,
-                  egui::Button::new(if profile.active {
-                    "已激活"
-                  } else {
-                    "激活"
-                  }),
-                )
-                .clicked()
-              {
-                self.command(UiCommand::ActivateProfile {
-                  uid: profile.uid.clone(),
-                });
-              }
-              if profile.source == ProfileSourceKind::Remote
-                && ui
-                  .add_enabled(!profiles.busy, egui::Button::new("更新"))
-                  .clicked()
-              {
-                self.command(UiCommand::UpdateProfile {
-                  uid: profile.uid.clone(),
-                });
-              }
-              if let Some(options) = profile.remote_options.as_ref()
-                && ui
-                  .add_enabled(!profiles.busy, egui::Button::new("下载设置"))
-                  .clicked()
-              {
-                self
-                  .profile_options_edits
-                  .insert(profile.uid.clone(), options.clone());
-                self.editing_profile_options = Some(profile.uid.clone());
-              }
-              if profile.source == ProfileSourceKind::Remote
-                && ui
-                  .add_enabled(!profiles.busy, egui::Button::new("分享二维码"))
-                  .clicked()
-              {
-                self.command(UiCommand::RequestProfileQr {
-                  uid: profile.uid.clone(),
-                });
-              }
-              if ui
-                .add_enabled(
-                  !profiles.busy && profile.source != ProfileSourceKind::Other,
-                  egui::Button::new("编辑 YAML"),
-                )
-                .clicked()
-              {
-                self.open_profile_editor(profile.uid.clone(), profile.name.clone());
-              }
-              if let Some(uid) = profile.enhancements.merge.as_deref()
-                && ui
-                  .add_enabled(!profiles.busy, egui::Button::new("扩展配置"))
-                  .clicked()
-              {
-                self.open_profile_editor(uid.to_string(), format!("{} · 合并配置", profile.name));
-              }
-              for (label, uid, kind) in [
-                (
-                  "编辑规则",
-                  profile.enhancements.rules.as_deref(),
-                  SequenceEditorKind::Rules,
-                ),
-                (
-                  "编辑代理",
-                  profile.enhancements.proxies.as_deref(),
-                  SequenceEditorKind::Proxies,
-                ),
-                (
-                  "编辑代理组",
-                  profile.enhancements.groups.as_deref(),
-                  SequenceEditorKind::Groups,
-                ),
-              ] {
-                if let Some(uid) = uid
-                  && ui
-                    .add_enabled(!profiles.busy, egui::Button::new(label))
-                    .clicked()
-                {
-                  self.open_sequence_editor(
-                    uid.to_string(),
-                    format!("{} · {}", profile.name, kind.label()),
-                    kind,
-                  );
-                }
-              }
-              if ui
-                .add_enabled(
-                  !profiles.busy && profile.source != ProfileSourceKind::Other,
-                  egui::Button::new("复制"),
-                )
-                .clicked()
-              {
-                self.command(UiCommand::DuplicateProfile {
-                  uid: profile.uid.clone(),
-                });
-              }
-              if ui
-                .add_enabled(!profiles.busy, egui::Button::new("重命名"))
-                .clicked()
-              {
-                self
-                  .profile_name_edits
-                  .insert(profile.uid.clone(), profile.name.clone());
-                self.renaming_profile = Some(profile.uid.clone());
-              }
-              if ui
-                .add_enabled(
-                  !profiles.busy && profile_index > 0,
-                  egui::Button::new("上移"),
-                )
-                .clicked()
-              {
-                self.command(UiCommand::ReorderProfile {
-                  uid: profile.uid.clone(),
-                  new_index: profile_index - 1,
-                });
-              }
-              if ui
-                .add_enabled(
-                  !profiles.busy && profile_index + 1 < profiles.items.len(),
-                  egui::Button::new("下移"),
-                )
-                .clicked()
-              {
-                self.command(UiCommand::ReorderProfile {
-                  uid: profile.uid.clone(),
-                  new_index: profile_index + 1,
-                });
-              }
-              let delete_pending =
-                self.pending_profile_delete.as_deref() == Some(profile.uid.as_str());
-              if ui
-                .add_enabled(
-                  !profiles.busy,
-                  egui::Button::new(if delete_pending {
-                    "确认删除"
-                  } else {
-                    "删除"
-                  }),
-                )
-                .clicked()
-              {
-                if delete_pending {
-                  self.command(UiCommand::DeleteProfiles {
-                    uids: vec![profile.uid.clone()],
-                  });
-                  self.pending_profile_delete = None;
-                } else {
-                  self.pending_profile_delete = Some(profile.uid.clone());
-                }
-              }
-              if delete_pending && ui.button("取消删除").clicked() {
-                self.pending_profile_delete = None;
-              }
-            });
+            ui.add_space(4.0);
+            let divider_width = (ui.available_width() - 32.0).max(0.0);
+            let (divider, _) =
+              ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+            ui.painter().line_segment(
+              [
+                egui::pos2(divider.center().x - divider_width / 2.0, divider.center().y),
+                egui::pos2(divider.center().x + divider_width / 2.0, divider.center().y),
+              ],
+              Stroke::new(1.0, theme::tokens(ui).border),
+            );
+            ui.add_space(geometry::GRID_GAP);
+            self.profile_extension_cards(ui, profiles.current());
           });
+      });
+  }
+
+  fn profile_card(
+    &mut self,
+    ui: &mut Ui,
+    profile: &ProfileSummary,
+    profile_index: usize,
+    profile_count: usize,
+    busy: bool,
+  ) {
+    let (rect, response) = ui.allocate_exact_size(
+      egui::vec2(ui.available_width(), geometry::PROFILE_CARD_HEIGHT),
+      egui::Sense::click(),
+    );
+    let tokens = theme::tokens(ui);
+    let fill = if response.hovered() {
+      tokens.surface_raised
+    } else {
+      tokens.surface
+    };
+    ui.painter()
+      .rect_filled(rect, geometry::GLOBAL_RADIUS, fill);
+    if profile.active {
+      let accent = egui::Rect::from_min_max(rect.min, egui::pos2(rect.left() + 3.0, rect.bottom()));
+      ui.painter()
+        .rect_filled(accent, geometry::GLOBAL_RADIUS, tokens.accent);
+    }
+
+    let content_left = rect.left() + 16.0;
+    let content_right = rect.right() - 16.0;
+    let header_y = rect.top() + 8.0 + geometry::PROFILE_CARD_LINE_HEIGHT / 2.0;
+    let second_y = header_y + geometry::PROFILE_CARD_LINE_HEIGHT;
+    let third_y = second_y + geometry::PROFILE_CARD_LINE_HEIGHT;
+    let mut title_left = content_left + 18.0;
+    let checkbox = if self.profile_batch_mode {
+      let checkbox_rect = egui::Rect::from_center_size(
+        egui::pos2(content_left + 4.0, header_y),
+        egui::Vec2::splat(26.0),
+      );
+      let checkbox_response = ui.interact(
+        checkbox_rect,
+        ui.id().with(("profile-checkbox", &profile.uid)),
+        egui::Sense::click(),
+      );
+      ui.painter().text(
+        checkbox_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        if self.selected_profiles.contains(&profile.uid) {
+          "☑"
+        } else {
+          "☐"
+        },
+        egui::FontId::proportional(18.0),
+        if self.selected_profiles.contains(&profile.uid) {
+          tokens.accent
+        } else {
+          tokens.text_muted
+        },
+      );
+      title_left += 24.0;
+      Some(checkbox_response)
+    } else {
+      None
+    };
+    ui.painter().text(
+      egui::pos2(title_left - 12.0, header_y),
+      egui::Align2::CENTER_CENTER,
+      "⠿",
+      egui::FontId::proportional(17.0),
+      ui.visuals().text_color(),
+    );
+
+    let update_rect = egui::Rect::from_center_size(
+      egui::pos2(content_right - 2.0, header_y),
+      egui::Vec2::splat(30.0),
+    );
+    let update = ui
+      .interact(
+        update_rect,
+        ui.id().with(("update-profile", &profile.uid)),
+        egui::Sense::click(),
+      )
+      .on_hover_text("更新订阅");
+    if update.hovered() {
+      ui.painter()
+        .rect_filled(update_rect, 15.0, tokens.accent_soft);
+    }
+    if profile.source == ProfileSourceKind::Remote {
+      ui.painter().text(
+        update_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "↻",
+        egui::FontId::proportional(18.0),
+        tokens.text_muted,
+      );
+      if update.clicked() && !busy {
+        self.command(UiCommand::UpdateProfile {
+          uid: profile.uid.clone(),
+        });
+      }
+    }
+
+    let title_right = if profile.source == ProfileSourceKind::Remote {
+      update_rect.left() - 2.0
+    } else {
+      content_right
+    };
+    let title_painter = ui.painter().with_clip_rect(egui::Rect::from_min_max(
+      egui::pos2(title_left, rect.top()),
+      egui::pos2(title_right, rect.top() + 34.0),
+    ));
+    title_painter.text(
+      egui::pos2(title_left, header_y),
+      egui::Align2::LEFT_CENTER,
+      &profile.name,
+      egui::FontId::proportional(18.0),
+      if profile.active {
+        tokens.accent
+      } else {
+        ui.visuals().text_color()
+      },
+    );
+
+    let origin = profile_origin(profile);
+    let updated = profile
+      .updated_at
+      .map_or_else(String::new, format_update_age);
+    let line_clip = ui.painter().with_clip_rect(egui::Rect::from_min_max(
+      egui::pos2(content_left, rect.top()),
+      egui::pos2(content_right, rect.bottom()),
+    ));
+    line_clip.text(
+      egui::pos2(content_left, second_y),
+      egui::Align2::LEFT_CENTER,
+      origin,
+      egui::FontId::proportional(14.0),
+      tokens.text_muted,
+    );
+    line_clip.text(
+      egui::pos2(content_right, second_y),
+      egui::Align2::RIGHT_CENTER,
+      &updated,
+      egui::FontId::proportional(14.0),
+      tokens.text_muted,
+    );
+
+    let (usage_label, expire_label, progress) = profile.usage.map_or_else(
+      || {
+        (
+          String::new(),
+          profile_source_label(profile.source).to_string(),
+          0.0,
+        )
+      },
+      |usage| {
+        let used = usage.upload.saturating_add(usage.download);
+        let progress = if usage.total == 0 {
+          0.0
+        } else {
+          used as f32 / usage.total as f32
+        };
+        (
+          format!("{} / {}", format_bytes(used), format_bytes(usage.total)),
+          if usage.expire == 0 {
+            "长期有效".to_string()
+          } else {
+            format!("到期 {}", usage.expire)
+          },
+          progress.clamp(0.0, 1.0),
+        )
+      },
+    );
+    line_clip.text(
+      egui::pos2(content_left, third_y),
+      egui::Align2::LEFT_CENTER,
+      usage_label,
+      egui::FontId::proportional(14.0),
+      tokens.text_muted,
+    );
+    line_clip.text(
+      egui::pos2(content_right, third_y),
+      egui::Align2::RIGHT_CENTER,
+      expire_label,
+      egui::FontId::proportional(12.0),
+      tokens.text_muted,
+    );
+    let progress_rect = egui::Rect::from_min_max(
+      egui::pos2(
+        content_left,
+        rect.bottom() - geometry::PROFILE_PROGRESS_HEIGHT,
+      ),
+      egui::pos2(content_right, rect.bottom()),
+    );
+    ui.painter()
+      .rect_filled(progress_rect, 0.0, tokens.surface_raised);
+    if progress > 0.0 {
+      ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+          progress_rect.min,
+          egui::pos2(
+            progress_rect.left() + progress_rect.width() * progress,
+            progress_rect.bottom(),
+          ),
+        ),
+        0.0,
+        tokens.accent,
+      );
+    }
+
+    if checkbox.is_some_and(|response| response.clicked())
+      || (self.profile_batch_mode && response.clicked())
+    {
+      if !self.selected_profiles.remove(&profile.uid) {
+        self.selected_profiles.insert(profile.uid.clone());
+      }
+      self.pending_batch_delete = false;
+    } else if response.clicked()
+      && !busy
+      && !profile.active
+      && matches!(
+        profile.source,
+        ProfileSourceKind::Local | ProfileSourceKind::Remote
+      )
+    {
+      self.command(UiCommand::ActivateProfile {
+        uid: profile.uid.clone(),
+      });
+    }
+    response.context_menu(|ui| {
+      self.profile_context_menu(ui, profile, profile_index, profile_count, busy);
+    });
+  }
+
+  fn profile_context_menu(
+    &mut self,
+    ui: &mut Ui,
+    profile: &ProfileSummary,
+    profile_index: usize,
+    profile_count: usize,
+    busy: bool,
+  ) {
+    let source_profile = matches!(
+      profile.source,
+      ProfileSourceKind::Local | ProfileSourceKind::Remote
+    );
+    if ui
+      .add_enabled(
+        !busy && source_profile && !profile.active,
+        egui::Button::new("选择"),
+      )
+      .clicked()
+    {
+      self.command(UiCommand::ActivateProfile {
+        uid: profile.uid.clone(),
+      });
+      ui.close();
+    }
+    if profile.source == ProfileSourceKind::Remote {
+      if ui
+        .add_enabled(!busy, egui::Button::new("分享二维码"))
+        .clicked()
+      {
+        self.command(UiCommand::RequestProfileQr {
+          uid: profile.uid.clone(),
+        });
+        ui.close();
+      }
+      if ui.add_enabled(!busy, egui::Button::new("更新")).clicked() {
+        self.command(UiCommand::UpdateProfile {
+          uid: profile.uid.clone(),
+        });
+        ui.close();
+      }
+      if let Some(options) = profile.remote_options.as_ref()
+        && ui
+          .add_enabled(!busy, egui::Button::new("编辑信息"))
+          .clicked()
+      {
+        self
+          .profile_options_edits
+          .insert(profile.uid.clone(), options.clone());
+        self.editing_profile_options = Some(profile.uid.clone());
+        ui.close();
+      }
+    }
+    ui.separator();
+    if ui
+      .add_enabled(
+        !busy && profile.source != ProfileSourceKind::Other,
+        egui::Button::new("编辑文件"),
+      )
+      .clicked()
+    {
+      self.open_profile_editor(profile.uid.clone(), profile.name.clone());
+      ui.close();
+    }
+    for (label, uid, kind) in [
+      (
+        "编辑规则",
+        profile.enhancements.rules.as_deref(),
+        SequenceEditorKind::Rules,
+      ),
+      (
+        "编辑代理",
+        profile.enhancements.proxies.as_deref(),
+        SequenceEditorKind::Proxies,
+      ),
+      (
+        "编辑代理组",
+        profile.enhancements.groups.as_deref(),
+        SequenceEditorKind::Groups,
+      ),
+    ] {
+      if ui
+        .add_enabled(!busy && uid.is_some(), egui::Button::new(label))
+        .clicked()
+      {
+        if let Some(uid) = uid {
+          self.open_sequence_editor(
+            uid.to_string(),
+            format!("{} · {}", profile.name, kind.label()),
+            kind,
+          );
+        }
+        ui.close();
+      }
+    }
+    if ui
+      .add_enabled(
+        !busy && profile.enhancements.merge.is_some(),
+        egui::Button::new("扩展配置"),
+      )
+      .clicked()
+    {
+      if let Some(uid) = profile.enhancements.merge.as_deref() {
+        self.open_profile_editor(uid.to_string(), format!("{} · 合并配置", profile.name));
+      }
+      ui.close();
+    }
+    ui.separator();
+    if ui
+      .add_enabled(
+        !busy && profile.source != ProfileSourceKind::Other,
+        egui::Button::new("复制"),
+      )
+      .clicked()
+    {
+      self.command(UiCommand::DuplicateProfile {
+        uid: profile.uid.clone(),
+      });
+      ui.close();
+    }
+    if ui.add_enabled(!busy, egui::Button::new("重命名")).clicked() {
+      self
+        .profile_name_edits
+        .insert(profile.uid.clone(), profile.name.clone());
+      self.renaming_profile = Some(profile.uid.clone());
+      ui.close();
+    }
+    if ui
+      .add_enabled(!busy && profile_index > 0, egui::Button::new("上移"))
+      .clicked()
+    {
+      self.command(UiCommand::ReorderProfile {
+        uid: profile.uid.clone(),
+        new_index: profile_index - 1,
+      });
+      ui.close();
+    }
+    if ui
+      .add_enabled(
+        !busy && profile_index + 1 < profile_count,
+        egui::Button::new("下移"),
+      )
+      .clicked()
+    {
+      self.command(UiCommand::ReorderProfile {
+        uid: profile.uid.clone(),
+        new_index: profile_index + 1,
+      });
+      ui.close();
+    }
+    let pending = self.pending_profile_delete.as_deref() == Some(profile.uid.as_str());
+    if ui
+      .add_enabled(
+        !busy,
+        egui::Button::new(if pending { "确认删除" } else { "删除" }),
+      )
+      .clicked()
+    {
+      if pending {
+        self.command(UiCommand::DeleteProfiles {
+          uids: vec![profile.uid.clone()],
+        });
+        self.pending_profile_delete = None;
+      } else {
+        self.pending_profile_delete = Some(profile.uid.clone());
+      }
+      ui.close();
+    }
+  }
+
+  fn profile_extension_cards(&mut self, ui: &mut Ui, current: Option<&ProfileSummary>) {
+    let columns =
+      if geometry::breakpoint(ui.ctx().content_rect().width()) == geometry::Breakpoint::Xs {
+        1
+      } else {
+        2
+      };
+    let mut edit_merge = false;
+    ui.scope(|ui| {
+      ui.spacing_mut().item_spacing.x = geometry::MUI_SPACING;
+      ui.columns(columns, |columns| {
+        edit_merge = profile_more_card(
+          &mut columns[0],
+          "全局合并配置",
+          "Merge",
+          "用于组合当前配置的确定性 YAML 增强。",
+        )
+        .double_clicked();
+        if columns.len() > 1 {
+          profile_more_card(
+            &mut columns[1],
+            "原生兼容增强",
+            "Rust",
+            &format!(
+              "{} 项内置转换",
+              self.snapshot.profiles.diagnostics.native_transforms.len()
+            ),
+          );
         }
       });
-      ui.add_space(geometry::TOOLBAR_GAP);
+    });
+    if columns == 1 {
+      ui.add_space(geometry::MUI_SPACING);
+      profile_more_card(
+        ui,
+        "原生兼容增强",
+        "Rust",
+        &format!(
+          "{} 项内置转换",
+          self.snapshot.profiles.diagnostics.native_transforms.len()
+        ),
+      );
+    }
+    if edit_merge
+      && let Some(profile) = current
+      && let Some(uid) = profile.enhancements.merge.as_deref()
+    {
+      self.open_profile_editor(uid.to_string(), format!("{} · 合并配置", profile.name));
+    }
+  }
+
+  fn profile_metadata_dialogs(&mut self, context: &egui::Context, busy: bool) {
+    if let Some(uid) = self.renaming_profile.clone() {
+      let mut open = true;
+      let mut save = false;
+      let mut cancel = false;
+      egui::Window::new("编辑配置")
+        .open(&mut open)
+        .collapsible(false)
+        .default_width(420.0)
+        .show(context, |ui| {
+          let edit = self.profile_name_edits.entry(uid.clone()).or_default();
+          ui.add(
+            egui::TextEdit::singleline(edit)
+              .hint_text("配置名称")
+              .desired_width(f32::INFINITY),
+          );
+          ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            save = ui
+              .add_enabled(!busy && !edit.trim().is_empty(), egui::Button::new("保存"))
+              .clicked();
+            cancel = ui.button("取消").clicked();
+          });
+        });
+      if save {
+        self.command(UiCommand::RenameProfile {
+          uid: uid.clone(),
+          name: self
+            .profile_name_edits
+            .get(&uid)
+            .cloned()
+            .unwrap_or_default(),
+        });
+      }
+      if save || cancel || !open {
+        self.renaming_profile = None;
+      }
+    }
+
+    if let Some(uid) = self.editing_profile_options.clone() {
+      let mut open = true;
+      let mut save = false;
+      let mut cancel = false;
+      egui::Window::new("订阅设置")
+        .open(&mut open)
+        .collapsible(false)
+        .default_width(460.0)
+        .show(context, |ui| {
+          if let Some(edit) = self.profile_options_edits.get_mut(&uid) {
+            remote_profile_options_editor(ui, edit);
+          }
+          ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            save = ui.add_enabled(!busy, egui::Button::new("保存")).clicked();
+            cancel = ui.button("取消").clicked();
+          });
+        });
+      if save && let Some(options) = self.profile_options_edits.get(&uid).cloned() {
+        self.command(UiCommand::SetRemoteProfileOptions {
+          uid: uid.clone(),
+          options,
+        });
+      }
+      if save || cancel || !open {
+        self.editing_profile_options = None;
+      }
     }
   }
 
@@ -3166,9 +3479,10 @@ impl RsClashUi {
         setting_switch_row(ui, "IPv6", &mut draft.ipv6);
         setting_switch_row(ui, "统一延迟", &mut draft.unified_delay);
         settings_log_level_row(ui, &mut draft.mihomo_log_level);
-        if setting_action_row(ui, "端口设置", &draft.ports.mixed.to_string()).clicked()
-          || setting_action_row(ui, "外部控制器", &draft.controller.address).clicked()
-        {
+        if setting_action_row(ui, "端口设置", &draft.ports.mixed.to_string()).clicked() {
+          *requested_dialog = Some(SettingsSection::Mihomo);
+        }
+        if setting_action_row(ui, "外部控制器", &draft.controller.address).clicked() {
           *requested_dialog = Some(SettingsSection::Mihomo);
         }
         if setting_action_row(
@@ -3238,14 +3552,17 @@ impl RsClashUi {
       };
 
     if two_columns {
-      ui.columns(2, |columns| {
-        render_left(
-          &mut columns[0],
-          &mut draft,
-          &mut action,
-          &mut requested_dialog,
-        );
-        render_right(&mut columns[1], &mut draft, &mut requested_dialog);
+      ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = geometry::GRID_GAP;
+        ui.columns(2, |columns| {
+          render_left(
+            &mut columns[0],
+            &mut draft,
+            &mut action,
+            &mut requested_dialog,
+          );
+          render_right(&mut columns[1], &mut draft, &mut requested_dialog);
+        });
       });
     } else {
       render_left(ui, &mut draft, &mut action, &mut requested_dialog);
@@ -3293,14 +3610,80 @@ impl RsClashUi {
     }
   }
 
-  fn placeholder(&self, ui: &mut Ui, page: Page) {
-    ui.label(RichText::new(page.label()).size(22.0).strong());
-    ui.label(RichText::new("页面协议和导航已经就位，业务功能将在后续阶段纵向接入。").weak());
-    ui.add_space(18.0);
-    card(ui, "分层边界", |ui| {
-      ui.label("这个页面只能读取 AppSnapshot 并发送 UiCommand。");
-      ui.label("文件、网络、Mihomo 和操作系统调用不会进入 egui render 函数。");
-    });
+  fn unlock(&mut self, ui: &mut Ui) {
+    const SERVICES: &[&str] = &[
+      "Bahamut",
+      "Bilibili",
+      "ChatGPT",
+      "Claude",
+      "Disney+",
+      "Gemini",
+      "Netflix",
+      "Prime Video",
+      "Spotify",
+      "TikTok",
+      "YouTube",
+    ];
+    let breakpoint = geometry::breakpoint(ui.ctx().content_rect().width());
+    let columns = geometry::unlock_grid_columns(breakpoint);
+    for row in SERVICES.chunks(columns) {
+      ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = geometry::GRID_GAP;
+        ui.columns(columns, |column_uis| {
+          for (column, service) in column_uis.iter_mut().zip(row) {
+            let tokens = theme::tokens(column);
+            let width = column.available_width();
+            let card = Frame::new()
+              .fill(tokens.surface)
+              .stroke(Stroke::new(1.0, tokens.border))
+              .corner_radius(geometry::GLOBAL_RADIUS)
+              .inner_margin(egui::Margin {
+                left: 10,
+                right: 10,
+                top: 10,
+                bottom: 2,
+              })
+              .show(column, |ui| {
+                ui.set_min_width((width - 20.0).max(0.0));
+                ui.set_min_height(82.0);
+                ui.horizontal(|ui| {
+                  ui.label(RichText::new(*service).size(16.0).strong());
+                  ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                      .add_sized([32.0, 32.0], egui::Button::new("↻").corner_radius(16))
+                      .clicked()
+                    {
+                      self.local_error =
+                        Some(format!("{service} 解锁检测将在 P11 接入网络探测后可用。"));
+                    }
+                  });
+                });
+                ui.horizontal(|ui| {
+                  Frame::new()
+                    .fill(tokens.surface_raised)
+                    .corner_radius(12)
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                      ui.label(RichText::new("◷  等待测试").small());
+                    });
+                });
+                ui.separator();
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                  ui.label(RichText::new("-- --").size(11.0).weak());
+                });
+              });
+            column.painter().line_segment(
+              [
+                card.response.rect.left_top() + egui::vec2(2.0, 4.0),
+                card.response.rect.left_bottom() + egui::vec2(2.0, -4.0),
+              ],
+              Stroke::new(4.0, tokens.border),
+            );
+          }
+        });
+      });
+      ui.add_space(geometry::GRID_GAP);
+    }
   }
 
   fn command(&mut self, command: UiCommand) {
@@ -5173,6 +5556,114 @@ fn metric_chart(ui: &mut Ui, metrics: &[MetricPoint]) {
   }
 }
 
+fn paint_navigation_icon(painter: &egui::Painter, page: Page, center: egui::Pos2, color: Color32) {
+  let stroke = Stroke::new(2.0, color);
+  let point = |x: f32, y: f32| center + egui::vec2(x, y);
+  match page {
+    Page::Home => {
+      painter.add(egui::Shape::line(
+        vec![point(-9.0, -1.0), point(0.0, -9.0), point(9.0, -1.0)],
+        stroke,
+      ));
+      painter.add(egui::Shape::line(
+        vec![
+          point(-7.0, -2.0),
+          point(-7.0, 9.0),
+          point(7.0, 9.0),
+          point(7.0, -2.0),
+        ],
+        stroke,
+      ));
+    },
+    Page::Proxies => {
+      for (radius, start) in [(10.0, 0.20), (6.5, 0.28)] {
+        let points = (0..=16)
+          .map(|index| {
+            let angle = std::f32::consts::PI * (start + (1.0 - start * 2.0) * index as f32 / 16.0);
+            center + egui::vec2(angle.cos() * radius, -angle.sin() * radius + 2.0)
+          })
+          .collect::<Vec<_>>();
+        painter.add(egui::Shape::line(points, stroke));
+      }
+      painter.circle_filled(point(0.0, 7.0), 2.2, color);
+    },
+    Page::Profiles => {
+      for y in [-7.0, 0.0, 7.0] {
+        let rect = egui::Rect::from_center_size(point(0.0, y), egui::vec2(18.0, 5.0));
+        painter.rect_stroke(rect, 2.0, stroke, egui::StrokeKind::Inside);
+        painter.circle_filled(point(-6.0, y), 1.0, color);
+      }
+    },
+    Page::Connections => {
+      painter.circle_stroke(center, 10.0, stroke);
+      painter.line_segment([point(-10.0, 0.0), point(10.0, 0.0)], stroke);
+      painter.line_segment([point(0.0, -10.0), point(0.0, 10.0)], stroke);
+      painter.add(egui::Shape::line(
+        vec![
+          point(-4.0, -9.0),
+          point(-2.0, -4.0),
+          point(-2.0, 4.0),
+          point(-4.0, 9.0),
+        ],
+        stroke,
+      ));
+      painter.add(egui::Shape::line(
+        vec![
+          point(4.0, -9.0),
+          point(2.0, -4.0),
+          point(2.0, 4.0),
+          point(4.0, 9.0),
+        ],
+        stroke,
+      ));
+    },
+    Page::Rules => {
+      painter.line_segment([point(-5.0, -9.0), point(-5.0, 9.0)], stroke);
+      painter.line_segment([point(-5.0, -3.0), point(5.0, -3.0)], stroke);
+      painter.line_segment([point(5.0, -3.0), point(5.0, 6.0)], stroke);
+      for position in [point(-5.0, -9.0), point(-5.0, 9.0), point(5.0, 6.0)] {
+        painter.circle_filled(position, 2.2, color);
+      }
+    },
+    Page::Logs => {
+      for (y, width) in [(-7.0, 18.0), (0.0, 14.0), (7.0, 18.0)] {
+        painter.line_segment(
+          [point(-9.0, y), point(-9.0 + width, y)],
+          Stroke::new(2.5, color),
+        );
+      }
+    },
+    Page::Unlock => {
+      let body = egui::Rect::from_center_size(point(0.0, 4.0), egui::vec2(16.0, 13.0));
+      painter.rect_stroke(body, 3.0, stroke, egui::StrokeKind::Inside);
+      painter.add(egui::Shape::line(
+        vec![
+          point(-5.0, -2.0),
+          point(-5.0, -5.0),
+          point(-3.0, -9.0),
+          point(0.0, -10.0),
+          point(3.0, -9.0),
+          point(5.0, -5.0),
+          point(5.0, -2.0),
+        ],
+        stroke,
+      ));
+    },
+    Page::Settings => {
+      painter.circle_stroke(center, 6.0, stroke);
+      painter.circle_stroke(center, 2.0, stroke);
+      for index in 0..8 {
+        let angle = std::f32::consts::TAU * index as f32 / 8.0;
+        let direction = egui::vec2(angle.cos(), angle.sin());
+        painter.line_segment(
+          [center + direction * 7.0, center + direction * 10.0],
+          Stroke::new(3.0, color),
+        );
+      }
+    },
+  }
+}
+
 fn header_icon_button(ui: &mut Ui, symbol: &str, tooltip: &str) -> egui::Response {
   ui.add_sized(
     [32.0, 32.0],
@@ -5280,6 +5771,70 @@ fn enhanced_card(ui: &mut Ui, title: &str, symbol: &str, contents: impl FnOnce(&
     });
 }
 
+fn profile_more_card(ui: &mut Ui, title: &str, badge: &str, detail: &str) -> egui::Response {
+  let tokens = theme::tokens(ui);
+  let width = ui.available_width();
+  let shown = Frame::new()
+    .fill(tokens.surface)
+    .corner_radius(geometry::GLOBAL_RADIUS)
+    .inner_margin(egui::Margin::symmetric(16, 8))
+    .show(ui, |ui| {
+      ui.set_min_width((width - 32.0).max(0.0));
+      ui.set_min_height(58.0);
+      ui.horizontal(|ui| {
+        ui.label(RichText::new(title).size(18.0).strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+          Frame::new()
+            .stroke(Stroke::new(1.0, tokens.accent))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::symmetric(7, 2))
+            .show(ui, |ui| {
+              ui.label(RichText::new(badge).size(11.0).color(tokens.accent));
+            });
+        });
+      });
+      ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), geometry::PROFILE_CARD_LINE_HEIGHT),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+          ui.label(RichText::new(detail).size(12.0).weak());
+        },
+      );
+    });
+  ui.interact(
+    shown.response.rect,
+    ui.id().with(("profile-more", title)),
+    egui::Sense::click(),
+  )
+  .on_hover_text("双击编辑")
+}
+
+fn profile_origin(profile: &ProfileSummary) -> String {
+  let Some(location) = profile.location.as_deref() else {
+    return profile_source_label(profile.source).to_string();
+  };
+  if let Some((_, rest)) = location.split_once("://") {
+    return rest.split('/').next().unwrap_or(rest).to_string();
+  }
+  PathBuf::from(location)
+    .file_name()
+    .and_then(|name| name.to_str())
+    .unwrap_or(location)
+    .to_string()
+}
+
+const fn profile_source_label(source: ProfileSourceKind) -> &'static str {
+  match source {
+    ProfileSourceKind::Local => "本地配置",
+    ProfileSourceKind::Remote => "远程订阅",
+    ProfileSourceKind::Merge => "合并配置",
+    ProfileSourceKind::Rules => "规则扩展",
+    ProfileSourceKind::Proxies => "代理扩展",
+    ProfileSourceKind::Groups => "代理组扩展",
+    ProfileSourceKind::Other => "扩展配置",
+  }
+}
+
 fn card(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui)) {
   let tokens = theme::tokens(ui);
   Frame::new()
@@ -5293,6 +5848,40 @@ fn card(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui)) {
       ui.add_space(geometry::MUI_SPACING);
       contents(ui);
     });
+}
+
+fn notice_frame(ui: &mut Ui, title: &str, detail: &str, close: impl FnOnce()) {
+  let mut should_close = false;
+  Frame::new()
+    .fill(ui.visuals().error_fg_color.gamma_multiply(0.08))
+    .stroke(Stroke::new(
+      1.0,
+      ui.visuals().error_fg_color.gamma_multiply(0.35),
+    ))
+    .corner_radius(geometry::GLOBAL_RADIUS)
+    .inner_margin(egui::Margin::same(12))
+    .show(ui, |ui| {
+      ui.set_min_width(280.0);
+      ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+          ui.label(
+            RichText::new(title)
+              .strong()
+              .color(ui.visuals().error_fg_color),
+          );
+          ui.label(RichText::new(detail).color(ui.visuals().error_fg_color));
+        });
+        ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+          should_close = ui
+            .add_sized([28.0, 28.0], egui::Button::new("×").frame(false))
+            .clicked();
+        });
+      });
+    });
+  ui.add_space(geometry::MUI_SPACING);
+  if should_close {
+    close();
+  }
 }
 
 fn client_error_message(error: &ClientError) -> String {

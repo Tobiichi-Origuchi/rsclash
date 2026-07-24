@@ -71,6 +71,12 @@ fn adwaita_style(dark: bool) -> Style {
   style.spacing.button_padding = vec2(12.0, 8.0);
   style.spacing.interact_size = vec2(40.0, 36.0);
   style.spacing.window_margin = egui::Margin::same(16);
+  let mut scroll = egui::style::ScrollStyle::solid();
+  scroll.bar_width = 8.0;
+  scroll.bar_inner_margin = 0.0;
+  scroll.handle_min_length = 24.0;
+  scroll.fade.strength = 0.0;
+  style.spacing.scroll = scroll;
   style.animation_time = 0.1;
   style.visuals = adwaita_visuals(dark);
   style.text_styles.insert(
@@ -138,8 +144,8 @@ fn adwaita_visuals(dark: bool) -> Visuals {
   visuals.extreme_bg_color = token.canvas;
   visuals.code_bg_color = visuals.extreme_bg_color;
   visuals.window_stroke = Stroke::new(1.0, token.border);
-  visuals.window_corner_radius = CornerRadius::same(12);
-  visuals.menu_corner_radius = CornerRadius::same(10);
+  visuals.window_corner_radius = CornerRadius::same(4);
+  visuals.menu_corner_radius = CornerRadius::same(4);
   visuals.window_shadow = Shadow {
     offset: [0, 5],
     blur: 18,
@@ -162,18 +168,18 @@ fn adwaita_visuals(dark: bool) -> Visuals {
     widget.bg_fill = token.surface;
     widget.weak_bg_fill = token.surface;
     widget.bg_stroke = Stroke::new(1.0, token.border);
-    widget.corner_radius = CornerRadius::same(8);
+    widget.corner_radius = CornerRadius::same(4);
     widget.fg_stroke = Stroke::new(1.0, text);
   }
   visuals.widgets.hovered.bg_fill = token.surface_raised;
   visuals.widgets.hovered.weak_bg_fill = token.surface_raised;
   visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, token.border);
-  visuals.widgets.hovered.corner_radius = CornerRadius::same(8);
+  visuals.widgets.hovered.corner_radius = CornerRadius::same(4);
   visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, text);
   visuals.widgets.active.bg_fill = token.accent_soft;
   visuals.widgets.active.weak_bg_fill = token.accent_soft;
   visuals.widgets.active.bg_stroke = Stroke::new(1.0, token.accent);
-  visuals.widgets.active.corner_radius = CornerRadius::same(8);
+  visuals.widgets.active.corner_radius = CornerRadius::same(4);
   visuals.widgets.active.fg_stroke = Stroke::new(1.0, text);
   visuals.widgets.open = visuals.widgets.active;
 
