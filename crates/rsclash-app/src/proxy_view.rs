@@ -411,4 +411,62 @@ mod tests {
       }
     ));
   }
+
+  #[test]
+  fn large_provider_sets_keep_every_record_and_reference() {
+    const PROVIDER_COUNT: usize = 32;
+    const NODES_PER_PROVIDER: usize = 160;
+
+    let providers = (0..PROVIDER_COUNT)
+      .map(|provider_index| {
+        let provider_name = format!("provider-{provider_index:02}");
+        let proxies = (0..NODES_PER_PROVIDER)
+          .map(|node_index| node(&format!("node-{provider_index:02}-{node_index:03}")))
+          .collect();
+        (
+          provider_name,
+          ProxyProvider {
+            proxies,
+            ..ProxyProvider::default()
+          },
+        )
+      })
+      .collect();
+    let group_members = (0..PROVIDER_COUNT)
+      .flat_map(|provider_index| {
+        (0..NODES_PER_PROVIDER)
+          .map(move |node_index| format!("node-{provider_index:02}-{node_index:03}"))
+      })
+      .collect::<Vec<_>>();
+    let view = ProxyViewBuilder::build(ProxyViewInput {
+      runtime_group_order: vec!["All".to_string()],
+      proxies: Proxies {
+        proxies: HashMap::from([(
+          "All".to_string(),
+          Proxy {
+            kind: "Selector".to_string(),
+            alive: true,
+            all: Some(group_members),
+            ..Proxy::default()
+          },
+        )]),
+        ..Proxies::default()
+      },
+      providers: Some(ProxyProviders {
+        providers,
+        ..ProxyProviders::default()
+      }),
+    });
+
+    let expected = PROVIDER_COUNT * NODES_PER_PROVIDER;
+    assert_eq!(view.providers.len(), PROVIDER_COUNT);
+    assert_eq!(view.records.len(), expected);
+    assert_eq!(view.groups[0].members.len(), expected);
+    assert!(
+      view.groups[0]
+        .members
+        .iter()
+        .all(|member| matches!(member, ProxyMemberSnapshot::Node { .. }))
+    );
+  }
 }

@@ -757,6 +757,8 @@ impl fmt::Display for SensitiveString {
 
 #[cfg(test)]
 mod tests {
+  use std::sync::Arc;
+
   use super::{AppSnapshot, AppStatus, Page, SensitiveString, ThemeMode};
 
   #[test]
@@ -782,5 +784,23 @@ mod tests {
     assert_eq!(secret.expose(), "controller-secret");
     assert!(!format!("{secret:?}").contains("controller-secret"));
     assert!(!secret.to_string().contains("controller-secret"));
+  }
+
+  #[test]
+  fn snapshot_clone_shares_large_mihomo_collections() {
+    let snapshot = AppSnapshot::default();
+    let clone = snapshot.clone();
+
+    assert!(Arc::ptr_eq(
+      &snapshot.mihomo.proxy_view,
+      &clone.mihomo.proxy_view
+    ));
+    assert!(Arc::ptr_eq(&snapshot.mihomo.rules, &clone.mihomo.rules));
+    assert!(Arc::ptr_eq(
+      &snapshot.mihomo.connections,
+      &clone.mihomo.connections
+    ));
+    assert!(Arc::ptr_eq(&snapshot.mihomo.logs, &clone.mihomo.logs));
+    assert!(Arc::ptr_eq(&snapshot.mihomo.metrics, &clone.mihomo.metrics));
   }
 }
