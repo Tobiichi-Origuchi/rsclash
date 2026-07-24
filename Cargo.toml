@@ -36,7 +36,7 @@ reqwest = { version = "0.13.3", default-features = false, features = ["json"] }
 rqrr = { version = "0.10.1", default-features = false, features = ["img"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 rustix = { version = "1.1.4", default-features = false, features = ["fs", "process", "std"] }
-serde = { version = "1.0.228", default-features = false, features = ["derive", "std"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive", "rc", "std"] }
 serde_json = "1.0.149"
 serde_yaml_ng = "0.10.0"
 thiserror = "2.0.18"

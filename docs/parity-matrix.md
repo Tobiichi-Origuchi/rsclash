@@ -47,4 +47,9 @@
 | Proxy provider 操作 | 单个/全部更新、provider/节点健康检查 | 完成 | 操作后 metadata 刷新 |
 | 节点选择记忆与连接清理 | profile 持久化、tray 同步、只关闭旧 chain | 完成 | P7 actor 端到端测试 |
 | 代理链 | 至少两 core 节点、原生拖放、可逆 runtime 注入 | 完成 | 注入顺序与断开清理测试 |
-| 规则、连接、日志和实时指标 | 后续 P8 独立提交 | 进行中 | 本矩阵随提交更新 |
+| 规则列表 | 搜索、虚拟滚动、rule provider 更新 | 完成 | Arc 批次与 `show_rows` |
+| 可视化规则 | Domain/IP/Geo/ASN/进程/端口/网络/入站/逻辑/MATCH | 完成 | 生成器单元测试与事务编辑器 |
+| Traffic/Memory | 可见 Home 页 WebSocket、300 点固定 ring | 完成 | 页面 stream 生命周期测试 |
+| Connections | active/closed、暂停/清空/关闭、搜索/排序/列/详情 | 完成 | 2,048 条 closed ring 压力测试 |
+| Logs | 等级、搜索、正反序、暂停、清空 | 完成 | 100,000 条输入仅保留 10,000 |
+| 大列表与重绘 | Arc 批次、100 ms flush、`show_rows`、worker wake | 完成 | 隐藏页 drop stream 测试 |

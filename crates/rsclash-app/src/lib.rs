@@ -627,6 +627,28 @@ impl Coordinator {
       UiCommand::SetProxyChain { group, nodes } => {
         self.dispatch_profile(ProfileBridgeCommand::SetProxyChain { group, nodes })
       },
+      UiCommand::UpdateRuleProvider { name } => {
+        self.dispatch_mihomo(MihomoBridgeCommand::UpdateRuleProvider { name })
+      },
+      UiCommand::CloseConnection { id } => {
+        self.dispatch_mihomo(MihomoBridgeCommand::CloseConnection { id })
+      },
+      UiCommand::CloseAllConnections => {
+        self.dispatch_mihomo(MihomoBridgeCommand::CloseAllConnections)
+      },
+      UiCommand::ClearClosedConnections => {
+        self.dispatch_mihomo(MihomoBridgeCommand::ClearClosedConnections)
+      },
+      UiCommand::SetConnectionsPaused(paused) => {
+        self.dispatch_mihomo(MihomoBridgeCommand::SetConnectionsPaused(paused))
+      },
+      UiCommand::ClearLogs => self.dispatch_mihomo(MihomoBridgeCommand::ClearLogs),
+      UiCommand::SetLogsPaused(paused) => {
+        self.dispatch_mihomo(MihomoBridgeCommand::SetLogsPaused(paused))
+      },
+      UiCommand::SetLogLevel(level) => {
+        self.dispatch_mihomo(MihomoBridgeCommand::SetLogLevel(level))
+      },
       UiCommand::SetProxyMode(mode) => self.dispatch_mihomo(MihomoBridgeCommand::SetMode(mode)),
       UiCommand::RefreshProfiles => self.dispatch_profile(ProfileBridgeCommand::Refresh),
       UiCommand::ImportLocalProfile { name, path } => {
@@ -697,6 +719,7 @@ impl Coordinator {
       UiCommand::SetSystemProxy(enabled) => self.set_system_proxy(enabled),
       UiCommand::Navigate(page) => {
         self.snapshot.page = page;
+        self.update_mihomo_presentation();
         self.publish_snapshot();
         self.emit(AppEvent::NavigationChanged(page));
         (Ok(CommandOutput::Accepted), false)
@@ -1011,8 +1034,18 @@ impl Coordinator {
   fn set_window_visible(&mut self, visible: bool) {
     if self.snapshot.window_visible != visible {
       self.snapshot.window_visible = visible;
+      self.update_mihomo_presentation();
       self.publish_snapshot();
       self.emit(AppEvent::WindowVisibilityChanged(visible));
+    }
+  }
+
+  fn update_mihomo_presentation(&self) {
+    if let Some(command_tx) = &self.mihomo_command_tx {
+      let _ = command_tx.try_send(MihomoBridgeCommand::SetPresentation {
+        page: self.snapshot.page,
+        visible: self.snapshot.window_visible,
+      });
     }
   }
 

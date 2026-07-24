@@ -13,11 +13,12 @@ use std::{
 use egui::{Align, Color32, Frame, Layout, RichText, ScrollArea, Stroke, Ui};
 use rsclash_app::{AppClient, AppEventReceiver, ClientError};
 use rsclash_domain::{
-  AppEvent, AppSnapshot, AppStatus, CoreChannel, CoreRunMode, CoreState, MihomoConnection, Page,
-  ProfileDiagnosticStage, ProfileDiagnostics, ProfileDownloadProxy, ProfileOperationKind,
-  ProfileQrCode, ProfileSourceKind, ProxyCapabilities, ProxyGroupView, ProxyMemberSnapshot,
-  ProxyMemberUnresolvedReason, ProxyMode, ProxyNodeSnapshot, ProxyNodeSource, ProxyViewV1,
-  RemoteProfileOptions, SensitiveString, ThemeMode, UiCommand,
+  AppEvent, AppSnapshot, AppStatus, ConnectionSnapshot, CoreChannel, CoreRunMode, CoreState,
+  LogSnapshot, MetricPoint, MihomoConnection, Page, ProfileDiagnosticStage, ProfileDiagnostics,
+  ProfileDownloadProxy, ProfileOperationKind, ProfileQrCode, ProfileSourceKind, ProxyCapabilities,
+  ProxyGroupView, ProxyMemberSnapshot, ProxyMemberUnresolvedReason, ProxyMode, ProxyNodeSnapshot,
+  ProxyNodeSource, ProxyViewV1, RemoteProfileOptions, RuleSnapshot, SensitiveString,
+  StreamLogLevel, ThemeMode, UiCommand,
 };
 
 struct ProfileEditor {
@@ -101,6 +102,33 @@ enum ProxyChainAction {
   Drop { from: usize, to: usize },
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ConnectionSort {
+  #[default]
+  Traffic,
+  Destination,
+  Process,
+  Started,
+}
+
+struct RuleDraft {
+  kind: String,
+  payload: String,
+  target: String,
+  no_resolve: bool,
+}
+
+impl Default for RuleDraft {
+  fn default() -> Self {
+    Self {
+      kind: "DOMAIN-SUFFIX".to_string(),
+      payload: "example.com".to_string(),
+      target: "DIRECT".to_string(),
+      no_resolve: false,
+    }
+  }
+}
+
 #[derive(Default)]
 struct YamlHighlightCache {
   source_hash: u64,
@@ -147,6 +175,19 @@ pub struct RsClashUi {
   locate_proxy: Option<(String, String)>,
   proxy_chain_group: String,
   proxy_chain_nodes: Vec<String>,
+  rule_search: String,
+  rule_draft: RuleDraft,
+  pending_rule_append: Option<String>,
+  connection_search: String,
+  show_closed_connections: bool,
+  connection_sort: ConnectionSort,
+  connection_show_process: bool,
+  connection_show_rule: bool,
+  connection_show_chains: bool,
+  selected_connection: Option<String>,
+  log_search: String,
+  log_reverse: bool,
+  log_level: StreamLogLevel,
 }
 
 impl RsClashUi {
@@ -193,6 +234,19 @@ impl RsClashUi {
       locate_proxy: None,
       proxy_chain_group: String::new(),
       proxy_chain_nodes: Vec::new(),
+      rule_search: String::new(),
+      rule_draft: RuleDraft::default(),
+      pending_rule_append: None,
+      connection_search: String::new(),
+      show_closed_connections: false,
+      connection_sort: ConnectionSort::default(),
+      connection_show_process: true,
+      connection_show_rule: true,
+      connection_show_chains: true,
+      selected_connection: None,
+      log_search: String::new(),
+      log_reverse: false,
+      log_level: StreamLogLevel::Info,
     }
   }
 
@@ -223,7 +277,11 @@ impl RsClashUi {
             .filter(|pending| pending.uid == uid)
           {
             match parse_sequence_editor(pending.uid, pending.name, pending.kind, content.expose()) {
-              Ok(editor) => {
+              Ok(mut editor) => {
+                if let Some(rule) = self.pending_rule_append.take() {
+                  editor.append.push(rule);
+                  editor.dirty = true;
+                }
                 self.profile_editor = None;
                 self.sequence_editor = Some(editor);
                 self.pending_editor_close = false;
@@ -463,6 +521,9 @@ impl RsClashUi {
       Page::Home => self.home(ui),
       Page::Proxies => self.proxies(ui),
       Page::Profiles => self.profiles(ui),
+      Page::Connections => self.connections(ui),
+      Page::Rules => self.rules(ui),
+      Page::Logs => self.logs(ui),
       Page::Settings => self.settings(ui),
       page => self.placeholder(ui, page),
     }
@@ -647,11 +708,25 @@ impl RsClashUi {
         );
       }
     });
+    if !mihomo.metrics.is_empty() {
+      ui.add_space(12.0);
+      card(ui, "实时流量与内存", |ui| {
+        ui.label(
+          RichText::new(format!(
+            "固定保留最近 {} 个采样；页面隐藏后停止订阅。",
+            mihomo.metrics.len()
+          ))
+          .small()
+          .weak(),
+        );
+        metric_chart(ui, &mihomo.metrics);
+      });
+    }
   }
 
   fn proxies(&mut self, ui: &mut Ui) {
     let mihomo = self.snapshot.mihomo.clone();
-    let view = mihomo.proxy_view.clone();
+    let view = Arc::clone(&mihomo.proxy_view);
     ui.horizontal(|ui| {
       ui.vertical(|ui| {
         ui.label(RichText::new("代理选择").size(24.0).strong());
@@ -1142,6 +1217,349 @@ impl RsClashUi {
       );
     }
     ui.separator();
+  }
+
+  fn rules(&mut self, ui: &mut Ui) {
+    let mihomo = self.snapshot.mihomo.clone();
+    ui.horizontal(|ui| {
+      ui.vertical(|ui| {
+        ui.label(RichText::new("运行规则").size(24.0).strong());
+        ui.label(RichText::new("搜索 Mihomo 当前规则并更新 rule provider").weak());
+      });
+      ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        if ui.button("刷新").clicked() {
+          self.command(UiCommand::RefreshMihomo);
+        }
+      });
+    });
+    ui.add_space(14.0);
+
+    card(ui, "规则生成器", |ui| {
+      ui.horizontal_wrapped(|ui| {
+        egui::ComboBox::from_id_salt("rule-draft-kind")
+          .selected_text(&self.rule_draft.kind)
+          .show_ui(ui, |ui| {
+            for kind in RULE_KINDS {
+              ui.selectable_value(&mut self.rule_draft.kind, kind.to_string(), *kind);
+            }
+          });
+        if self.rule_draft.kind != "MATCH" {
+          ui.add(
+            egui::TextEdit::singleline(&mut self.rule_draft.payload)
+              .hint_text(rule_payload_hint(&self.rule_draft.kind))
+              .desired_width(260.0),
+          );
+        }
+        ui.add(
+          egui::TextEdit::singleline(&mut self.rule_draft.target)
+            .hint_text("目标代理组或策略")
+            .desired_width(180.0),
+        );
+        if rule_supports_no_resolve(&self.rule_draft.kind) {
+          ui.checkbox(&mut self.rule_draft.no_resolve, "no-resolve");
+        }
+      });
+      ui.label(
+        RichText::new(
+          "覆盖 Domain、IP、Geo、ASN、进程、端口、网络、入站、RULE-SET、逻辑组合与 MATCH。",
+        )
+        .small()
+        .weak(),
+      );
+      if ui.button("加入当前配置的规则扩展").clicked() {
+        match build_rule_draft(&self.rule_draft) {
+          Ok(rule) => {
+            let target = self.snapshot.profiles.current().and_then(|profile| {
+              profile
+                .enhancements
+                .rules
+                .as_ref()
+                .map(|uid| (uid.clone(), format!("{} · 规则", profile.name)))
+            });
+            if let Some((uid, name)) = target {
+              self.pending_rule_append = Some(rule);
+              self.open_sequence_editor(uid, name, SequenceEditorKind::Rules);
+              self.command(UiCommand::Navigate(Page::Profiles));
+            } else {
+              self.local_error = Some("当前没有可编辑的活动 profile。".to_string());
+            }
+          },
+          Err(error) => self.local_error = Some(error),
+        }
+      }
+    });
+    ui.add_space(12.0);
+
+    if !mihomo.rule_providers.is_empty() {
+      card(ui, "Rule Providers", |ui| {
+        for provider in mihomo.rule_providers.iter() {
+          ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(&provider.name).strong());
+            ui.label(
+              RichText::new(format!(
+                "{} · {} · {} 条 · {}",
+                provider.behavior, provider.format, provider.rule_count, provider.updated_at
+              ))
+              .small()
+              .weak(),
+            );
+            if ui.button("更新").clicked() {
+              self.command(UiCommand::UpdateRuleProvider {
+                name: provider.name.clone(),
+              });
+            }
+          });
+        }
+      });
+      ui.add_space(12.0);
+    }
+
+    card(
+      ui,
+      &format!("规则列表 · {} 条", mihomo.rules.len()),
+      |ui| {
+        ui.add(
+          egui::TextEdit::singleline(&mut self.rule_search)
+            .hint_text("搜索类型、内容或目标")
+            .desired_width(320.0),
+        );
+        let query = self.rule_search.trim().to_ascii_lowercase();
+        let filtered = mihomo
+          .rules
+          .iter()
+          .filter(|rule| rule_matches(rule, &query))
+          .collect::<Vec<_>>();
+        let row_height = 44.0;
+        ScrollArea::vertical()
+          .id_salt("rules-list")
+          .max_height(620.0)
+          .auto_shrink([false, true])
+          .show_rows(ui, row_height, filtered.len(), |ui, rows| {
+            for rule in &filtered[rows] {
+              ui.horizontal(|ui| {
+                ui.label(RichText::new(&rule.kind).strong());
+                ui.label(&rule.payload);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                  ui.label(RichText::new(&rule.proxy).small().strong());
+                  ui.label(RichText::new(format!("#{}", rule.index)).small().weak());
+                });
+              });
+              ui.separator();
+            }
+          });
+      },
+    );
+  }
+
+  fn connections(&mut self, ui: &mut Ui) {
+    let mihomo = self.snapshot.mihomo.clone();
+    ui.label(RichText::new("连接").size(24.0).strong());
+    ui.label(RichText::new("活动与最近关闭连接的固定容量视图").weak());
+    ui.add_space(14.0);
+    card(ui, "连接控制", |ui| {
+      ui.horizontal_wrapped(|ui| {
+        ui.selectable_value(&mut self.show_closed_connections, false, "活动");
+        ui.selectable_value(&mut self.show_closed_connections, true, "已关闭");
+        if ui
+          .button(if mihomo.connections_paused {
+            "继续"
+          } else {
+            "暂停"
+          })
+          .clicked()
+        {
+          self.command(UiCommand::SetConnectionsPaused(!mihomo.connections_paused));
+        }
+        if ui.button("关闭全部活动连接").clicked() {
+          self.command(UiCommand::CloseAllConnections);
+        }
+        if ui.button("清空已关闭").clicked() {
+          self.command(UiCommand::ClearClosedConnections);
+        }
+      });
+      ui.horizontal_wrapped(|ui| {
+        ui.add(
+          egui::TextEdit::singleline(&mut self.connection_search)
+            .hint_text("搜索地址、进程、规则或链")
+            .desired_width(280.0),
+        );
+        ui.label("排序");
+        for (sort, label) in [
+          (ConnectionSort::Traffic, "流量"),
+          (ConnectionSort::Destination, "目标"),
+          (ConnectionSort::Process, "进程"),
+          (ConnectionSort::Started, "时间"),
+        ] {
+          ui.selectable_value(&mut self.connection_sort, sort, label);
+        }
+      });
+      ui.horizontal_wrapped(|ui| {
+        ui.label("列");
+        ui.checkbox(&mut self.connection_show_process, "进程");
+        ui.checkbox(&mut self.connection_show_rule, "规则");
+        ui.checkbox(&mut self.connection_show_chains, "链");
+      });
+    });
+    ui.add_space(12.0);
+
+    let source = if self.show_closed_connections {
+      mihomo.closed_connections.as_ref()
+    } else {
+      mihomo.connections.as_ref()
+    };
+    let query = self.connection_search.trim().to_ascii_lowercase();
+    let mut connections = source
+      .iter()
+      .filter(|connection| connection_matches(connection, &query))
+      .collect::<Vec<_>>();
+    sort_connections(&mut connections, self.connection_sort);
+    card(ui, &format!("{} 条连接", connections.len()), |ui| {
+      let row_height = 58.0;
+      ScrollArea::vertical()
+        .id_salt("connections-list")
+        .max_height(620.0)
+        .auto_shrink([false, true])
+        .show_rows(ui, row_height, connections.len(), |ui, rows| {
+          for connection in &connections[rows] {
+            self.connection_row(ui, connection, self.show_closed_connections);
+          }
+        });
+    });
+    if let Some(id) = self.selected_connection.as_deref()
+      && let Some(connection) = source.iter().find(|connection| connection.id == id)
+    {
+      ui.add_space(12.0);
+      connection_detail(ui, connection);
+    }
+  }
+
+  fn connection_row(&mut self, ui: &mut Ui, connection: &ConnectionSnapshot, closed: bool) {
+    ui.horizontal(|ui| {
+      if ui
+        .selectable_label(
+          self.selected_connection.as_deref() == Some(connection.id.as_str()),
+          &connection.destination,
+        )
+        .clicked()
+      {
+        self.selected_connection = Some(connection.id.clone());
+      }
+      ui.label(
+        RichText::new(format!(
+          "↑ {}  ↓ {}",
+          format_bytes(connection.upload),
+          format_bytes(connection.download)
+        ))
+        .small(),
+      );
+      if !closed && ui.button("关闭").clicked() {
+        self.command(UiCommand::CloseConnection {
+          id: connection.id.clone(),
+        });
+      }
+    });
+    ui.horizontal_wrapped(|ui| {
+      ui.label(RichText::new(&connection.network).small().weak());
+      if self.connection_show_process && !connection.process.is_empty() {
+        ui.label(RichText::new(&connection.process).small().weak());
+      }
+      if self.connection_show_rule && !connection.rule.is_empty() {
+        ui.label(
+          RichText::new(format!("{} {}", connection.rule, connection.rule_payload))
+            .small()
+            .weak(),
+        );
+      }
+      if self.connection_show_chains && !connection.chains.is_empty() {
+        ui.label(
+          RichText::new(
+            connection
+              .chains
+              .iter()
+              .rev()
+              .cloned()
+              .collect::<Vec<_>>()
+              .join(" → "),
+          )
+          .small()
+          .weak(),
+        );
+      }
+    });
+    ui.separator();
+  }
+
+  fn logs(&mut self, ui: &mut Ui) {
+    let mihomo = self.snapshot.mihomo.clone();
+    ui.label(RichText::new("Mihomo 日志").size(24.0).strong());
+    ui.label(RichText::new("固定保留最近 10,000 条，并按 100 ms 批量发布").weak());
+    ui.add_space(14.0);
+    card(ui, "日志控制", |ui| {
+      ui.horizontal_wrapped(|ui| {
+        egui::ComboBox::from_id_salt("log-level")
+          .selected_text(stream_log_level_label(self.log_level))
+          .show_ui(ui, |ui| {
+            for level in [
+              StreamLogLevel::Debug,
+              StreamLogLevel::Info,
+              StreamLogLevel::Warning,
+              StreamLogLevel::Error,
+              StreamLogLevel::Silent,
+            ] {
+              if ui
+                .selectable_value(&mut self.log_level, level, stream_log_level_label(level))
+                .changed()
+              {
+                self.command(UiCommand::SetLogLevel(level));
+              }
+            }
+          });
+        ui.add(
+          egui::TextEdit::singleline(&mut self.log_search)
+            .hint_text("搜索等级或内容")
+            .desired_width(300.0),
+        );
+        ui.checkbox(&mut self.log_reverse, "最新在前");
+        if ui
+          .button(if mihomo.logs_paused {
+            "继续"
+          } else {
+            "暂停"
+          })
+          .clicked()
+        {
+          self.command(UiCommand::SetLogsPaused(!mihomo.logs_paused));
+        }
+        if ui.button("清空").clicked() {
+          self.command(UiCommand::ClearLogs);
+        }
+      });
+    });
+    ui.add_space(12.0);
+    let query = self.log_search.trim().to_ascii_lowercase();
+    let filtered = mihomo
+      .logs
+      .iter()
+      .filter(|log| log_matches(log, &query))
+      .collect::<Vec<_>>();
+    card(ui, &format!("日志 · {} 条", filtered.len()), |ui| {
+      let row_height = 34.0;
+      ScrollArea::vertical()
+        .id_salt("logs-list")
+        .max_height(680.0)
+        .stick_to_bottom(!self.log_reverse && query.is_empty())
+        .auto_shrink([false, true])
+        .show_rows(ui, row_height, filtered.len(), |ui, rows| {
+          for visual_index in rows {
+            let index = if self.log_reverse {
+              filtered.len() - 1 - visual_index
+            } else {
+              visual_index
+            };
+            log_row(ui, filtered[index]);
+          }
+        });
+    });
   }
 
   fn profiles(&mut self, ui: &mut Ui) {
@@ -2498,6 +2916,181 @@ fn proxy_delay_color(ui: &Ui, delay: Option<u32>, alive: bool) -> Color32 {
   }
 }
 
+const RULE_KINDS: &[&str] = &[
+  "DOMAIN",
+  "DOMAIN-SUFFIX",
+  "DOMAIN-KEYWORD",
+  "IP-CIDR",
+  "IP-CIDR6",
+  "GEOIP",
+  "GEOSITE",
+  "IP-ASN",
+  "PROCESS-NAME",
+  "PROCESS-PATH",
+  "DST-PORT",
+  "SRC-PORT",
+  "NETWORK",
+  "IN-TYPE",
+  "IN-USER",
+  "IN-NAME",
+  "RULE-SET",
+  "AND",
+  "OR",
+  "NOT",
+  "MATCH",
+];
+
+fn build_rule_draft(draft: &RuleDraft) -> Result<String, String> {
+  let target = draft.target.trim();
+  if target.is_empty() {
+    return Err("规则目标不能为空。".to_string());
+  }
+  if draft.kind == "MATCH" {
+    return Ok(format!("MATCH,{target}"));
+  }
+  let payload = draft.payload.trim();
+  if payload.is_empty() {
+    return Err(format!("{} 规则内容不能为空。", draft.kind));
+  }
+  let mut rule = format!("{},{payload},{target}", draft.kind);
+  if draft.no_resolve && rule_supports_no_resolve(&draft.kind) {
+    rule.push_str(",no-resolve");
+  }
+  Ok(rule)
+}
+
+fn rule_payload_hint(kind: &str) -> &'static str {
+  match kind {
+    "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" => "域名或关键字",
+    "IP-CIDR" | "IP-CIDR6" => "CIDR，例如 10.0.0.0/8",
+    "GEOIP" | "GEOSITE" => "国家或 Geo 标识",
+    "IP-ASN" => "ASN，例如 13335",
+    "PROCESS-NAME" | "PROCESS-PATH" => "进程名或路径",
+    "DST-PORT" | "SRC-PORT" => "端口或端口范围",
+    "NETWORK" => "tcp 或 udp",
+    "IN-TYPE" | "IN-USER" | "IN-NAME" => "入站属性",
+    "RULE-SET" => "rule provider 名称",
+    "AND" | "OR" | "NOT" => "逻辑子规则表达式",
+    _ => "规则内容",
+  }
+}
+
+fn rule_supports_no_resolve(kind: &str) -> bool {
+  matches!(kind, "IP-CIDR" | "IP-CIDR6" | "GEOIP" | "IP-ASN")
+}
+
+fn rule_matches(rule: &RuleSnapshot, query: &str) -> bool {
+  query.is_empty()
+    || [
+      rule.kind.as_str(),
+      rule.payload.as_str(),
+      rule.proxy.as_str(),
+    ]
+    .iter()
+    .any(|field| field.to_ascii_lowercase().contains(query))
+}
+
+fn connection_matches(connection: &ConnectionSnapshot, query: &str) -> bool {
+  query.is_empty()
+    || [
+      connection.source.as_str(),
+      connection.destination.as_str(),
+      connection.host.as_str(),
+      connection.process.as_str(),
+      connection.rule.as_str(),
+      connection.rule_payload.as_str(),
+    ]
+    .into_iter()
+    .chain(connection.chains.iter().map(String::as_str))
+    .any(|field| field.to_ascii_lowercase().contains(query))
+}
+
+fn sort_connections(connections: &mut [&ConnectionSnapshot], sort: ConnectionSort) {
+  match sort {
+    ConnectionSort::Traffic => connections.sort_by_key(|connection| {
+      std::cmp::Reverse(connection.upload.saturating_add(connection.download))
+    }),
+    ConnectionSort::Destination => {
+      connections.sort_by_key(|connection| connection.destination.to_ascii_lowercase());
+    },
+    ConnectionSort::Process => {
+      connections.sort_by_key(|connection| connection.process.to_ascii_lowercase());
+    },
+    ConnectionSort::Started => {
+      connections.sort_by(|left, right| right.start.cmp(&left.start));
+    },
+  }
+}
+
+fn connection_detail(ui: &mut Ui, connection: &ConnectionSnapshot) {
+  card(ui, "连接详情", |ui| {
+    for (label, value) in [
+      ("ID", connection.id.as_str()),
+      ("源地址", connection.source.as_str()),
+      ("目标地址", connection.destination.as_str()),
+      ("Host", connection.host.as_str()),
+      ("进程", connection.process.as_str()),
+      ("网络", connection.network.as_str()),
+      ("开始时间", connection.start.as_str()),
+      ("规则", connection.rule.as_str()),
+      ("规则内容", connection.rule_payload.as_str()),
+    ] {
+      if !value.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+          ui.label(RichText::new(label).small().strong());
+          ui.label(value);
+        });
+      }
+    }
+    if !connection.chains.is_empty() {
+      ui.label(format!(
+        "代理链：{}",
+        connection
+          .chains
+          .iter()
+          .rev()
+          .cloned()
+          .collect::<Vec<_>>()
+          .join(" → ")
+      ));
+    }
+  });
+}
+
+fn log_matches(log: &LogSnapshot, query: &str) -> bool {
+  query.is_empty()
+    || log.level.to_ascii_lowercase().contains(query)
+    || log.payload.to_ascii_lowercase().contains(query)
+}
+
+fn log_row(ui: &mut Ui, log: &LogSnapshot) {
+  ui.horizontal(|ui| {
+    let color = match log.level.to_ascii_lowercase().as_str() {
+      "error" => ui.visuals().error_fg_color,
+      "warning" | "warn" => ui.visuals().warn_fg_color,
+      "debug" => ui.visuals().weak_text_color(),
+      _ => ui.visuals().text_color(),
+    };
+    ui.label(
+      RichText::new(log.level.to_ascii_uppercase())
+        .small()
+        .color(color),
+    );
+    ui.label(&log.payload);
+  });
+  ui.separator();
+}
+
+const fn stream_log_level_label(level: StreamLogLevel) -> &'static str {
+  match level {
+    StreamLogLevel::Debug => "Debug",
+    StreamLogLevel::Info => "Info",
+    StreamLogLevel::Warning => "Warning",
+    StreamLogLevel::Error => "Error",
+    StreamLogLevel::Silent => "Silent",
+  }
+}
+
 fn remote_profile_options_editor(ui: &mut Ui, options: &mut RemoteProfileOptions) {
   ui.horizontal(|ui| {
     ui.label("User-Agent");
@@ -2779,6 +3372,74 @@ fn format_bytes(bytes: u64) -> String {
   }
 }
 
+fn metric_chart(ui: &mut Ui, metrics: &[MetricPoint]) {
+  let width = ui.available_width().max(240.0);
+  let height = 130.0;
+  let (response, painter) = ui.allocate_painter(egui::vec2(width, height), egui::Sense::hover());
+  painter.rect_filled(response.rect, 8.0, ui.visuals().extreme_bg_color);
+  if metrics.len() < 2 {
+    return;
+  }
+  let traffic_max = metrics
+    .iter()
+    .map(|point| {
+      point
+        .upload_bytes_per_second
+        .max(point.download_bytes_per_second)
+    })
+    .max()
+    .unwrap_or(1)
+    .max(1);
+  let memory_max = metrics
+    .iter()
+    .map(|point| point.memory_bytes)
+    .max()
+    .unwrap_or(1)
+    .max(1);
+  let plot = |index: usize, value: u64, maximum: u64| {
+    let x = response.rect.left()
+      + response.rect.width() * index as f32 / (metrics.len().saturating_sub(1)) as f32;
+    let y = response.rect.bottom() - response.rect.height() * value as f32 / maximum as f32;
+    egui::pos2(x, y)
+  };
+  for (values, maximum, color) in [
+    (
+      metrics
+        .iter()
+        .map(|point| point.download_bytes_per_second)
+        .collect::<Vec<_>>(),
+      traffic_max,
+      Color32::from_rgb(53, 132, 228),
+    ),
+    (
+      metrics
+        .iter()
+        .map(|point| point.upload_bytes_per_second)
+        .collect::<Vec<_>>(),
+      traffic_max,
+      Color32::from_rgb(38, 162, 105),
+    ),
+    (
+      metrics
+        .iter()
+        .map(|point| point.memory_bytes)
+        .collect::<Vec<_>>(),
+      memory_max,
+      Color32::from_rgb(145, 65, 172),
+    ),
+  ] {
+    for index in 1..values.len() {
+      painter.line_segment(
+        [
+          plot(index - 1, values[index - 1], maximum),
+          plot(index, values[index], maximum),
+        ],
+        Stroke::new(1.5, color),
+      );
+    }
+  }
+}
+
 fn card(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui)) {
   Frame::new()
     .fill(ui.visuals().faint_bg_color)
@@ -2803,8 +3464,8 @@ mod tests {
   use rsclash_domain::{CoreChannel, CoreRunMode, CoreState, Page};
 
   use super::{
-    SequenceEditorKind, format_bytes, highlight_yaml, parse_sequence_editor,
-    serialize_sequence_editor, tun_capability, yaml_comment_start,
+    RuleDraft, SequenceEditorKind, build_rule_draft, format_bytes, highlight_yaml,
+    parse_sequence_editor, serialize_sequence_editor, tun_capability, yaml_comment_start,
   };
 
   #[test]
@@ -2893,5 +3554,25 @@ delete:
         Ok(())
       },
     }
+  }
+
+  #[test]
+  fn visual_rule_builder_handles_match_and_no_resolve() -> Result<(), String> {
+    let cidr = build_rule_draft(&RuleDraft {
+      kind: "IP-CIDR".to_string(),
+      payload: "10.0.0.0/8".to_string(),
+      target: "DIRECT".to_string(),
+      no_resolve: true,
+    })?;
+    let final_rule = build_rule_draft(&RuleDraft {
+      kind: "MATCH".to_string(),
+      payload: String::new(),
+      target: "Proxy".to_string(),
+      no_resolve: false,
+    })?;
+
+    assert_eq!(cidr, "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve");
+    assert_eq!(final_rule, "MATCH,Proxy");
+    Ok(())
   }
 }

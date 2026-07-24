@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+futures-util.workspace = true
 image.workspace = true
 qrcode.workspace = true
 rsclash-config.workspace = true

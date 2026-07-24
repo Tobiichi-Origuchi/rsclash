@@ -1,6 +1,6 @@
 //! Stable, UI-independent application protocol and state models.
 
-use std::{collections::BTreeMap, fmt};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -146,6 +146,16 @@ impl From<&str> for ProxyMode {
   }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum StreamLogLevel {
+  Debug,
+  #[default]
+  Info,
+  Warning,
+  Error,
+  Silent,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TrafficSnapshot {
   pub upload_bytes_per_second: u64,
@@ -287,6 +297,57 @@ pub struct ProxyChainSnapshot {
   pub connected: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuleSnapshot {
+  pub index: i32,
+  pub kind: String,
+  pub payload: String,
+  pub proxy: String,
+  pub size: i32,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuleProviderSnapshot {
+  pub name: String,
+  pub kind: String,
+  pub behavior: String,
+  pub format: String,
+  pub rule_count: u32,
+  pub updated_at: String,
+  pub vehicle_type: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ConnectionSnapshot {
+  pub id: String,
+  pub network: String,
+  pub source: String,
+  pub destination: String,
+  pub host: String,
+  pub process: String,
+  pub upload: u64,
+  pub download: u64,
+  pub start: String,
+  pub chains: Vec<String>,
+  pub rule: String,
+  pub rule_payload: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LogSnapshot {
+  pub sequence: u64,
+  pub level: String,
+  pub payload: String,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MetricPoint {
+  pub sequence: u64,
+  pub upload_bytes_per_second: u64,
+  pub download_bytes_per_second: u64,
+  pub memory_bytes: u64,
+}
+
 impl Default for ProxyViewV1 {
   fn default() -> Self {
     Self {
@@ -314,9 +375,17 @@ pub struct MihomoSnapshot {
   pub memory_bytes: u64,
   pub connection_count: u64,
   pub groups: Vec<ProxyGroupSnapshot>,
-  pub proxy_view: ProxyViewV1,
+  pub proxy_view: Arc<ProxyViewV1>,
   pub proxy_busy: bool,
   pub proxy_chain: ProxyChainSnapshot,
+  pub rules: Arc<Vec<RuleSnapshot>>,
+  pub rule_providers: Arc<Vec<RuleProviderSnapshot>>,
+  pub connections: Arc<Vec<ConnectionSnapshot>>,
+  pub closed_connections: Arc<Vec<ConnectionSnapshot>>,
+  pub logs: Arc<Vec<LogSnapshot>>,
+  pub metrics: Arc<Vec<MetricPoint>>,
+  pub connections_paused: bool,
+  pub logs_paused: bool,
   pub last_error: Option<String>,
 }
 
@@ -540,6 +609,18 @@ pub enum UiCommand {
     group: String,
     nodes: Vec<String>,
   },
+  UpdateRuleProvider {
+    name: String,
+  },
+  CloseConnection {
+    id: String,
+  },
+  CloseAllConnections,
+  ClearClosedConnections,
+  SetConnectionsPaused(bool),
+  ClearLogs,
+  SetLogsPaused(bool),
+  SetLogLevel(StreamLogLevel),
   SetProxyMode(ProxyMode),
   RefreshProfiles,
   ImportLocalProfile {
